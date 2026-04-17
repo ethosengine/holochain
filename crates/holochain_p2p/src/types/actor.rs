@@ -304,6 +304,13 @@ pub trait HcP2p: 'static + Send + Sync + std::fmt::Debug {
         filter: holochain_zome_types::chain::ChainFilter,
     ) -> BoxFut<'_, HolochainP2pResult<Vec<MustGetAgentActivityResponse>>>;
 
+    /// Check if an agent was recently online in this network.
+    fn was_agent_recently_online(
+        &self,
+        dna_hash: DnaHash,
+        agent: AgentPubKey,
+    ) -> BoxFut<'_, HolochainP2pResult<bool>>;
+
     /// Send a validation receipt to a remote node.
     fn send_validation_receipts(
         &self,

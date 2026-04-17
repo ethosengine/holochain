@@ -176,6 +176,12 @@ pub trait HolochainP2pDnaT: Send + Sync + 'static {
         filter: holochain_zome_types::chain::ChainFilter,
     ) -> HolochainP2pResult<Vec<MustGetAgentActivityResponse>>;
 
+    /// Check if an agent was recently online in this network.
+    ///
+    /// Returns `true` if the agent has a known URL in the peer store and that URL is not marked as
+    /// unresponsive in the peer meta store.
+    async fn was_agent_recently_online(&self, agent: AgentPubKey) -> HolochainP2pResult<bool>;
+
     /// Send a validation receipt to a remote node.
     async fn send_validation_receipts(
         &self,
@@ -362,6 +368,12 @@ impl HolochainP2pDnaT for HolochainP2pDna {
     ) -> HolochainP2pResult<Vec<MustGetAgentActivityResponse>> {
         self.sender
             .must_get_agent_activity(self.dna_hash(), author, filter)
+            .await
+    }
+
+    async fn was_agent_recently_online(&self, agent: AgentPubKey) -> HolochainP2pResult<bool> {
+        self.sender
+            .was_agent_recently_online(self.dna_hash(), agent)
             .await
     }
 

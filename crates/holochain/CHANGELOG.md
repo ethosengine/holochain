@@ -1,8 +1,85 @@
+---
+default_semver_increment_mode: !pre_patch rc
+---
 # Changelog
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/). This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
+
+- When Holochain attempts to prepare validation receipts but the author of the data has not been recently online, by being
+  present in our peer store, then clear the receipt request and skip attempting to send. The author may request validation
+  receipts again by republishing their content.
+
+## 0.6.1-rc.7
+
+- Update kitsune2 dependencies to `0.4.0-dev.10`.
+
+## 0.6.1-rc.6
+
+## 0.6.1-rc.5
+
+- Update kitsune2 dependencies to `0.4.0-dev.7`, which bumps `iroh` to v0.97.
+- Update `holochain_serialized_bytes` to v0.0.57.
+- Update `holochain_wasmer` to v0.0.102.
+
+## 0.6.1-rc.4
+
+- **BREAKING CHANGE:** Split combined auth material into auth material for bootstrap service and auth material for relay service.
+- All influxive metrics modes now automatically stamp a `host` tag on every emitted metric, defaulting to the OS hostname. Override with the `HOLOCHAIN_INFLUXIVE_HOST_TAG` environment variable. \#5686
+- Fix an issue with the Holochain configuration schema generation which caused a panic. This is now properly tested to prevent regressions. \#5683
+- Record new OpenTelemetry metrics covering conductor, ribosome, network, cascade, and keystore operations.
+
+## 0.6.1-rc.3
+
+- Update kitsune2 dependencies to `0.4.0-dev.4`.
+  - Implements new required `OpStore::query_total_op_count` method, counting integrated ops across both the DHT and cache databases.
+  - Adds `GossipStateSummary::local_op_count` field to the gossip state summary.
+  - **BREAKING** Adds `HolochainP2pConfig::get_db_cache` callback (required when constructing the p2p config) to supply the cache database handle per space.
+- Update kitsune2 dependencies to `0.4.0-dev.3`. \#5673
+- Fixed an issue where the `on_signal` method of the client `AppWebsocket` would not handle signals for cloned cells correctly. Since Holochain now outputs signals only on connections associated with the app where they are emitted, filtering in the client is no longer necessary. \#5672
+- Rewrite influxive metric collection using OpenTelemetry SDK. \#5666
+- Import influxive crates from https://github.com/holochain/influxive into monorepo and update their dependencies.
+- Fix: DbKind display implementation now properly includes the associated CellId or DnaHash of the database, instead of escaped rust code.
+
+## 0.6.1-rc.2
+
+## 0.6.1-rc.1
+
+- **BREAKING CHANGE** `ConductorConfig` now includes a field `incoming_request_concurrency_limit` for specifying the number of incoming authority requests that will be handled concurrently. Additional requests will be dropped. This limit only applies to incoming requests to `get`, `get_links`, `count_links`, `get_agent_activity`, `must_get_agent_activity`.
+- **BREAKING CHANGE** `ConductorConfig` now includes an optional field `db_max_readers` for overriding the maximum number of read connections per database.
+
+## 0.6.1-rc.0
+
+- **BREAKING CHANGE** Test utility `await_consistency` has been renamed to `await_consistency_s`. The function `await_consistency` now has a hard-coded 60 second timeout and should always be used by default to reduce test flakiness.
+- **BREAKING CHANGE**: Remove features for tx5 transport variants `datachannel-vendored` and `backend-libdatachannel`. The only supported tx5 transport is `backend-go-pion` now.
+- **BREAKING CHANGE**: Removed `block_agent` and `unblock_agent` functions from the HDK. These functions were behind the `unstable-functions` feature flag and have been removed as blocking should be a system-level behavior triggered by warrants, not application-level logic. The host functions remain as no-ops for backward compatibility with existing apps. Applications using these functions should remove the calls - they will succeed but have no effect. \[\#5518\]
+- Expanded `GetOptions` with network control fields (`remote_agent_count`, `timeout_ms`) to give developers finer-grained control over network requests. The cascade now respects these options when making network calls. \#5422
+- **BREAKING CHANGE**: `GetOptions` fields are now private with getter methods. Code that accessed `options.strategy` directly must now use `options.strategy()`. \#5422
+- **BREAKING CHANGE**: `get_agent_activity` function now requires a fourth parameter `GetOptions`. \#5422
+- **BREAKING CHANGE** Add `GetStrategy` field to \[`Anchor`\] struct to allow users to specify whether anchor operations should use network or local-only fetching. The \[`Anchor`\] struct now has a `strategy` field with serde default, and a `with_strategy()` builder method. New functions `anchor_with_strategy()`, `list_anchor_type_addresses_with_strategy()`, `list_anchor_addresses_with_strategy()`, and `list_anchor_tags_with_strategy()` have been added to the HDK to support this functionality. Additionally, an `AnchorExt` trait has been added to convert \[`Anchor`\] directly to \[`TypedPath`\] while preserving the strategy. Applications can now configure anchors to use local-only fetching by calling `.with_strategy(GetStrategy::Local)` on an \[`Anchor`\]. This complements the similar change to \[`TypedPath`\]. \#5471
+- **BREAKING CHANGE** Add `GetStrategy` field to `TypedPath` to allow users to specify whether path operations should use network or local-only fetching. The `GetStrategy` enum has been moved from `holochain_zome_types` to `holochain_integrity_types` and re-exported for backward compatibility. Applications can now configure paths to use local-only fetching by calling `.with_strategy(GetStrategy::Local)` on a TypedPath. \#5471
+- **BREAKING CHANGE**: Default to iroh transport for all binaries.
+- Revert to iroh’s public relay server URL `https://use1-1.relay.n0.iroh-canary.iroh.link./` in the conductor config.
+- Reinstate tests that ensure publish and gossip doesn’t contact blocked nodes.
+- Set default iroh relay server to `dev-test-bootstrap2-iroh-relay.holochain.org`.
+- Run test workflow for all platforms with iroh transport. One job to test tx5 on Ubuntu is kept in the workflow.
+- Update kitsune2 to v0.4.0-dev.2, which includes the iroh relay integration with the bootstrap server.
+- Crates `holochain_cli_client` and `holochain_client` now have features to set which network transport is compiled in (tx5 or iroh).
+- **BREAKING CHANGE** Feature `mock_network` was removed from crate `holochain_p2p`. It was only referencing `test_utils`, so instead `test_utils` should be used directly.
+- Conductor now overrides the Cell bootstrap and signal urls if specified in the app manifest.
+- Fix: `EnableCloneCell` now works consistently when called with either `CloneId` or `DnaHash` on already-enabled clones. Previously, using a `DnaHash` would fail with `CloneCellNotFound` while using a `CloneId` would succeed. \#5519
+- **BREAKING CHANGE** Removed the `InstalledAppCommon` function `get_disabled_clone_id`. \#5519
+- Removed the unnecessary `hc_stress_test` helper module, its integration test, and example binaries now that performance testing lives in the `holochain/wind-tunnel` repository.
+- Conductor now overrides the Cell bootstrap and signal urls if specified in the app manifest [5524](https://github.com/holochain/holochain/pull/5524).
+- Added feature `transport-iroh` for using Iroh as network transport backend.
+- **BREAKING CHANGE** Renamed features `backend-libdatachannel` to `transport-tx5-backend-libdatachannel`, `backend-go-pion` to `transport-tx5-backend-go-pion`, `datachannel-vendored` to `transport-tx5-datachannel-vendored`.
+- Removed unused `hc_demo_cli` crate.
+- Removed the unnecessary `hc_stress_test` helper module, its integration test, and example binaries now that performance testing lives in the `holochain/wind-tunnel` repository.
+- Fix: Limit concurrency when starting many cells at once to prevent resource exhaustion. Starting cells is now limited to 5 concurrent cell creation operations and 10 concurrent network join operations. This improves startup reliability for conductors managing large numbers of cells.
+- CI: Allow test workflow to pass when tests of the feature `wasmer_wamr` fail. WAMR is not actively used, so investigating flaky tests on WAMR is not a priority. \#5523
+- CI: Run windows test workflow on Depot.dev runners for improved performance. \#5473
+- Refactor: Use production transport for all tests instead of in-memory implementations.
 
 ## 0.6.0
 
@@ -820,7 +897,7 @@ Now it serializes to
   - Performance and correctness: A feature which captured and processed ops that were discovered during validation has been removed. This had been added as an attempt to avoid deadlocks within validation but if that happens there’s a bug somewhere else. Sys validation needs to trust that Holochain will correctly manage its current arc and that we will get that data eventually through publishing or gossip. This probably wasn’t doing a lot of harm but it was uneccessary and doing database queries so it should be good to have that gone.
   - Performance: In-memory caching for sys validation dependencies. When we have to wait to validate an op because it has a missing dependency, any other actions required by that op will be held in memory rather than being refetched from the database. This has a fairly small memory footprint because actions are relatively small but saves repeatedly hitting the cascade for the same data if it takes a bit of time to find a dependency on the network.
 
-- **BREAKING* CHANGE*: The `ConductorConfig` has been updated to add a new option for configuring conductor behaviour. This should be compatible with existing conductor config YAML files but if you are creating the struct directly then you will need to include the new field. Currently this just has one setting which controls how fast the sys validation workflow will retry network gets for missing dependencies. It’s likely this option will change in the near future.
+- \**BREAKING* CHANGE\*: The `ConductorConfig` has been updated to add a new option for configuring conductor behaviour. This should be compatible with existing conductor config YAML files but if you are creating the struct directly then you will need to include the new field. Currently this just has one setting which controls how fast the sys validation workflow will retry network gets for missing dependencies. It’s likely this option will change in the near future.
 
 ## 0.3.0-beta-dev.26
 
@@ -941,7 +1018,7 @@ Now it serializes to
 - When uninstalling an app, local data is now cleaned up where appropriate. [\#1805](https://github.com/holochain/holochain/pull/1805)
   - Detail: any time an app is uninstalled, if the removal of that app’s cells would cause there to be no cell installed which uses a given DNA, the databases for that DNA space are deleted. So, if you have an app installed twice under two different agents and uninstall one of them, no data will be removed, but if you uninstall both, then all local data will be cleaned up. If any of your data was gossiped to other peers though, it will live on in the DHT, and even be gossiped back to you if you reinstall that same app with a new agent.
 - Renames `OpType` to `FlatOp`, and `Op::to_type()` to `Op::flattened()`. Aliases for the old names still exist, so this is not a breaking change. [\#1909](https://github.com/holochain/holochain/pull/1909)
-- Fixed a [problem with validation of Ops with private entry data](https://github.com/holochain/holochain/issues/1861), where  `Op::to_type()` would fail for private `StoreEntry` ops. [\#1910](https://github.com/holochain/holochain/pull/1910)
+- Fixed a [problem with validation of Ops with private entry data](https://github.com/holochain/holochain/issues/1861), where `Op::to_type()` would fail for private `StoreEntry` ops. [\#1910](https://github.com/holochain/holochain/pull/1910)
 
 ## 0.1.0
 
@@ -1052,7 +1129,7 @@ Now it serializes to
 
 - Revert: “Add the `hdi_version_req` key:value field to the output of the `--build-info` argument” because it broke. [\#1521](https://github.com/holochain/holochain/pull/1521)
   
-  Reason: it causes a build failure of the *holochain*  crate on crates.io
+  Reason: it causes a build failure of the *holochain* crate on crates.io
 
 ## 0.0.153
 
@@ -1400,7 +1477,7 @@ The severity of these issues increases with cell concurrency, i.e. using multipl
 
 ### Removed
 
-- BREAKING:  `InstallAppDnaPayload` in admin conductor API `InstallApp` command now only accepts a hash.  Both properties and path have been removed as per deprecation warning.  Use either `RegisterDna` or `InstallAppBundle` instead. [\#665](https://github.com/holochain/holochain/pull/665)
+- BREAKING: `InstallAppDnaPayload` in admin conductor API `InstallApp` command now only accepts a hash. Both properties and path have been removed as per deprecation warning. Use either `RegisterDna` or `InstallAppBundle` instead. [\#665](https://github.com/holochain/holochain/pull/665)
 - BREAKING: `DnaSource(Path)` in conductor\_api `RegisterDna` call now must point to `DnaBundle` as created by `hc dna pack` not a `DnaFile` created by `dna_util` [\#665](https://github.com/holochain/holochain/pull/665)
 
 ### CHANGED
