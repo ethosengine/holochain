@@ -122,6 +122,14 @@ petgraph = { version = "0.6.0", features = ["quickcheck", "stable_graph"] }
 
 [target.'cfg(unix)'.dependencies]
 sd-notify = "0.4"
+# Optional heap profiler — leak-hunt canary ONLY, off in production builds.
+# `profiling` builds jemalloc with --enable-prof; `unprefixed_malloc_on_supported_platforms`
+# routes C-side malloc (SQLCipher codec, OpenSSL, CGo shims) through jemalloc too, so the heap
+# profile is NOT blind to non-Rust allocations. Activated by the `jemalloc-prof` feature below.
+tikv-jemallocator = { version = "0.6", features = [
+  "profiling",
+  "unprefixed_malloc_on_supported_platforms",
+], optional = true }
 
 [dev-dependencies]
 holochain = { path = ".", default-features = false, features = [
@@ -181,6 +189,13 @@ workspace = true
 
 [features]
 default = ["sqlite-encrypted", "schema", "wasmer_sys", "transport-iroh"]
+
+# Leak-hunt canary: install jemalloc as the global allocator with heap profiling.
+# Build:   cargo build --release --bin holochain --no-default-features \
+#            --features sqlite-encrypted,wasmer_sys,backend-go-pion,jemalloc-prof
+# Runtime: _RJEM_MALLOC_CONF=prof:true,prof_active:true,...  (see the canary runbook)
+# NOT for production — adds profiling overhead and changes the system allocator.
+jemalloc-prof = ["dep:tikv-jemallocator"]
 
 # Exposes additional functionality only needed for integration tests.
 # This feature should be turned off for production builds.
