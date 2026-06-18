@@ -15,6 +15,16 @@ use sd_notify::{notify, NotifyState};
 use std::path::PathBuf;
 use tracing::*;
 
+// Leak-hunt canary ONLY (feature `jemalloc-prof`, off in production): swap the global
+// allocator to jemalloc so a heap profile with backtraces can name the leaking call site.
+// Paired with `unprefixed_malloc_on_supported_platforms` (Cargo.toml) so C-side allocations
+// (SQLCipher codec, OpenSSL) are captured too — the conductor's native-heap leak lives in
+// glibc arenas, and the prior Go-pprof attempt profiled the wrong runtime. Enable profiling
+// at runtime via `_RJEM_MALLOC_CONF=prof:true,prof_active:true,...`; see the canary runbook.
+#[cfg(feature = "jemalloc-prof")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 const MAGIC_CONDUCTOR_READY_STRING: &str = "Conductor ready.";
 
 /// The Holochain Conductor.
