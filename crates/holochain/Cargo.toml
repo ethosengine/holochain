@@ -121,12 +121,14 @@ petgraph = { version = "0.6.0", features = ["quickcheck", "stable_graph"] }
 
 [target.'cfg(unix)'.dependencies]
 sd-notify = "0.4"
-# Optional heap profiler — leak-hunt canary ONLY, off in production builds.
-# `profiling` builds jemalloc with --enable-prof; `unprefixed_malloc_on_supported_platforms`
-# routes C-side malloc (SQLCipher codec, OpenSSL, CGo shims) through jemalloc too, so the heap
-# profile is NOT blind to non-Rust allocations. Activated by the `jemalloc-prof` feature below.
+# Production allocator: jemalloc in place of glibc ptmalloc2. The base dep carries ONLY
+# `unprefixed_malloc_on_supported_platforms` — this interposes the bare malloc/free symbols so
+# C-side allocations (statically-linked SQLCipher codec, OpenSSL, CGo shims) ALSO route through
+# jemalloc, not just Rust. That interposition is THE cure for the conductor's native-heap leak
+# (glibc hoarded freed pages in chained 64MB secondary arenas; jemalloc's decay/munmap returns
+# them). `profiling` (--enable-prof) is NOT here — it is layered in ONLY by the `jemalloc-prof`
+# feature below for debug heap-profiling. Activated by the `jemalloc` / `jemalloc-prof` features.
 tikv-jemallocator = { version = "0.6", features = [
-  "profiling",
   "unprefixed_malloc_on_supported_platforms",
 ], optional = true }
 
@@ -196,12 +198,24 @@ default = [
   "datachannel-vendored",
 ]
 
-# Leak-hunt canary: install jemalloc as the global allocator with heap profiling.
+# PRODUCTION allocator: install jemalloc as the global allocator with C-side malloc
+# interposition (via the base dep's `unprefixed_malloc_on_supported_platforms`), profiling OFF.
+# This is the standard fleet build — it cures the conductor's native glibc-arena heap leak.
+# Build:   cargo build --release --bin holochain --no-default-features \
+#            --features sqlite-encrypted,wasmer_sys,backend-go-pion,jemalloc
+jemalloc = ["dep:tikv-jemallocator"]
+
+# Leak-hunt canary: the production `jemalloc` allocator PLUS heap profiling (--enable-prof).
+# A debug-only SUPERSET of `jemalloc` — adds profiling overhead; revert to plain `jemalloc`
+# once a leak site is named. Activate the profiler at runtime via
+# `_RJEM_MALLOC_CONF=prof:true,prof_active:true,...` (see the canary runbook).
+# ⚠ Enabling this feature is NECESSARY BUT NOT SUFFICIENT for dumps: the build must also compile
+# tikv-jemalloc-sys WITH --enable-prof. Verify `Compiling tikv-jemalloc-sys` in the build log AND
+# `strings <holochain binary> | grep -i prof_prefix` is non-empty before trusting a profiler run —
+# a cached -sys layer silently yields a no-dump profiler (this happened on the 2026-06-18 canary).
 # Build:   cargo build --release --bin holochain --no-default-features \
 #            --features sqlite-encrypted,wasmer_sys,backend-go-pion,jemalloc-prof
-# Runtime: _RJEM_MALLOC_CONF=prof:true,prof_active:true,...  (see the canary runbook)
-# NOT for production — adds profiling overhead and changes the system allocator.
-jemalloc-prof = ["dep:tikv-jemallocator"]
+jemalloc-prof = ["jemalloc", "tikv-jemallocator/profiling"]
 
 # Use the "Influxive" opentelemetry metrics binding to write metrics
 # to an InfluxDB time series database.

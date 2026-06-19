@@ -15,13 +15,15 @@ use sd_notify::{notify, NotifyState};
 use std::path::PathBuf;
 use tracing::*;
 
-// Leak-hunt canary ONLY (feature `jemalloc-prof`, off in production): swap the global
-// allocator to jemalloc so a heap profile with backtraces can name the leaking call site.
-// Paired with `unprefixed_malloc_on_supported_platforms` (Cargo.toml) so C-side allocations
-// (SQLCipher codec, OpenSSL) are captured too — the conductor's native-heap leak lives in
-// glibc arenas, and the prior Go-pprof attempt profiled the wrong runtime. Enable profiling
-// at runtime via `_RJEM_MALLOC_CONF=prof:true,prof_active:true,...`; see the canary runbook.
-#[cfg(feature = "jemalloc-prof")]
+// PRODUCTION allocator (feature `jemalloc`, the standard fleet build): swap the global
+// allocator from glibc ptmalloc2 to jemalloc. Paired with `unprefixed_malloc_on_supported_platforms`
+// (Cargo.toml) so C-side allocations (SQLCipher codec, OpenSSL, CGo shims) route through jemalloc
+// too — that is THE cure for the conductor's native-heap leak, which lived in glibc's chained
+// 64MB secondary arenas (the prior Go-pprof attempt profiled the wrong runtime). The opt-in
+// debug superset `jemalloc-prof` adds --enable-prof on top; enable profiling at runtime via
+// `_RJEM_MALLOC_CONF=prof:true,prof_active:true,...` (see the canary runbook). Gating on
+// `jemalloc` means BOTH the prod and prof builds install the allocator.
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
