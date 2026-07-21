@@ -399,7 +399,45 @@ impl OpStore for HolochainOpStore {
             DhtArc::Arc(start, end) => (start, end),
         };
 
+        let want = slice_hash.to_vec();
+
         Box::pin(async move {
+            // Change-check on the READ pool before taking the write guard. The kitsune2
+            // historical catch-up path (`TimePartition::inform_ops_stored`) re-informs the same
+            // (arc, slice_index) with an unchanged hash every cycle; the PK is `ON CONFLICT
+            // REPLACE`, so an unconditional INSERT re-writes a byte-identical row under the
+            // holochain_sqlite write guard. On a slow-link full-arc node that is ~1000 redundant
+            // guarded writes / 15min (~50% duty cycle) starving content reads. Skipping the write
+            // when the stored hash already matches keeps link slowness from surfacing as local
+            // write-lock saturation. See history/2026-07-20-adam-slow-link-write-guard-saturation.md.
+            let probe = want.clone();
+            let unchanged = db
+                .read_async(move |txn| -> StateMutationResult<bool> {
+                    let mut stmt = txn.prepare(
+                        r#"SELECT hash FROM SliceHash
+                    WHERE arc_start = :arc_start AND arc_end = :arc_end AND slice_index = :slice_index"#,
+                    )?;
+
+                    match stmt.query_row(
+                        named_params! {
+                            ":arc_start": arc_start,
+                            ":arc_end": arc_end,
+                            ":slice_index": slice_index,
+                        },
+                        |r| r.get::<_, Vec<u8>>(0),
+                    ) {
+                        Ok(stored) => Ok(stored == probe),
+                        Err(holochain_sqlite::rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+                        Err(e) => Err(e.into()),
+                    }
+                })
+                .await
+                .map_err(|e| K2Error::other_src("Failed to check slice hash", e))?;
+
+            if unchanged {
+                return Ok(());
+            }
+
             db.write_async(move |txn| -> StateMutationResult<()> {
                 let mut stmt = txn.prepare(
                     r#"INSERT INTO SliceHash
@@ -411,7 +449,7 @@ impl OpStore for HolochainOpStore {
                     ":arc_start": arc_start,
                     ":arc_end": arc_end,
                     ":slice_index": slice_index,
-                    ":hash": slice_hash.to_vec(),
+                    ":hash": want,
                 })?;
 
                 Ok(())

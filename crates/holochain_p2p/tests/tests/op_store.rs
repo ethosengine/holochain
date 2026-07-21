@@ -427,6 +427,55 @@ async fn create_and_read_slice_hashes() {
     assert_eq!(Bytes::from_static(b"hash"), hashes[0].1);
 }
 
+// Regression: the write-guard change-check (skip the write when the stored slice hash is
+// unchanged) must never swallow a REAL change, and a redundant re-store must stay a safe no-op.
+// See history/2026-07-20-adam-slow-link-write-guard-saturation.md.
+#[tokio::test]
+async fn store_slice_hash_change_check_updates_and_is_idempotent() {
+    let (_, op_store) = setup_test().await;
+
+    // Initial store.
+    op_store
+        .store_slice_hash(DhtArc::Arc(0, 100), 5, Bytes::from_static(b"hash-a"))
+        .await
+        .unwrap();
+
+    // Redundant re-store of the identical hash — must be a no-op that leaves state intact.
+    op_store
+        .store_slice_hash(DhtArc::Arc(0, 100), 5, Bytes::from_static(b"hash-a"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Some(Bytes::from_static(b"hash-a")),
+        op_store
+            .retrieve_slice_hash(DhtArc::Arc(0, 100), 5)
+            .await
+            .unwrap()
+    );
+
+    // A genuinely changed hash for the same (arc, slice_index) MUST be applied — the change-check
+    // must not mistake a real update for a redundant write.
+    op_store
+        .store_slice_hash(DhtArc::Arc(0, 100), 5, Bytes::from_static(b"hash-b"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Some(Bytes::from_static(b"hash-b")),
+        op_store
+            .retrieve_slice_hash(DhtArc::Arc(0, 100), 5)
+            .await
+            .unwrap()
+    );
+
+    // The row is still unique (ON CONFLICT REPLACE held — no duplicate accumulation).
+    let hashes = op_store
+        .retrieve_slice_hashes(DhtArc::Arc(0, 100))
+        .await
+        .unwrap();
+    assert_eq!(1, hashes.len());
+    assert_eq!(Bytes::from_static(b"hash-b"), hashes[0].1);
+}
+
 #[tokio::test]
 async fn count_slice_hashes() {
     let (_, op_store) = setup_test().await;
