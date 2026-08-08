@@ -8,6 +8,8 @@ use holochain_conductor_api::conductor::ConductorConfig;
 pub use holochain_conductor_api::*;
 use holochain_serialized_bytes::prelude::*;
 use holochain_types::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// What the conductor decided to do with an incoming zome call, before any of
@@ -36,8 +38,13 @@ pub enum ZomeCallAdmissionDecision {
 }
 
 /// Admission and deadline policy for zome calls arriving on one app interface.
+///
+/// The counter is per-[`AppInterfaceApi`], which is per app interface rather
+/// than per connection: a client cannot raise its own limit by opening more
+/// websockets.
 #[derive(Debug)]
 pub struct ZomeCallAdmission {
+    in_flight: AtomicUsize,
     max_in_flight: Option<usize>,
     default_deadline: Option<Duration>,
     max_deadline: Duration,
@@ -48,6 +55,7 @@ impl ZomeCallAdmission {
     pub fn from_config(config: &ConductorConfig) -> Self {
         let tuning = config.conductor_tuning_params();
         Self {
+            in_flight: AtomicUsize::new(0),
             max_in_flight: tuning.max_concurrent_zome_calls(),
             default_deadline: tuning.zome_call_deadline(),
             max_deadline: tuning.zome_call_deadline_max(),
@@ -87,6 +95,32 @@ impl ZomeCallAdmission {
             _ => ZomeCallAdmissionDecision::Admit(effective),
         }
     }
+
+    /// Claim a slot for a call, or refuse it.
+    ///
+    /// On success the returned guard holds the slot until it is dropped, which
+    /// happens however the call ends — completion, deadline, error, or the
+    /// client disconnecting.
+    fn enter(admission: &Arc<Self>) -> (usize, ZomeCallSlot) {
+        let previously_in_flight = admission.in_flight.fetch_add(1, Ordering::AcqRel);
+        (
+            previously_in_flight,
+            ZomeCallSlot {
+                admission: admission.clone(),
+            },
+        )
+    }
+}
+
+/// Holds an in-flight zome call slot for as long as the call is running.
+struct ZomeCallSlot {
+    admission: Arc<ZomeCallAdmission>,
+}
+
+impl Drop for ZomeCallSlot {
+    fn drop(&mut self) {
+        self.admission.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// The Conductor lives inside an Arc<RwLock<_>> which is shared with all
@@ -94,12 +128,17 @@ impl ZomeCallAdmission {
 #[derive(Clone)]
 pub struct AppInterfaceApi {
     conductor_handle: ConductorHandle,
+    admission: Arc<ZomeCallAdmission>,
 }
 
 impl AppInterfaceApi {
     /// Create a new instance from a shared Conductor reference
     pub fn new(conductor_handle: ConductorHandle) -> Self {
-        Self { conductor_handle }
+        let admission = Arc::new(ZomeCallAdmission::from_config(&conductor_handle.config));
+        Self {
+            conductor_handle,
+            admission,
+        }
     }
 
     /// Check an authentication request and return the app that access has been granted
@@ -174,10 +213,11 @@ impl AppInterfaceApi {
                 Ok(AppResponse::PeerMetaInfo(r))
             }
             AppRequest::CallZome(zome_call_params_signed) => {
-                self.handle_call_zome(*zome_call_params_signed).await
+                self.handle_call_zome(*zome_call_params_signed, None).await
             }
-            AppRequest::CallZomeWithDeadline { call, .. } => {
-                self.handle_call_zome(*call).await
+            AppRequest::CallZomeWithDeadline { call, deadline_ms } => {
+                self.handle_call_zome(*call, Some(Duration::from_millis(deadline_ms as u64)))
+                    .await
             }
             #[cfg(feature = "unstable-countersigning")]
             AppRequest::GetCountersigningSessionState(payload) => {
@@ -309,27 +349,89 @@ impl AppInterfaceApi {
         }
     }
 
-    /// Run a zome call and translate its outcome into an [`AppResponse`].
+    /// Run a zome call under this interface's admission and deadline policy.
     ///
-    /// Shared by [`AppRequest::CallZome`] and
-    /// [`AppRequest::CallZomeWithDeadline`]; the latter's deadline is not yet
-    /// acted on.
+    /// `declared_deadline` is the caller's own declaration, from
+    /// [`AppRequest::CallZomeWithDeadline`]. `None` means the caller said
+    /// nothing, in which case the conductor's configured default applies —
+    /// which, unless an operator has opted in, is also nothing.
+    ///
+    /// When a deadline elapses the call future is dropped. Every `await` it was
+    /// parked on is cancelled, which returns any database read or write permits
+    /// it was queued for. A WASM body already running on a blocking thread is
+    /// not interrupted, so the abandoned call may still complete; the response
+    /// says so rather than implying the work was undone.
     async fn handle_call_zome(
         &self,
         zome_call_params_signed: ZomeCallParamsSigned,
+        declared_deadline: Option<Duration>,
     ) -> ConductorApiResult<AppResponse> {
-        match self
+        let (in_flight, _slot) = ZomeCallAdmission::enter(&self.admission);
+        let deadline = match self.admission.decide(declared_deadline, in_flight) {
+            ZomeCallAdmissionDecision::Admit(deadline) => deadline,
+            ZomeCallAdmissionDecision::Refuse {
+                in_flight,
+                max_in_flight,
+            } => {
+                tracing::debug!(
+                    in_flight,
+                    max_in_flight,
+                    "Refusing zome call: at the concurrent zome call limit and the caller \
+                     declared a deadline"
+                );
+                return Ok(AppResponse::Error(ExternalApiWireError::ZomeCallRefused(
+                    format!(
+                        "The conductor is already running {in_flight} concurrent zome calls \
+                         against a limit of {max_in_flight} and cannot start this call within \
+                         the deadline you declared. No call was made. Retry later, or declare a \
+                         longer deadline."
+                    ),
+                )));
+            }
+        };
+
+        let started = std::time::Instant::now();
+        let call = self
             .conductor_handle
-            .handle_external_zome_call(zome_call_params_signed)
-            .await?
-        {
+            .handle_external_zome_call(zome_call_params_signed);
+
+        let result = match deadline {
+            Some(deadline) => match tokio::time::timeout(deadline, call).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        deadline_ms = deadline.as_millis() as u64,
+                        "Abandoning zome call: the caller's deadline elapsed"
+                    );
+                    return Ok(AppResponse::Error(
+                        ExternalApiWireError::ZomeCallDeadlineExceeded(format!(
+                            "Zome call abandoned after {}ms, exceeding the {}ms deadline. \
+                             Queued database permits were released. A WASM body already \
+                             executing was not interrupted, so this call may still complete.",
+                            started.elapsed().as_millis(),
+                            deadline.as_millis()
+                        )),
+                    ));
+                }
+            },
+            None => call.await,
+        }?;
+
+        match result {
             Ok(ZomeCallResponse::Ok(output)) => Ok(AppResponse::ZomeCalled(Box::new(output))),
-            Ok(ZomeCallResponse::AuthenticationFailed(signature, provenance)) => Ok(AppResponse::Error(
-                ExternalApiWireError::ZomeCallAuthenticationFailed(format!(
-                    "Authentication failure. Bad signature {signature:?} by provenance {provenance:?}.",
-                )),
-            )),
-            Ok(ZomeCallResponse::Unauthorized(zome_call_authorization, cap_secret, zome_name, fn_name)) => Ok(AppResponse::Error(
+            Ok(ZomeCallResponse::AuthenticationFailed(signature, provenance)) => {
+                Ok(AppResponse::Error(
+                    ExternalApiWireError::ZomeCallAuthenticationFailed(format!(
+                        "Authentication failure. Bad signature {signature:?} by provenance {provenance:?}.",
+                    )),
+                ))
+            }
+            Ok(ZomeCallResponse::Unauthorized(
+                zome_call_authorization,
+                cap_secret,
+                zome_name,
+                fn_name,
+            )) => Ok(AppResponse::Error(
                 ExternalApiWireError::ZomeCallUnauthorized(format!(
                     "Call was not authorized with reason {zome_call_authorization:?}, cap secret {cap_secret:?} to call the function {fn_name} in zome {zome_name}"
                 )),
@@ -369,7 +471,7 @@ mod tests {
         default_deadline: Option<Duration>,
         max_deadline: Option<Duration>,
         max_concurrent: Option<usize>,
-    ) -> ZomeCallAdmission {
+    ) -> Arc<ZomeCallAdmission> {
         let config = ConductorConfig {
             tuning_params: Some(ConductorTuningParams {
                 zome_call_deadline: default_deadline,
@@ -379,7 +481,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        ZomeCallAdmission::from_config(&config)
+        Arc::new(ZomeCallAdmission::from_config(&config))
     }
 
     #[test]
@@ -487,5 +589,24 @@ mod tests {
                 max_in_flight: 2
             }
         );
+    }
+
+    #[test]
+    fn slots_are_released_however_the_call_ends() {
+        let admission = admission(None, None, Some(2));
+
+        let (first, slot_a) = ZomeCallAdmission::enter(&admission);
+        assert_eq!(first, 0);
+        let (second, slot_b) = ZomeCallAdmission::enter(&admission);
+        assert_eq!(second, 1);
+        let (third, slot_c) = ZomeCallAdmission::enter(&admission);
+        assert_eq!(third, 2);
+
+        drop(slot_b);
+        drop(slot_c);
+        let (after_release, _slot_d) = ZomeCallAdmission::enter(&admission);
+        assert_eq!(after_release, 1);
+
+        drop(slot_a);
     }
 }

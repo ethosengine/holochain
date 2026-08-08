@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- App interface zome calls can now carry the deadline the caller already has. A client that sends the new `AppRequest::CallZomeWithDeadline { call, deadline_ms }` tells the conductor how long it is prepared to wait, instead of enforcing that timeout silently on its own side of the websocket while the conductor keeps working on a call nobody is listening to. The plain `CallZome` request is unchanged.
+- Three new optional `tuning_params`, all defaulting to the previous behaviour, let an operator bound app interface zome call work: `zome_call_deadline` (applied to calls that declare none; unset by default, so such calls stay unbounded), `zome_call_deadline_max` (clamps a client-declared deadline; 5 minutes by default) and `max_concurrent_zome_calls` (unset by default, so there is no admission limit). At the concurrency limit, a call that declared a deadline is refused immediately with the new `ExternalApiWireError::ZomeCallRefused` rather than queued behind work that would consume its deadline before it started; a call that declared no deadline is still queued, so the setting is invisible to an existing client. Adopt them in the order `zome_call_deadline_max`, then `max_concurrent_zome_calls`, then `zome_call_deadline` — the last is the only one that changes behaviour for clients that asked for nothing.
+- **New failure mode**: a zome call that exceeds its deadline is abandoned and answered with the new `ExternalApiWireError::ZomeCallDeadlineExceeded`. Abandoning releases the database read and write permits the call was queued for, but it does not interrupt a WASM function body that has already started executing, because that runs on a blocking thread. The call may therefore still complete and commit. Treat `ZomeCallDeadlineExceeded` as "the conductor stopped waiting", never as proof the call did not run — a client that retries on it can double-commit.
+
 ## 0.8.0-dev.0
 
 ## 0.7.0
