@@ -93,29 +93,10 @@ impl AppInterfaceApi {
                 Ok(AppResponse::PeerMetaInfo(r))
             }
             AppRequest::CallZome(zome_call_params_signed) => {
-                match self.conductor_handle.handle_external_zome_call(*zome_call_params_signed).await? {
-                    Ok(ZomeCallResponse::Ok(output)) => Ok(AppResponse::ZomeCalled(Box::new(output))),
-                    Ok(ZomeCallResponse::AuthenticationFailed(signature, provenance)) => Ok(AppResponse::Error(
-                        ExternalApiWireError::ZomeCallAuthenticationFailed(format!(
-                            "Authentication failure. Bad signature {signature:?} by provenance {provenance:?}.",
-                        )),
-                    )),
-                    Ok(ZomeCallResponse::Unauthorized(zome_call_authorization, cap_secret, zome_name, fn_name)) => Ok(AppResponse::Error(
-                        ExternalApiWireError::ZomeCallUnauthorized(format!(
-                            "Call was not authorized with reason {zome_call_authorization:?}, cap secret {cap_secret:?} to call the function {fn_name} in zome {zome_name}"
-                        )),
-                    )),
-                    Ok(ZomeCallResponse::NetworkError(e)) => unreachable!(
-                        "Interface zome calls should never be routed to the network. This is a bug. Got {}",
-                        e
-                    ),
-                    Ok(ZomeCallResponse::CountersigningSession(e)) => Ok(AppResponse::Error(
-                        ExternalApiWireError::CountersigningSessionError(format!(
-                            "A countersigning session has failed to start on this zome call because: {e}"
-                        )),
-                    )),
-                    Err(e) => Ok(AppResponse::Error(e.into())),
-                }
+                self.handle_call_zome(*zome_call_params_signed).await
+            }
+            AppRequest::CallZomeWithDeadline { call, .. } => {
+                self.handle_call_zome(*call).await
             }
             #[cfg(feature = "unstable-countersigning")]
             AppRequest::GetCountersigningSessionState(payload) => {
@@ -244,6 +225,44 @@ impl AppInterfaceApi {
 
                 Ok(AppResponse::Ok)
             }
+        }
+    }
+
+    /// Run a zome call and translate its outcome into an [`AppResponse`].
+    ///
+    /// Shared by [`AppRequest::CallZome`] and
+    /// [`AppRequest::CallZomeWithDeadline`]; the latter's deadline is not yet
+    /// acted on.
+    async fn handle_call_zome(
+        &self,
+        zome_call_params_signed: ZomeCallParamsSigned,
+    ) -> ConductorApiResult<AppResponse> {
+        match self
+            .conductor_handle
+            .handle_external_zome_call(zome_call_params_signed)
+            .await?
+        {
+            Ok(ZomeCallResponse::Ok(output)) => Ok(AppResponse::ZomeCalled(Box::new(output))),
+            Ok(ZomeCallResponse::AuthenticationFailed(signature, provenance)) => Ok(AppResponse::Error(
+                ExternalApiWireError::ZomeCallAuthenticationFailed(format!(
+                    "Authentication failure. Bad signature {signature:?} by provenance {provenance:?}.",
+                )),
+            )),
+            Ok(ZomeCallResponse::Unauthorized(zome_call_authorization, cap_secret, zome_name, fn_name)) => Ok(AppResponse::Error(
+                ExternalApiWireError::ZomeCallUnauthorized(format!(
+                    "Call was not authorized with reason {zome_call_authorization:?}, cap secret {cap_secret:?} to call the function {fn_name} in zome {zome_name}"
+                )),
+            )),
+            Ok(ZomeCallResponse::NetworkError(e)) => unreachable!(
+                "Interface zome calls should never be routed to the network. This is a bug. Got {}",
+                e
+            ),
+            Ok(ZomeCallResponse::CountersigningSession(e)) => Ok(AppResponse::Error(
+                ExternalApiWireError::CountersigningSessionError(format!(
+                    "A countersigning session has failed to start on this zome call because: {e}"
+                )),
+            )),
+            Err(e) => Ok(AppResponse::Error(e.into())),
         }
     }
 }

@@ -77,6 +77,59 @@ pub enum AppRequest {
     /// to the expected [`ZomeCallParams`].
     CallZome(Box<ZomeCallParamsSigned>),
 
+    /// Call a zome function, declaring a deadline after which the caller will
+    /// stop waiting for a response.
+    ///
+    /// The call payload is identical to [`AppRequest::CallZome`] — the same
+    /// signed [`ZomeCallParams`] — plus an unsigned `deadline_ms`.
+    ///
+    /// The deadline is deliberately *not* covered by the call signature. It is
+    /// scheduling metadata about the caller's own patience, not an
+    /// authorization claim: the only party a forged deadline can disadvantage
+    /// is the caller that appears to have declared it.
+    ///
+    /// The conductor uses the deadline in two ways:
+    ///
+    /// 1. **Admission.** If the app interface is already running its configured
+    ///    maximum number of concurrent zome calls
+    ///    (`tuning_params.max_concurrent_zome_calls`), the call is refused
+    ///    immediately with [`ExternalApiWireError::ZomeCallRefused`] rather
+    ///    than queued behind work that would consume the caller's whole
+    ///    deadline before this call started.
+    /// 2. **Bounded response.** The call is abandoned once the deadline
+    ///    elapses and [`ExternalApiWireError::ZomeCallDeadlineExceeded`] is
+    ///    returned, so a caller always receives a response and never has to
+    ///    guess whether the conductor is still working.
+    ///
+    /// Abandoning a call drops every pending `await` on its task, which
+    /// releases queued database read and write permits back to the conductor.
+    /// It does **not** interrupt a WASM function body that has already started
+    /// executing; that work remains bounded by the ribosome's metering points.
+    /// Callers should treat a deadline as a bound on *their* wait, not as proof
+    /// that the conductor stopped working.
+    ///
+    /// The declared deadline is clamped to the conductor's configured maximum
+    /// (`tuning_params.zome_call_deadline_max`).
+    ///
+    /// # Returns
+    ///
+    /// [`AppResponse::ZomeCalled`], exactly as for [`AppRequest::CallZome`].
+    ///
+    /// # Errors
+    ///
+    /// [`ExternalApiWireError::ZomeCallDeadlineExceeded`] when the deadline
+    /// elapsed before the call produced a result.
+    ///
+    /// [`ExternalApiWireError::ZomeCallRefused`] when the conductor declined
+    /// to start the call because it could not meet the declared deadline.
+    CallZomeWithDeadline {
+        /// The signed zome call parameters, exactly as for [`AppRequest::CallZome`].
+        call: Box<ZomeCallParamsSigned>,
+        /// Milliseconds, measured from when the conductor receives the request,
+        /// after which the caller will stop waiting for a response.
+        deadline_ms: u32,
+    },
+
     /// Get the state of a countersigning session.
     ///
     /// # Returns
@@ -696,5 +749,75 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Read the variant tag out of an externally tagged request envelope.
+    ///
+    /// A signed zome call carries raw bytes, which have no JSON representation,
+    /// so these tests read the msgpack envelope directly rather than going via
+    /// `serde_json::Value` as the tests above do.
+    fn request_tag(encoded: &[u8]) -> String {
+        // 0x82: a map of two entries. 0xa4 "type": the tag key.
+        assert_eq!(&encoded[..6], b"\x82\xa4type", "not a two-entry tagged map");
+        assert_eq!(encoded[6] & 0xe0, 0xa0, "the tag is not a msgpack fixstr");
+        let len = (encoded[6] & 0x1f) as usize;
+        String::from_utf8(encoded[7..7 + len].to_vec()).unwrap()
+    }
+
+    /// Adding `CallZomeWithDeadline` must not perturb the encoding of the
+    /// request every existing client sends. A `CallZome` encoded by a previous
+    /// release still decodes here, and still writes the same envelope.
+    #[test]
+    fn call_zome_encoding_is_unchanged_by_the_deadline_variant() {
+        use super::ZomeCallParamsSigned;
+        use holochain_zome_types::prelude::Signature;
+
+        let signed = ZomeCallParamsSigned::new(vec![1, 2, 3], Signature([7; 64]));
+        let encoded =
+            holochain_serialized_bytes::encode(&AppRequest::CallZome(Box::new(signed))).unwrap();
+
+        assert_eq!(request_tag(&encoded), "call_zome");
+
+        let decoded: AppRequest = holochain_serialized_bytes::decode(&encoded).unwrap();
+        assert!(matches!(decoded, AppRequest::CallZome(_)));
+    }
+
+    /// The deadline rides alongside the signed params under its own tag, so a
+    /// conductor tells the two requests apart without inspecting the payload.
+    #[test]
+    fn call_zome_with_deadline_round_trips_under_its_own_tag() {
+        use super::ZomeCallParamsSigned;
+        use holochain_zome_types::prelude::Signature;
+
+        let signed = ZomeCallParamsSigned::new(vec![1, 2, 3], Signature([7; 64]));
+        let encoded = holochain_serialized_bytes::encode(&AppRequest::CallZomeWithDeadline {
+            call: Box::new(signed),
+            deadline_ms: 1_500,
+        })
+        .unwrap();
+
+        assert_eq!(request_tag(&encoded), "call_zome_with_deadline");
+
+        let decoded: AppRequest = holochain_serialized_bytes::decode(&encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            AppRequest::CallZomeWithDeadline {
+                deadline_ms: 1_500,
+                ..
+            }
+        ));
+    }
+
+    /// A conductor that predates the variant rejects it as an unknown request
+    /// rather than misreading it as something else. This is why
+    /// `CallZomeOptions::declare_deadline` defaults to off.
+    #[test]
+    fn an_unknown_request_tag_fails_to_decode_cleanly() {
+        let result: Result<AppRequest, _> = serde_json::from_value(serde_json::json!({
+            "type": "call_zome_with_deadline_from_the_future",
+            "value": { "deadline_ms": 1 }
+        }));
+
+        assert!(result.is_err());
     }
 }
