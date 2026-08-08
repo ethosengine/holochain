@@ -2,6 +2,7 @@ mod agent_activity;
 mod agent_scaling;
 mod app_disable;
 mod app_install;
+mod app_interface_call_deadline;
 mod app_interface_security;
 mod app_uninstall;
 mod authored_test;
