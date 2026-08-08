@@ -636,6 +636,25 @@ pub enum ExternalApiWireError {
     ZomeCallUnauthorized(String),
     /// A countersigning session has failed.
     CountersigningSessionError(String),
+    /// The conductor declined to start a zome call because it could not meet
+    /// the deadline the caller declared.
+    ///
+    /// This is a backpressure signal, not a failure: the call did not run, no
+    /// source chain state changed, and the caller may retry with a longer
+    /// deadline or after a delay.
+    ///
+    /// [How to declare a deadline.](crate::AppRequest::CallZomeWithDeadline)
+    ZomeCallRefused(String),
+    /// A zome call was abandoned because the deadline the caller declared
+    /// elapsed before the call produced a result.
+    ///
+    /// The conductor released the call's pending database permits, but a WASM
+    /// function body already executing was not interrupted, so the call may
+    /// still complete and commit. Treat this as "stopped waiting", not as
+    /// "did not happen".
+    ///
+    /// [How to declare a deadline.](crate::AppRequest::CallZomeWithDeadline)
+    ZomeCallDeadlineExceeded(String),
 }
 
 impl ExternalApiWireError {

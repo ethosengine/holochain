@@ -683,6 +683,46 @@ pub struct ConductorTuningParams {
     /// Default: false
     #[cfg(feature = "test-utils")]
     pub disable_warrant_issuance: bool,
+    /// The deadline applied to app interface zome calls that do not declare one
+    /// of their own.
+    ///
+    /// A zome call that exceeds its deadline is abandoned and the caller
+    /// receives [`crate::ExternalApiWireError::ZomeCallDeadlineExceeded`].
+    /// Abandoning releases the call's queued database permits; it does not
+    /// interrupt a WASM body that has already started executing.
+    ///
+    /// Clients that declare their own deadline with
+    /// [`crate::AppRequest::CallZomeWithDeadline`] are bounded by that value
+    /// instead, clamped to `zome_call_deadline_max`.
+    ///
+    /// Default: None — zome calls are unbounded, which is the behaviour of
+    /// conductors that predate this setting.
+    pub zome_call_deadline: Option<std::time::Duration>,
+    /// The longest deadline the conductor will honour from a client.
+    ///
+    /// A client-declared deadline longer than this is clamped down to it, so a
+    /// client cannot pin conductor resources indefinitely by asking for an
+    /// unreasonable deadline.
+    ///
+    /// Default: 5 minutes
+    pub zome_call_deadline_max: Option<std::time::Duration>,
+    /// The maximum number of zome calls an app interface will run concurrently
+    /// before it starts refusing calls that declare a deadline.
+    ///
+    /// When the interface is at this limit, a call that declared a deadline is
+    /// refused immediately with
+    /// [`crate::ExternalApiWireError::ZomeCallRefused`] rather than queued: a
+    /// caller that has told us how long it will wait is better served by an
+    /// immediate, actionable refusal than by a queue slot it cannot use. Calls
+    /// that declare no deadline are still queued, so this setting never changes
+    /// the behaviour seen by an existing client.
+    ///
+    /// Note that this setting is related to `db_max_readers`: each running zome
+    /// call may hold database read permits.
+    ///
+    /// Default: None — no limit, which is the behaviour of conductors that
+    /// predate this setting.
+    pub max_concurrent_zome_calls: Option<usize>,
 }
 
 impl ConductorTuningParams {
@@ -697,7 +737,33 @@ impl ConductorTuningParams {
             disable_self_validation: false,
             #[cfg(feature = "test-utils")]
             disable_warrant_issuance: false,
+            zome_call_deadline: None,
+            zome_call_deadline_max: None,
+            max_concurrent_zome_calls: None,
         }
+    }
+
+    /// Get the current value of `zome_call_deadline`.
+    ///
+    /// `None` means zome calls that do not declare their own deadline are
+    /// unbounded, which is the behaviour of conductors that predate this
+    /// setting.
+    pub fn zome_call_deadline(&self) -> Option<std::time::Duration> {
+        self.zome_call_deadline
+    }
+
+    /// Get the current value of `zome_call_deadline_max` or its default value.
+    pub fn zome_call_deadline_max(&self) -> std::time::Duration {
+        self.zome_call_deadline_max
+            .unwrap_or_else(|| std::time::Duration::from_secs(60 * 5))
+    }
+
+    /// Get the current value of `max_concurrent_zome_calls`.
+    ///
+    /// `None` means no limit, which is the behaviour of conductors that predate
+    /// this setting.
+    pub fn max_concurrent_zome_calls(&self) -> Option<usize> {
+        self.max_concurrent_zome_calls
     }
 
     /// Get the current value of `sys_validation_retry_delay` or its default value.
@@ -733,6 +799,12 @@ impl Default for ConductorTuningParams {
             disable_self_validation: false,
             #[cfg(feature = "test-utils")]
             disable_warrant_issuance: false,
+            // Left unset so that a conductor built from defaults keeps the
+            // pre-existing unbounded, unlimited zome call behaviour. Opting in
+            // is an explicit act.
+            zome_call_deadline: None,
+            zome_call_deadline_max: Some(empty.zome_call_deadline_max()),
+            max_concurrent_zome_calls: None,
         }
     }
 }

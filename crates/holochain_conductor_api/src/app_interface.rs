@@ -76,6 +76,59 @@ pub enum AppRequest {
     /// to the expected [`ZomeCallParams`].
     CallZome(Box<ZomeCallParamsSigned>),
 
+    /// Call a zome function, declaring a deadline after which the caller will
+    /// stop waiting for a response.
+    ///
+    /// The call payload is identical to [`AppRequest::CallZome`] — the same
+    /// signed [`ZomeCallParams`] — plus an unsigned `deadline_ms`.
+    ///
+    /// The deadline is deliberately *not* covered by the call signature. It is
+    /// scheduling metadata about the caller's own patience, not an
+    /// authorization claim: the only party a forged deadline can disadvantage
+    /// is the caller that appears to have declared it.
+    ///
+    /// The conductor uses the deadline in two ways:
+    ///
+    /// 1. **Admission.** If the app interface is already running its configured
+    ///    maximum number of concurrent zome calls
+    ///    (`tuning_params.max_concurrent_zome_calls`), the call is refused
+    ///    immediately with [`ExternalApiWireError::ZomeCallRefused`] rather
+    ///    than queued behind work that would consume the caller's whole
+    ///    deadline before this call started.
+    /// 2. **Bounded response.** The call is abandoned once the deadline
+    ///    elapses and [`ExternalApiWireError::ZomeCallDeadlineExceeded`] is
+    ///    returned, so a caller always receives a response and never has to
+    ///    guess whether the conductor is still working.
+    ///
+    /// Abandoning a call drops every pending `await` on its task, which
+    /// releases queued database read and write permits back to the conductor.
+    /// It does **not** interrupt a WASM function body that has already started
+    /// executing; that work remains bounded by the ribosome's metering points.
+    /// Callers should treat a deadline as a bound on *their* wait, not as proof
+    /// that the conductor stopped working.
+    ///
+    /// The declared deadline is clamped to the conductor's configured maximum
+    /// (`tuning_params.zome_call_deadline_max`).
+    ///
+    /// # Returns
+    ///
+    /// [`AppResponse::ZomeCalled`], exactly as for [`AppRequest::CallZome`].
+    ///
+    /// # Errors
+    ///
+    /// [`ExternalApiWireError::ZomeCallDeadlineExceeded`] when the deadline
+    /// elapsed before the call produced a result.
+    ///
+    /// [`ExternalApiWireError::ZomeCallRefused`] when the conductor declined
+    /// to start the call because it could not meet the declared deadline.
+    CallZomeWithDeadline {
+        /// The signed zome call parameters, exactly as for [`AppRequest::CallZome`].
+        call: Box<ZomeCallParamsSigned>,
+        /// Milliseconds, measured from when the conductor receives the request,
+        /// after which the caller will stop waiting for a response.
+        deadline_ms: u32,
+    },
+
     /// Get the state of a countersigning session.
     ///
     /// # Returns

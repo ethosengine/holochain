@@ -48,6 +48,9 @@ impl From<NetworkConfig> for SweetConductorConfig {
                 min_publish_interval: None,
                 disable_self_validation: false,
                 disable_warrant_issuance: false,
+                zome_call_deadline: None,
+                zome_call_deadline_max: None,
+                max_concurrent_zome_calls: None,
             }),
             ..Default::default()
         }
