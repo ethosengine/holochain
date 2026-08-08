@@ -304,7 +304,13 @@ impl AppWebsocket {
         signed_params: ZomeCallParamsSigned,
         options: CallZomeOptions,
     ) -> ConductorApiResult<ExternIO> {
-        let app_request = AppRequest::CallZome(Box::new(signed_params));
+        let app_request = match (options.declare_deadline, options.timeout) {
+            (true, Some(timeout)) => AppRequest::CallZomeWithDeadline {
+                call: Box::new(signed_params),
+                deadline_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
+            },
+            _ => AppRequest::CallZome(Box::new(signed_params)),
+        };
         let response = self
             .inner
             .send_with_timeout(app_request, options.timeout)
@@ -578,6 +584,25 @@ pub struct CallZomeOptions {
     /// When `None`, the connection-level `default_request_timeout` is used.
     /// When `Some`, this duration is used instead.
     pub timeout: Option<Duration>,
+
+    /// Whether to tell the conductor about `timeout`.
+    ///
+    /// A timeout is normally enforced entirely on the client: the client stops
+    /// waiting, and the conductor carries on executing a call nobody is
+    /// listening to. Setting this sends the timeout to the conductor as a call
+    /// deadline, so the conductor can refuse a call it cannot start in time and
+    /// abandon one that overruns, releasing the database permits it was queued
+    /// for.
+    ///
+    /// Requires a conductor that understands
+    /// [`AppRequest::CallZomeWithDeadline`]. Against an older conductor the
+    /// request fails to deserialize, so this defaults to `false` and must be
+    /// opted into until the supported-conductor floor moves.
+    ///
+    /// Has no effect unless `timeout` is also set.
+    ///
+    /// Default: `false`
+    pub declare_deadline: bool,
 }
 
 impl CallZomeOptions {
@@ -589,6 +614,16 @@ impl CallZomeOptions {
     /// Sets the timeout for this zome call.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the timeout for this zome call and declares it to the conductor as
+    /// a call deadline.
+    ///
+    /// See [`CallZomeOptions::declare_deadline`] for the compatibility caveat.
+    pub fn with_declared_deadline(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self.declare_deadline = true;
         self
     }
 }
