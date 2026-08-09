@@ -1,0 +1,7 @@
+{
+  "git": {
+    "sha1": "b33fa55606f8bd5020cffacf1ffae41f92d4d296",
+    "dirty": true
+  },
+  "path_in_vcs": "crates/transport_iroh"
+}

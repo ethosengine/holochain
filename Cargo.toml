@@ -37,7 +37,12 @@ members = [
   "crates/test_utils/wasm_common",
 ]
 
-exclude = ["crates/release-automation"]
+exclude = [
+  "crates/release-automation",
+  # ELOHIM: vendored [patch.crates-io] target, built as a path dependency
+  # rather than a workspace member (see the patch note below).
+  "patches/kitsune2_transport_iroh",
+]
 
 resolver = "2"
 
@@ -103,6 +108,25 @@ lto = true
 # (../tx5, branch elohim-0.8.1-zombie-fix) so there is one consistent source for each tx5 crate.
 # BUILD-VERIFY on a Go 1.24 + nix host (tx5-go-pion-sys is CGo); not verifiable in the dev container.
 # See .claude/data/conductor-leak-rca-tx5-gopion-backpressure-2026-06-17.md
+# --- ELOHIM: cross-relay preflight fix (kitsune2_transport_iroh 0.4.1) ---
+# Upstream `IrohTransport::own_url_for_preflight` (src/lib.rs) fails CLOSED when
+# a peer homes to a relay we do not home to, so two peers on different relays
+# can never connect. The caller then reports it as "Connection attempted before
+# home relay URL is known", which names a DIFFERENT condition (no local URL) and
+# sent three separate investigations at the wrong seam.
+#
+# Wave-2 relay sovereignty (D2) homes each conductor to its own doorway's relay
+# — doorway A -> relay.alpha.elohim.host, doorway B -> relay.elohim.host — and
+# the design doc's own rationale states peers need not share a relay. That
+# property is true of iroh and of the peer-URL encoding, but NOT of this
+# function. The patch falls back to our global (home-relay) URL instead of
+# refusing, and leaves `None` only for the genuinely address-less case.
+#
+# Vendored rather than submoduled: elohim/kitsune2 is pinned at v0.3.2, which
+# predates the transport_iroh crate entirely. Source is the unmodified
+# crates.io 0.4.1 tarball plus the marked ELOHIM PATCH hunks.
+# Upstream-candidate: holochain/kitsune2.
+kitsune2_transport_iroh = { path = "patches/kitsune2_transport_iroh" }
 tx5 = { path = "../tx5/crates/tx5" }
 tx5-connection = { path = "../tx5/crates/tx5-connection" }
 tx5-core = { path = "../tx5/crates/tx5-core" }

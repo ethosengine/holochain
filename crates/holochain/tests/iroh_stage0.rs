@@ -221,3 +221,166 @@ async fn stage0_two_conductors_against_sovereign_relay() {
     println!("STAGE0 bob read alice's record — ops exchanged over iroh/relay.elohim.host");
     println!("STAGE0 PASS");
 }
+
+/// Doorway-A relay, the OTHER half of the Wave-2 per-doorway relay split.
+/// Override with `ELOHIM_RELAY_URL_A`.
+const DEFAULT_RELAY_URL_A: &str = "https://relay.alpha.elohim.host";
+
+/// Stage-0b — the CROSS-RELAY mechanism proof.
+///
+/// Wave-2 relay sovereignty (design doc D2) homes each conductor to its own
+/// doorway's relay: doorway A -> `relay.alpha.elohim.host`, doorway B ->
+/// `relay.elohim.host`. D2's rationale states that peers need not share a
+/// relay, because a peer URL embeds *that peer's* home relay and the dialing
+/// side connects through the other peer's relay.
+///
+/// `stage0_two_conductors_against_sovereign_relay` above cannot test that
+/// claim: it homes BOTH conductors to the SAME relay. This test homes them to
+/// DIFFERENT relays — the actual alpha topology — while sharing one local
+/// bootstrap server, so the only variable is the relay split.
+///
+/// Regression guard for the 2026-08-09 seam: `kitsune2_transport_iroh`'s
+/// `IrohTransport::own_url_for_preflight` failed CLOSED whenever a peer homed
+/// to a relay the local node did not home to, so every doorway-B -> doorway-A
+/// initiation died. It surfaced as `Connection attempted before home relay URL
+/// is known` — an error naming a DIFFERENT condition (no local URL at all) on
+/// conductors whose home relay was confirmed and whose per-space relays had
+/// all been inserted. Fixed by the vendored `patches/kitsune2_transport_iroh`
+/// [patch.crates-io] entry; see its ELOHIM PATCH note.
+///
+/// Run with:
+///   cargo test --locked -p holochain --test iroh_stage0 \
+///     --features test_utils -- --nocapture stage0b
+///
+/// Requires BOTH relays reachable from the runner.
+#[tokio::test(flavor = "multi_thread")]
+async fn stage0b_cross_relay_two_doorway_relays() {
+    holochain_trace::test_run();
+
+    let relay_b =
+        std::env::var("ELOHIM_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
+    let relay_a =
+        std::env::var("ELOHIM_RELAY_URL_A").unwrap_or_else(|_| DEFAULT_RELAY_URL_A.to_string());
+    assert_ne!(
+        relay_a.trim_end_matches('/'),
+        relay_b.trim_end_matches('/'),
+        "stage0b is meaningless unless the two conductors home to DIFFERENT \
+         relays — that split IS the thing under test"
+    );
+    println!("STAGE0b relay_a={relay_a} relay_b={relay_b}");
+
+    #[cfg(not(feature = "transport-iroh"))]
+    compile_error!("iroh_stage0 requires the `transport-iroh` feature");
+    #[cfg(feature = "transport-tx5-backend-go-pion")]
+    compile_error!(
+        "iroh_stage0 requires `transport-tx5-backend-go-pion` to be ABSENT — \
+         kitsune2 0.4.1 selects tx5 whenever it is compiled"
+    );
+
+    let entry_def = EntryDef::default_from_id("entry");
+    let zomes = SweetInlineZomes::new(vec![entry_def], 0)
+        .function("create", move |api, _: ()| {
+            let entry = Entry::app(().try_into().unwrap()).unwrap();
+            let hash = api.create(CreateInput::new(
+                InlineZomeSet::get_entry_location(&api, EntryDefIndex(0)),
+                EntryVisibility::Public,
+                entry,
+                ChainTopOrdering::default(),
+            ))?;
+            Ok(hash)
+        })
+        .function("get", move |api, hash: ActionHash| {
+            let records = api.get(vec![GetInput::new(hash.into(), GetOptions::network())])?;
+            Ok(records)
+        })
+        .0;
+
+    let (dna, _, _) = SweetDnaFile::unique_from_inline_zomes(zomes).await;
+    println!("STAGE0b dna_hash={}", dna.dna_hash());
+
+    // ONE bootstrap server, TWO relay homes. Sharing `inner` is what keeps the
+    // peers discoverable while splitting their transport home — exactly how
+    // alpha's two doorways share one bootstrap namespace.
+    let inner = SweetLocalRendezvous::new_raw().await;
+    let rendezvous_b: DynSweetRendezvous = Arc::new(ElohimRelayRendezvous {
+        inner: inner.clone(),
+        relay: relay_b.clone(),
+    });
+    let rendezvous_a: DynSweetRendezvous = Arc::new(ElohimRelayRendezvous {
+        inner,
+        relay: relay_a.clone(),
+    });
+    println!(
+        "STAGE0b bootstrap_addr={} (shared, local, private space)",
+        rendezvous_b.bootstrap_addr()
+    );
+
+    let config = SweetConductorConfig::rendezvous(true);
+    let c_b = SweetConductor::from_config_rendezvous(config.clone(), rendezvous_b).await;
+    let c_a = SweetConductor::from_config_rendezvous(config.clone(), rendezvous_a).await;
+
+    for (label, c, expected) in [("B", &c_b, &relay_b), ("A", &c_a, &relay_a)] {
+        let net = &c.raw_handle().config.network;
+        println!("STAGE0b conductor{label} relay_url={}", net.relay_url);
+        assert_eq!(
+            net.relay_url.as_str().trim_end_matches('/'),
+            expected.trim_end_matches('/'),
+            "conductor {label} did not take its doorway's relay URL"
+        );
+    }
+
+    let mut conductors = SweetConductorBatch::new(vec![c_b, c_a]);
+    let apps = conductors.setup_app("stage0b", [&dna]).await.unwrap();
+    let ((bob,), (alice,)) = apps.into_tuples();
+
+    // Peer URLs must show BOTH relay hosts — proof the split is real and not
+    // collapsed by some shared default.
+    let mut hosts = std::collections::BTreeSet::new();
+    for c in conductors.iter() {
+        for info in c.raw_handle().get_agent_infos(None).await.unwrap() {
+            if let Some(url) = info.url.as_ref() {
+                let u = url.to_string();
+                println!("STAGE0b-PEER-URL {u}");
+                if let Some(rest) = u.strip_prefix("https://") {
+                    hosts.insert(
+                        rest.split('/')
+                            .next()
+                            .unwrap_or_default()
+                            .trim_end_matches(":443")
+                            // iroh's RelayUrl canonicalizes to an FQDN, so the
+                            // host carries a trailing root-label dot.
+                            .trim_end_matches('.')
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    println!("STAGE0b distinct relay hosts in peer store: {hosts:?}");
+    assert!(
+        hosts.len() >= 2,
+        "expected peer URLs on BOTH relays, saw {hosts:?} — the cross-relay \
+         condition never materialised, so a PASS here would prove nothing"
+    );
+
+    // The assertion the defect broke: ops cross the relay split.
+    let alice_zome = alice.zome(SweetInlineZomes::COORDINATOR);
+    let hash: ActionHash = conductors[1].call(&alice_zome, "create", ()).await;
+    println!("STAGE0b alice (doorway A) created action={hash}");
+
+    await_consistency_s(120u64, [&alice, &bob]).await.expect(
+        "ops did not converge ACROSS the per-doorway relay split — this is \
+             the own_url_for_preflight fail-closed seam if the logs carry \
+             'Connection attempted before home relay URL is known' on a \
+             conductor whose home relay was confirmed",
+    );
+
+    let bob_zome = bob.zome(SweetInlineZomes::COORDINATOR);
+    let records: Vec<Option<Record>> = conductors[0].call(&bob_zome, "get", hash.clone()).await;
+    assert!(
+        records.iter().any(|r| r.is_some()),
+        "bob (doorway B) could not get alice's (doorway A) record across the \
+         relay split"
+    );
+    println!("STAGE0b PASS — ops crossed relay_a <-> relay_b");
+}
