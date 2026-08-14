@@ -119,6 +119,11 @@ reqwest = { version = "0.12", default-features = false, features = [
 # fact deps
 petgraph = { version = "0.6.0", features = ["quickcheck", "stable_graph"] }
 
+# Optional continuous CPU profiler. The `pyroscope-prof` feature keeps the
+# profiler and its signal-sampling backend out of ordinary conductor builds.
+pyroscope = { version = "=0.5.8", optional = true }
+pyroscope_pprofrs = { version = "=0.2.10", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 sd-notify = "0.4"
 # Production allocator: jemalloc in place of glibc ptmalloc2. The base dep carries ONLY
@@ -216,6 +221,13 @@ jemalloc = ["dep:tikv-jemallocator"]
 # Build:   cargo build --release --bin holochain --no-default-features \
 #            --features sqlite-encrypted,wasmer_sys,backend-go-pion,jemalloc-prof
 jemalloc-prof = ["jemalloc", "tikv-jemallocator/profiling"]
+
+# Operator canary: push 100 Hz CPU profiles directly to Pyroscope. The binary
+# only starts the agent when PYROSCOPE_SERVER_ADDRESS is set, so compiling the
+# feature does not make profiler reachability a conductor-startup dependency.
+# Build:   cargo build --release --bin holochain --no-default-features \
+#            --features sqlite-encrypted,wasmer_sys,backend-go-pion,jemalloc,pyroscope-prof
+pyroscope-prof = ["dep:pyroscope", "dep:pyroscope_pprofrs"]
 
 # Use the "Influxive" opentelemetry metrics binding to write metrics
 # to an InfluxDB time series database.

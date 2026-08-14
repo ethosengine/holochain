@@ -10,6 +10,12 @@ use holochain_conductor_api::config::conductor::paths::ConfigRootPath;
 use holochain_conductor_api::config::conductor::KeystoreConfig;
 use holochain_trace::Output;
 use holochain_util::tokio_helper;
+#[cfg(feature = "pyroscope-prof")]
+use pyroscope::pyroscope::PyroscopeAgentRunning;
+#[cfg(feature = "pyroscope-prof")]
+use pyroscope::PyroscopeAgent;
+#[cfg(feature = "pyroscope-prof")]
+use pyroscope_pprofrs::{pprof_backend, PprofConfig};
 #[cfg(unix)]
 use sd_notify::{notify, NotifyState};
 use std::path::PathBuf;
@@ -26,6 +32,11 @@ use tracing::*;
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "pyroscope-prof")]
+const DEFAULT_PYROSCOPE_APPLICATION_NAME: &str = "holochain-conductor";
+#[cfg(feature = "pyroscope-prof")]
+const DEFAULT_PYROSCOPE_SAMPLE_RATE: u32 = 100;
 
 const MAGIC_CONDUCTOR_READY_STRING: &str = "Conductor ready.";
 
@@ -130,6 +141,9 @@ async fn async_main() {
     holochain_trace::init_fmt(opt.structured.clone()).expect("Failed to start contextual logging");
     debug!("holochain_trace initialized");
 
+    #[cfg(feature = "pyroscope-prof")]
+    let pyroscope_agent = start_pyroscope_agent();
+
     let data_root_path: DataRootPath = config.data_root_path_or_die();
 
     holochain_metrics::HolochainMetricsConfig::new(data_root_path.as_ref())
@@ -161,6 +175,75 @@ async fn async_main() {
     tracing::info!("Gracefully shutting down conductor...");
     let shutdown_result = conductor.shutdown().await;
     handle_shutdown(shutdown_result);
+
+    #[cfg(feature = "pyroscope-prof")]
+    shutdown_pyroscope_agent(pyroscope_agent);
+}
+
+#[cfg(feature = "pyroscope-prof")]
+fn start_pyroscope_agent() -> Option<PyroscopeAgent<PyroscopeAgentRunning>> {
+    let server_address = match std::env::var("PYROSCOPE_SERVER_ADDRESS") {
+        Ok(server_address) if !server_address.trim().is_empty() => server_address,
+        _ => {
+            info!("pyroscope-prof compiled in but disabled: PYROSCOPE_SERVER_ADDRESS is not set");
+            return None;
+        }
+    };
+    let application_name = std::env::var("PYROSCOPE_APPLICATION_NAME")
+        .unwrap_or_else(|_| DEFAULT_PYROSCOPE_APPLICATION_NAME.to_string());
+    let sample_rate = std::env::var("PYROSCOPE_SAMPLE_RATE")
+        .ok()
+        .and_then(|value| match value.parse::<u32>() {
+            Ok(0) | Err(_) => {
+                warn!(
+                    value,
+                    default = DEFAULT_PYROSCOPE_SAMPLE_RATE,
+                    "invalid PYROSCOPE_SAMPLE_RATE; using default"
+                );
+                None
+            }
+            Ok(value) => Some(value),
+        })
+        .unwrap_or(DEFAULT_PYROSCOPE_SAMPLE_RATE);
+    let pod_name = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+
+    let agent = PyroscopeAgent::builder(&server_address, &application_name)
+        .backend(pprof_backend(PprofConfig::new().sample_rate(sample_rate)))
+        .tags(vec![("pod", pod_name.as_str())])
+        .build()
+        .and_then(PyroscopeAgent::start);
+
+    match agent {
+        Ok(agent) => {
+            info!(
+                %server_address,
+                %application_name,
+                %pod_name,
+                sample_rate,
+                "Pyroscope CPU profiling started"
+            );
+            Some(agent)
+        }
+        Err(error) => {
+            warn!(%error, "Pyroscope CPU profiling could not start; continuing without it");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "pyroscope-prof")]
+fn shutdown_pyroscope_agent(agent: Option<PyroscopeAgent<PyroscopeAgentRunning>>) {
+    let Some(agent) = agent else {
+        return;
+    };
+
+    match agent.stop() {
+        Ok(agent) => {
+            agent.shutdown();
+            info!("Pyroscope CPU profiling stopped");
+        }
+        Err(error) => warn!(%error, "Pyroscope CPU profiling did not stop cleanly"),
+    }
 }
 
 async fn conductor_handle_from_config(opt: &Opt, config: ConductorConfig) -> ConductorHandle {
