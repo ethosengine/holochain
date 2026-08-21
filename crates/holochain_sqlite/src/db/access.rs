@@ -1,5 +1,6 @@
 use super::metrics::{
-    create_connection_use_time_metric, create_write_txn_duration_metric, Histogram,
+    create_connection_use_time_metric, create_read_saturation_metric,
+    create_write_txn_duration_metric, Histogram, ReadSaturationMetric,
 };
 use crate::db::conn::PConn;
 use crate::db::databases::DATABASE_HANDLES;
@@ -24,6 +25,14 @@ use tracing::Instrument;
 
 static ACQUIRE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
 static THREAD_ACQUIRE_TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
+
+/// How often, at most, the read pool saturation warning is logged per database.
+///
+/// Saturation is a sustained condition, not an event: once a pool is oversubscribed, every single
+/// acquisition attempt satisfies the condition. Logging each one turns a slow workload into a log
+/// flood that costs more CPU and I/O than the queries do. The count of suppressed occurrences is
+/// carried on the next line that is emitted, and the exact rate is available as a metric.
+const READ_SATURATION_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Wrapper around a Transaction reference which is typed by database kind.
 ///
@@ -110,8 +119,41 @@ pub struct DbRead<Kind: DbKindT> {
     statement_trace_fn: Option<fn(TraceEvent)>,
     max_readers: usize,
     num_readers: Arc<AtomicUsize>,
+    /// Counts read connection checkouts attempted while the pool is oversubscribed.
+    saturation_metric: ReadSaturationMetric,
+    /// Rate limiter state for the read pool saturation log line: when it was last emitted, and how
+    /// many occurrences have been suppressed since.
+    saturation_log_state: Arc<Mutex<SaturationLogState>>,
     use_time_metric: Histogram,
     write_txn_metric: Histogram,
+}
+
+/// Rate limiter state for the read pool saturation log line.
+#[derive(Debug, Default)]
+struct SaturationLogState {
+    last_logged: Option<Instant>,
+    suppressed: u64,
+}
+
+impl SaturationLogState {
+    /// Decide whether this occurrence should be logged, returning the number of occurrences that
+    /// were suppressed since the last line if so.
+    fn should_log(&mut self, now: Instant) -> Option<u64> {
+        let due = match self.last_logged {
+            None => true,
+            Some(last) => now.duration_since(last) >= READ_SATURATION_LOG_INTERVAL,
+        };
+
+        if due {
+            let suppressed = self.suppressed;
+            self.last_logged = Some(now);
+            self.suppressed = 0;
+            Some(suppressed)
+        } else {
+            self.suppressed += 1;
+            None
+        }
+    }
 }
 
 impl<Kind: DbKindT> std::fmt::Debug for DbRead<Kind> {
@@ -187,13 +229,22 @@ impl<Kind: DbKindT> DbRead<Kind> {
         // TODO: use semaphore for this message
         let waiting = self.num_readers.fetch_add(1, Ordering::Relaxed);
         if waiting > self.max_readers {
-            let s = tracing::info_span!("holochain_perf", kind = ?self.kind().kind());
-            s.in_scope(|| {
-                tracing::info!(
-                    "Database read connection is saturated. Util {:.2}%",
-                    waiting as f64 / self.max_readers as f64 * 100.0
-                )
-            });
+            // Always counted, so the true rate is visible even though the log line is throttled.
+            self.saturation_metric.add(1);
+
+            let suppressed = self.saturation_log_state.lock().should_log(Instant::now());
+
+            if let Some(suppressed) = suppressed {
+                let s = tracing::info_span!("holochain_perf", kind = ?self.kind().kind());
+                s.in_scope(|| {
+                    tracing::info!(
+                        "Database read connection is saturated. Util {:.2}% ({} further occurrences suppressed in the last {:?})",
+                        waiting as f64 / self.max_readers as f64 * 100.0,
+                        suppressed,
+                        READ_SATURATION_LOG_INTERVAL
+                    )
+                });
+            }
         } else {
             tracing::trace!("checkout_connection ready to acquire semaphore");
         }
@@ -328,6 +379,7 @@ impl<Kind: DbKindT + Send + Sync + 'static> DbWrite<Kind> {
 
         let use_time_metric = create_connection_use_time_metric(kind.kind());
         let write_txn_metric = create_write_txn_duration_metric(kind.kind());
+        let saturation_metric = create_read_saturation_metric(kind.kind());
 
         let db_read = DbRead {
             write_semaphore: Self::get_write_semaphore(kind.kind()),
@@ -335,6 +387,8 @@ impl<Kind: DbKindT + Send + Sync + 'static> DbWrite<Kind> {
             long_read_semaphore: Self::get_long_read_semaphore(kind.kind(), max_long_readers),
             max_readers,
             num_readers: Arc::new(AtomicUsize::new(0)),
+            saturation_metric,
+            saturation_log_state: Arc::new(Mutex::new(SaturationLogState::default())),
             kind: kind.clone(),
             path: path.unwrap_or_default(),
             connection_pool: pool,

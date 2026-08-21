@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## \[Unreleased\]
 
+- Rate limit the "Database read connection is saturated" log line to at most once per 30s per database, carrying the count of suppressed occurrences. Saturation is a sustained condition rather than an event, so logging every acquisition attempt turned an oversubscribed pool into a log flood that cost more than the queries did. The true rate is now available as the `hc.db.connections.read_saturation` counter, attributed by database kind.
+
 ## 0.6.3
 
 ## 0.6.2

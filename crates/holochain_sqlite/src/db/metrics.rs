@@ -68,3 +68,42 @@ fn db_kind_name(kind: DbKind) -> String {
     }
     .to_string()
 }
+
+/// An OpenTelemetry u64 counter pre-bound to a fixed set of attributes.
+#[derive(Clone)]
+pub struct Counter {
+    counter: metrics::Counter<u64>,
+    attributes: Vec<KeyValue>,
+}
+
+impl Counter {
+    /// Add to the counter using the pre-bound attributes.
+    pub fn add(&self, value: u64) {
+        self.counter.add(value, &self.attributes);
+    }
+}
+
+/// Metric for `hc.db.connections.read_saturation`.
+pub type ReadSaturationMetric = Counter;
+
+/// Create a [`ReadSaturationMetric`] bound to the given [`DbKind`].
+///
+/// Counts every attempt to check out a read connection while the read pool is oversubscribed. The
+/// corresponding log line is rate limited, so this counter is the accurate measure of how hard the
+/// read pool is being oversubscribed, and of which database.
+pub fn create_read_saturation_metric(kind: DbKind) -> ReadSaturationMetric {
+    let counter = meter("hc.db")
+        .u64_counter("hc.db.connections.read_saturation")
+        .with_description(
+            "Read connection checkouts attempted while the read pool was oversubscribed.",
+        )
+        .build();
+    let attributes = vec![
+        KeyValue::new("kind", db_kind_name(kind.clone())),
+        KeyValue::new("id", format!("{kind}")),
+    ];
+    Counter {
+        counter,
+        attributes,
+    }
+}
