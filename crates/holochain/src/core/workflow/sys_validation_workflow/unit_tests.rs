@@ -31,6 +31,7 @@ use holochain_zome_types::prelude::{
     Judged, SignedAction, SignedActionHashed,
 };
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use {
     hdk::prelude::AppEntryBytesFixturator, holo_hash::HashableContentExtSync,
@@ -233,6 +234,102 @@ async fn validate_op_with_dependency_not_found_on_the_dht() {
     assert!(ops_to_app_validate.is_empty());
 
     test_case.expect_app_validation_not_triggered().await;
+}
+
+/// A dependency that cannot be found must not be asked for again on the very next pass of the
+/// workflow. Without this, a node holding ops whose dependencies no peer has spins: every pass
+/// issues a network request per missing dependency, forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_dependency_is_not_refetched_on_the_next_pass() {
+    holochain_trace::test_run();
+
+    let mut test_case = TestCase::new().await;
+
+    let (_previous_action, op) = test_case.op_with_missing_previous_action().await;
+    test_case.save_op_to_dht(op).await.unwrap();
+
+    let get_calls = Arc::new(AtomicUsize::new(0));
+    let mut network = MockHolochainP2pDnaT::new();
+    network.expect_get().returning({
+        let get_calls = get_calls.clone();
+        move |_, _, _| {
+            get_calls.fetch_add(1, Ordering::SeqCst);
+            // Nothing found, as though no peer holds the dependency.
+            Ok(vec![WireOps::Record(WireRecordOps::new())])
+        }
+    });
+    network
+        .expect_target_arcs()
+        .returning(|| Ok(vec![kitsune2_api::DhtArc::Empty]));
+
+    test_case.with_retained_network_behaviour(network);
+
+    // First pass: the dependency is unknown, so it is asked for immediately. Nothing about the
+    // late-dependency case changes.
+    test_case.run().await;
+    assert_eq!(
+        get_calls.load(Ordering::SeqCst),
+        1,
+        "the first pass must still go to the network immediately"
+    );
+
+    // Second and third passes, with no time for the backoff to elapse: no further requests.
+    test_case.run().await;
+    test_case.run().await;
+    assert_eq!(
+        get_calls.load(Ordering::SeqCst),
+        1,
+        "a dependency in backoff must not be refetched on every pass"
+    );
+
+    // And the op is still waiting, not dropped and not accepted.
+    let ops_to_app_validate = test_case.get_ops_pending_app_validation().await;
+    assert!(ops_to_app_validate.is_empty());
+}
+
+/// Backing off must not blind the workflow to a dependency that turns up locally by some other
+/// route (gossip, publish, another op being integrated). Once the backoff elapses, the local
+/// re-check finds it and the op validates.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dependency_that_arrives_locally_after_backoff_is_still_picked_up() {
+    holochain_trace::test_run();
+
+    let mut test_case = TestCase::new().await;
+    // Keep the backoff short enough to elapse within the test.
+    test_case.with_retry_delay(std::time::Duration::from_millis(1));
+
+    let (previous_action, previous_op, op) = test_case.op_with_missing_previous_op().await;
+    let op_hash = test_case.save_op_to_dht(op).await.unwrap();
+
+    let mut network = MockHolochainP2pDnaT::new();
+    network
+        .expect_get()
+        .returning(|_, _, _| Ok(vec![WireOps::Record(WireRecordOps::new())]));
+    network
+        .expect_target_arcs()
+        .returning(|| Ok(vec![kitsune2_api::DhtArc::Empty]));
+    test_case.with_retained_network_behaviour(network);
+
+    // First pass: the dependency is nowhere to be found, so the op stays in limbo.
+    test_case.run().await;
+    assert!(test_case.get_ops_pending_app_validation().await.is_empty());
+
+    // The dependency now arrives locally, by a route the workflow did not initiate.
+    test_case
+        .save_chain_op_as_cached(previous_op)
+        .await
+        .unwrap();
+    assert_eq!(previous_action.action().action_seq(), 10);
+
+    // Once the (very short) backoff has elapsed, the local re-check finds it.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    test_case.run().await;
+
+    let ops_to_app_validate = test_case.get_ops_pending_app_validation().await;
+    assert!(
+        ops_to_app_validate.contains(&op_hash),
+        "the op should validate once its dependency is held locally"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -743,6 +840,11 @@ struct TestCase {
     publish_trigger: (TriggerSender, TriggerReceiver),
     self_trigger: (TriggerSender, TriggerReceiver),
     actual_network: Option<MockHolochainP2pDnaT>,
+    /// A network mock that is kept across runs, so that a test can assert on how many requests
+    /// several passes of the workflow make in total.
+    retained_network: Option<Arc<MockHolochainP2pDnaT>>,
+    /// The base of the missing-dependency backoff schedule, and the workflow's own retry delay.
+    retry_delay: std::time::Duration,
 }
 
 impl TestCase {
@@ -766,11 +868,67 @@ impl TestCase {
             publish_trigger: TriggerSender::new(),
             self_trigger: TriggerSender::new(),
             actual_network: None,
+            retained_network: None,
+            retry_delay: std::time::Duration::from_secs(10),
         }
+    }
+
+    /// Shorten the retry delay so that the missing-dependency backoff elapses within a test.
+    fn with_retry_delay(&mut self, retry_delay: std::time::Duration) -> &mut Self {
+        self.retry_delay = retry_delay;
+        self
     }
 
     fn dna_hash(&self) -> DnaHash {
         self.dna_hash.hash.clone()
+    }
+
+    /// An op whose previous action is not held anywhere, plus that previous action.
+    async fn op_with_missing_previous_action(&self) -> (SignedActionHashed, DhtOp) {
+        let mut validation_package_action = fixt!(Action, AgentValidationPkgAction);
+        validation_package_action.header.author = self.agent.clone();
+        validation_package_action.header.action_seq = 10;
+        let previous_action = self.sign_action(validation_package_action).await;
+
+        let op = self.op_depending_on(&previous_action);
+
+        (previous_action, op)
+    }
+
+    /// As [`Self::op_with_missing_previous_action`], but also returns the chain op that would
+    /// satisfy the dependency, so a test can make it appear locally partway through.
+    async fn op_with_missing_previous_op(&self) -> (SignedActionHashed, ChainOp, DhtOp) {
+        let mut prev_create_action = fixt!(Action, CreateAction);
+        prev_create_action.header.author = self.agent.clone();
+        prev_create_action.header.action_seq = 10;
+        *prev_create_action.entry_type_mut().unwrap() = EntryType::App(AppEntryDef {
+            entry_index: 0.into(),
+            zome_index: 0.into(),
+            visibility: EntryVisibility::Public,
+        });
+        let previous_action = self.sign_action(prev_create_action.clone()).await;
+        let previous_op =
+            ChainOp::AgentActivity(SignedAction::new(prev_create_action, fixt!(Signature)));
+
+        let op = self.op_depending_on(&previous_action);
+
+        (previous_action, previous_op, op)
+    }
+
+    /// An op that cannot be validated until `previous_action` is held.
+    fn op_depending_on(&self, previous_action: &SignedActionHashed) -> DhtOp {
+        let mut create_action = fixt!(Action, CreateAction);
+        create_action.header.author = previous_action.action().author().clone();
+        create_action.header.action_seq = previous_action.action().action_seq() + 1;
+        create_action.header.prev_action = Some(previous_action.as_hash().clone());
+        create_action.header.timestamp = Timestamp::now();
+        *create_action.entry_type_mut().unwrap() = EntryType::App(AppEntryDef {
+            entry_index: 0.into(),
+            zome_index: 0.into(),
+            visibility: EntryVisibility::Public,
+        });
+
+        ChainOp::AgentActivity(SignedAction::new(create_action, fixt!(Signature))).into()
     }
 
     async fn sign_action(&self, action: Action) -> SignedActionHashed {
@@ -782,6 +940,12 @@ impl TestCase {
 
     fn with_network_behaviour(&mut self, network: MockHolochainP2pDnaT) -> &mut Self {
         self.actual_network = Some(network);
+        self
+    }
+
+    /// Use this network mock for every run, rather than only the next one.
+    fn with_retained_network_behaviour(&mut self, network: MockHolochainP2pDnaT) -> &mut Self {
+        self.retained_network = Some(Arc::new(network));
         self
     }
 
@@ -895,11 +1059,14 @@ impl TestCase {
         let workspace = SysValidationWorkspace::new(
             self.test_space.space.dht_store.clone(),
             self.dna_hash.hash.clone(),
-            std::time::Duration::from_secs(10),
+            self.retry_delay,
         );
 
         println!("Running with network: {:?}", self.actual_network);
-        let actual_network = Arc::new(self.actual_network.take().unwrap_or_default());
+        let actual_network: holochain_p2p::DynHolochainP2pDna = match &self.retained_network {
+            Some(network) => network.clone(),
+            None => Arc::new(self.actual_network.take().unwrap_or_default()),
+        };
 
         sys_validation_workflow(
             Arc::new(workspace),

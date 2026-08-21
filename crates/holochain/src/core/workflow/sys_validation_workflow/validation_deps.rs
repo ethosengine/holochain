@@ -1,7 +1,9 @@
+use super::missing_dep_backoff::MissingDepRetry;
 use holochain_cascade::CascadeSource;
 use holochain_types::prelude::*;
 use std::ops::Deref;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -83,18 +85,107 @@ impl ValidationDependencies {
         }
     }
 
-    /// Get the hashes and types of all dependencies that are currently missing from the DHT.
-    pub(super) fn get_missing_dependencies(&self) -> Vec<(ActionHash, ValidationDependencyType)> {
+    /// Get the missing dependencies whose backoff schedule says they are due to be fetched from
+    /// the network now.
+    ///
+    /// A dependency that has repeatedly failed to be found is not due on most passes of the
+    /// workflow. It is never removed from the missing set, so it will be asked for again once its
+    /// backoff elapses; it just stops costing a network request every retry interval.
+    pub(super) fn get_missing_dependencies_due_for_fetch(
+        &self,
+        now: Instant,
+    ) -> Vec<(ActionHash, ValidationDependencyType)> {
         self.states
             .iter()
             .filter_map(|(hash, state)| {
-                if state.dependency.is_none() {
-                    Some((hash.clone(), state.dependency_type.clone()))
-                } else {
-                    None
+                if state.dependency.is_some() {
+                    return None;
                 }
+
+                let due = state
+                    .retry
+                    .as_ref()
+                    .map(|r| r.due_for_network_fetch(now))
+                    .unwrap_or(true);
+
+                due.then(|| (hash.clone(), state.dependency_type.clone()))
             })
             .collect()
+    }
+
+    /// Count the dependencies that are currently missing, and how many of those have failed often
+    /// enough to be reported as unfetchable.
+    pub(super) fn missing_dependency_counts(&self) -> MissingDependencyCounts {
+        let mut counts = MissingDependencyCounts::default();
+        for state in self.states.values() {
+            if state.dependency.is_some() {
+                continue;
+            }
+            counts.missing += 1;
+            if state
+                .retry
+                .as_ref()
+                .map(|r| r.is_unfetchable())
+                .unwrap_or(false)
+            {
+                counts.unfetchable += 1;
+            }
+        }
+        counts
+    }
+
+    /// Whether the local databases should be searched for this dependency on this pass.
+    ///
+    /// Always marks the dependency as retained, so that skipping the search never causes the
+    /// dependency (and with it, its backoff state) to be purged.
+    pub(super) fn needs_local_recheck(&mut self, hash: &ActionHash, now: Instant) -> bool {
+        self.retained_deps.insert(hash.clone());
+
+        match self.states.get(hash) {
+            // Never looked for it: we have to look.
+            None => true,
+            // Already held.
+            Some(state) if state.dependency.is_some() => false,
+            // Missing: only re-check when the backoff says so.
+            Some(state) => state
+                .retry
+                .as_ref()
+                .map(|r| r.due_for_local_recheck(now))
+                .unwrap_or(true),
+        }
+    }
+
+    /// Record that a search of the local databases for this dependency came back empty, advancing
+    /// its local re-check schedule.
+    pub(super) fn note_local_miss(&mut self, hash: &ActionHash, now: Instant, base: Duration) {
+        if let Some(state) = self.states.get_mut(hash) {
+            if state.dependency.is_none() {
+                state
+                    .retry
+                    .get_or_insert_with(|| MissingDepRetry::new(now))
+                    .record_local_miss(now, base);
+            }
+        }
+    }
+
+    /// Record that a network fetch for this dependency came back empty, advancing its network
+    /// retry schedule.
+    ///
+    /// Returns `true` if this failure is the transition into the unfetchable state, so the caller
+    /// can report it exactly once.
+    pub(super) fn note_network_miss(
+        &mut self,
+        hash: &ActionHash,
+        now: Instant,
+        base: Duration,
+    ) -> bool {
+        match self.states.get_mut(hash) {
+            Some(state) if state.dependency.is_none() => state
+                .retry
+                .get_or_insert_with(|| MissingDepRetry::new(now))
+                .record_network_miss(now, base),
+            _ => false,
+        }
     }
 
     /// Insert an action which was found after this set of dependencies was created.
@@ -236,12 +327,24 @@ impl ValidationDependencies {
     }
 }
 
+/// A count of the dependencies sys validation is waiting on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct MissingDependencyCounts {
+    /// Dependencies that are not held locally.
+    pub missing: usize,
+    /// The subset of `missing` that has failed often enough to be reported as unfetchable.
+    pub unfetchable: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct ValidationDependencyState {
     /// The type of dependency this is, either an Action or a Record.
     dependency_type: ValidationDependencyType,
     /// The dependency if we've been able to fetch it, otherwise None until we manage to find it.
     dependency: Option<ValidationDependency>,
+    /// The retry schedule for a dependency we have not been able to find. `None` once the
+    /// dependency is held.
+    retry: Option<MissingDepRetry>,
 }
 
 impl ValidationDependencyState {
@@ -263,6 +366,7 @@ impl ValidationDependencyState {
                 value,
                 fetched_from,
             }),
+            retry: None,
         }
     }
 
@@ -270,6 +374,7 @@ impl ValidationDependencyState {
         Self {
             dependency_type,
             dependency: None,
+            retry: Some(MissingDepRetry::new(Instant::now())),
         }
     }
 
@@ -286,6 +391,8 @@ impl ValidationDependencyState {
                     value: ValidationDependencyValue::Action(action),
                     fetched_from: CascadeSource::Network,
                 });
+                // Found: it is no longer on a retry schedule.
+                self.retry = None;
             }
             _ => {
                 tracing::warn!(
@@ -315,6 +422,8 @@ impl ValidationDependencyState {
                     )),
                     fetched_from: CascadeSource::Network,
                 });
+                // Found: it is no longer on a retry schedule.
+                self.retry = None;
             }
             _ => {
                 tracing::warn!("Attempted to set a warranted record dependency that already has a value, this is a bug")
