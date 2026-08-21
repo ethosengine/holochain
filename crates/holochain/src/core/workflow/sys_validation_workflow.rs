@@ -96,11 +96,15 @@ use self::validation_deps::SysValDeps;
 use self::validation_deps::ValidationDependencies;
 use self::validation_deps::ValidationDependencyState;
 use crate::conductor::Conductor;
+use crate::core::metrics::{
+    sys_validation_missing_deps_metric, sys_validation_unfetchable_deps_metric,
+};
 use crate::core::queue_consumer::TriggerSender;
 use crate::core::queue_consumer::WorkComplete;
 use crate::core::sys_validate::*;
 use crate::core::validation::*;
 use crate::core::workflow::error::WorkflowResult;
+use crate::core::workflow::sys_validation_workflow::missing_dep_backoff::DEFAULT_RETRY_BASE;
 use crate::core::workflow::sys_validation_workflow::validation_deps::{
     ValidationDependencyType, ValidationDependencyValue, WarrantedDep,
 };
@@ -124,6 +128,7 @@ use types::Outcome;
 
 pub mod types;
 
+pub mod missing_dep_backoff;
 pub mod validation_deps;
 pub mod validation_query;
 
@@ -187,9 +192,23 @@ pub async fn sys_validation_workflow(
         trigger_integration.trigger(&"sys_validation_workflow");
     }
 
-    // Now go to the network to try to fetch missing dependencies
+    // Now go to the network to try to fetch missing dependencies. Dependencies that have failed
+    // repeatedly are on a backoff schedule and are only attempted when they come due, so this is
+    // not necessarily a request per missing dependency.
     let num_fetched =
-        fetch_missing_dependencies(&workspace, network, current_validation_dependencies).await;
+        fetch_missing_dependencies(&workspace, network, current_validation_dependencies.clone())
+            .await;
+
+    let dep_counts = current_validation_dependencies
+        .lock()
+        .expect("poisoned")
+        .missing_dependency_counts();
+    let dna_attrs = [opentelemetry::KeyValue::new(
+        "dna_hash",
+        workspace.dna_hash.to_string(),
+    )];
+    sys_validation_missing_deps_metric().record(dep_counts.missing as u64, &dna_attrs);
+    sys_validation_unfetchable_deps_metric().record(dep_counts.unfetchable as u64, &dna_attrs);
 
     if outcome_summary.missing > 0 {
         tracing::debug!(
@@ -208,9 +227,11 @@ pub async fn sys_validation_workflow(
 
     if num_fetched < outcome_summary.missing {
         tracing::info!(
-            "Sys validation sleeping for {:?}, with {num_fetched} fetched of {} missing dependencies",
+            "Sys validation sleeping for {:?}, with {num_fetched} fetched of {} missing dependencies ({} of {} tracked dependencies are unfetchable and on a slow sweep)",
             workspace.sys_validation_retry_delay,
-            outcome_summary.missing
+            outcome_summary.missing,
+            dep_counts.unfetchable,
+            dep_counts.missing
         );
         Ok(WorkComplete::Incomplete(Some(
             workspace.sys_validation_retry_delay,
@@ -261,6 +282,7 @@ async fn sys_validation_workflow_inner(
         current_validation_dependencies.clone(),
         cascade.clone(),
         sorted_ops.clone().into_iter(),
+        workspace.sys_validation_retry_delay,
     )
     .await;
 
@@ -454,80 +476,140 @@ async fn fetch_missing_dependencies(
     let missing_dependencies = current_validation_dependencies
         .lock()
         .expect("poisoned")
-        .get_missing_dependencies();
+        .get_missing_dependencies_due_for_fetch(std::time::Instant::now());
 
-    futures::stream::iter(missing_dependencies.into_iter().map(|(hash, dep_type)| {
-        let network_cascade = network_cascade.clone();
-        let current_validation_dependencies = current_validation_dependencies.clone();
-        async move {
-            match dep_type {
-                ValidationDependencyType::Action => {
-                    match network_cascade
-                        .retrieve_action(hash, Default::default())
-                        .await
-                    {
-                        Ok(Some((action, source))) => {
-                            let mut deps =
-                                current_validation_dependencies.lock().expect("poisoned");
+    let retry_base = workspace.sys_validation_retry_delay;
+    let newly_unfetchable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-                            if deps.insert_action(action, source) {
-                                1
-                            } else {
+    let num_fetched: usize =
+        futures::stream::iter(missing_dependencies.into_iter().map(|(hash, dep_type)| {
+            let network_cascade = network_cascade.clone();
+            let current_validation_dependencies = current_validation_dependencies.clone();
+            let newly_unfetchable = newly_unfetchable.clone();
+            async move {
+                match dep_type {
+                    ValidationDependencyType::Action => {
+                        match network_cascade
+                            .retrieve_action(hash.clone(), Default::default())
+                            .await
+                        {
+                            Ok(Some((action, source))) => {
+                                let mut deps =
+                                    current_validation_dependencies.lock().expect("poisoned");
+
+                                if deps.insert_action(action, source) {
+                                    1
+                                } else {
+                                    0
+                                }
+                            }
+                            Ok(None) => {
+                                // Not found on the network. The dependency stays in the missing set
+                                // and is asked for again when its backoff schedule says it is due,
+                                // so a dependency nobody holds stops costing a request every retry
+                                // interval.
+                                note_network_miss(
+                                    &current_validation_dependencies,
+                                    &hash,
+                                    retry_base,
+                                    &newly_unfetchable,
+                                );
                                 0
                             }
-                        }
-                        Ok(None) => {
-                            // This is fine, we didn't find it on the network, so we'll have to try again.
-                            // TODO This will hit the network again fairly quickly if sys validation is triggered again soon.
-                            //      It would be more efficient to wait a bit before trying again.
-                            0
-                        }
-                        Err(err) => {
-                            tracing::error!(?err, "Error fetching missing dependency");
-                            0
+                            Err(err) => {
+                                tracing::error!(?err, "Error fetching missing dependency");
+                                note_network_miss(
+                                    &current_validation_dependencies,
+                                    &hash,
+                                    retry_base,
+                                    &newly_unfetchable,
+                                );
+                                0
+                            }
                         }
                     }
-                }
-                ValidationDependencyType::Warranted(chain_op_type) => {
-                    match network_cascade
-                        .retrieve_public_record(hash.clone().into(), Default::default())
-                        .await
-                    {
-                        Ok(Some((record, source))) => {
-                            let mut deps =
-                                current_validation_dependencies.lock().expect("poisoned");
+                    ValidationDependencyType::Warranted(chain_op_type) => {
+                        match network_cascade
+                            .retrieve_public_record(hash.clone().into(), Default::default())
+                            .await
+                        {
+                            Ok(Some((record, source))) => {
+                                let mut deps =
+                                    current_validation_dependencies.lock().expect("poisoned");
 
-                            if deps.insert_pending_validation_warranted(
-                                record.signed_action,
-                                chain_op_type,
-                                source,
-                            ) {
-                                1
-                            } else {
+                                if deps.insert_pending_validation_warranted(
+                                    record.signed_action,
+                                    chain_op_type,
+                                    source,
+                                ) {
+                                    1
+                                } else {
+                                    0
+                                }
+                            }
+                            Ok(None) => {
+                                // Not found on the network. See the note in the Action arm above.
+                                note_network_miss(
+                                    &current_validation_dependencies,
+                                    &hash,
+                                    retry_base,
+                                    &newly_unfetchable,
+                                );
                                 0
                             }
-                        }
-                        Ok(None) => {
-                            // This is fine, we didn't find it on the network, so we'll have to try again.
-                            // TODO This will hit the network again fairly quickly if sys validation is triggered again soon.
-                            //      It would be more efficient to wait a bit before trying again.
-                            0
-                        }
-                        Err(err) => {
-                            tracing::error!(?err, "Error fetching missing dependency");
-                            0
+                            Err(err) => {
+                                tracing::error!(?err, "Error fetching missing dependency");
+                                note_network_miss(
+                                    &current_validation_dependencies,
+                                    &hash,
+                                    retry_base,
+                                    &newly_unfetchable,
+                                );
+                                0
+                            }
                         }
                     }
                 }
             }
-        }
-        .boxed()
-    }))
-    .buffer_unordered(10)
-    .collect::<Vec<usize>>()
-    .await
-    .into_iter()
-    .sum()
+            .boxed()
+        }))
+        .buffer_unordered(10)
+        .collect::<Vec<usize>>()
+        .await
+        .into_iter()
+        .sum();
+
+    let newly_unfetchable = newly_unfetchable.load(std::sync::atomic::Ordering::Relaxed);
+    if newly_unfetchable > 0 {
+        // Say it once, at the transition. These dependencies are not dropped and are never treated
+        // as valid; they move to a slow sweep instead of being asked for every retry interval.
+        tracing::info!(
+            "{} sys validation dependencies could not be found on the network after {} attempts each and have moved to a slow sweep",
+            newly_unfetchable,
+            missing_dep_backoff::UNFETCHABLE_ATTEMPT_BUDGET
+        );
+    }
+
+    num_fetched
+}
+
+/// Record a failed network fetch for a missing dependency, counting the transition into the
+/// unfetchable state so the caller can report it once.
+fn note_network_miss(
+    deps: &SysValDeps,
+    hash: &ActionHash,
+    retry_base: Duration,
+    newly_unfetchable: &std::sync::atomic::AtomicUsize,
+) {
+    let became_unfetchable = deps.lock().expect("poisoned").note_network_miss(
+        hash,
+        std::time::Instant::now(),
+        retry_base,
+    );
+
+    if became_unfetchable {
+        newly_unfetchable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 // - Move any cached warranted ops because they need to be validated now.
@@ -597,17 +679,27 @@ async fn move_and_check_warrant_deps(
     }
 }
 
+/// The number of local dependency lookups allowed to be in flight at once.
+///
+/// Each lookup opens a read transaction on every local store in the cascade, so an unbounded fan
+/// out over a large missing set oversubscribes the database read pool by orders of magnitude
+/// (the pool defaults to 8 readers). Bounding this costs nothing in throughput - the pool is the
+/// real limit either way - and keeps the pool out of permanent saturation.
+const LOCAL_DEP_LOOKUP_CONCURRENCY: usize = 10;
+
 async fn retrieve_dependencies(
     current_validation_dependencies: SysValDeps,
     cascade: Arc<impl Cascade + Send + Sync>,
     dependencies: impl Iterator<Item = (ActionHash, ValidationDependencyType)>,
+    retry_base: Duration,
 ) {
+    let now = std::time::Instant::now();
     let dependency_fetches = dependencies
         .filter(|(hash, _)| {
-            !current_validation_dependencies
+            current_validation_dependencies
                 .lock()
                 .expect("poisoned")
-                .has(hash)
+                .needs_local_recheck(hash, now)
         })
         .map(|(hash, dep_type)| {
             // For each previous action that will be needed for validation, map the action to a fetch Action for its hash
@@ -641,8 +733,17 @@ async fn retrieve_dependencies(
                 .boxed()
         });
 
-    let new_deps: ValidationDependencies = ValidationDependencies::new_from_iter(futures::future::join_all(dependency_fetches)
-        .await
+    let results = futures::stream::iter(dependency_fetches)
+        .buffer_unordered(LOCAL_DEP_LOOKUP_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    // The dependencies we looked for on this pass and still did not find. Each one advances its
+    // own backoff schedule so that a dependency which keeps failing stops being looked for on
+    // every pass of the workflow.
+    let mut not_found = Vec::new();
+
+    let new_deps: ValidationDependencies = ValidationDependencies::new_from_iter(results
         .into_iter()
         .filter_map(|r| {
             // Filter out errors, preparing the rest to be put into a HashMap for easy access.
@@ -651,6 +752,7 @@ async fn retrieve_dependencies(
                     Some((hash, ValidationDependencyState::new_present(value, source)))
                 }
                 (hash, dep_type, Ok(None)) => {
+                    not_found.push(hash.clone());
                     Some((hash, ValidationDependencyState::new_pending(dep_type)))
                 }
                 (hash, dep_type, Err(e)) => {
@@ -660,10 +762,12 @@ async fn retrieve_dependencies(
             }
         }));
 
-    current_validation_dependencies
-        .lock()
-        .expect("poisoned")
-        .merge(new_deps);
+    let mut deps = current_validation_dependencies.lock().expect("poisoned");
+    deps.merge(new_deps);
+
+    for hash in not_found {
+        deps.note_local_miss(&hash, now, retry_base);
+    }
 }
 
 fn get_dependency_hashes_from_actions(
@@ -700,6 +804,9 @@ async fn fetch_previous_actions(
         current_validation_dependencies,
         cascade,
         get_dependency_hashes_from_actions(actions).into_iter(),
+        // This path is a one-shot direct validation with a fresh dependency set, so the backoff
+        // schedule never comes into play; the base only has to be a sane value.
+        DEFAULT_RETRY_BASE,
     )
     .await;
 }
@@ -826,11 +933,13 @@ async fn retrieve_previous_actions_for_ops(
     current_validation_dependencies: SysValDeps,
     cascade: Arc<impl Cascade + Send + Sync>,
     ops: impl Iterator<Item = DhtOpHashed>,
+    retry_base: Duration,
 ) {
     retrieve_dependencies(
         current_validation_dependencies,
         cascade,
         get_dependencies_from_ops(ops).into_iter(),
+        retry_base,
     )
     .await;
 }

@@ -2368,6 +2368,7 @@ impl TestCase {
                 .clone()]
             .into_iter()
             .map(DhtOpHashed::from_content_sync),
+            super::missing_dep_backoff::DEFAULT_RETRY_BASE,
         )
         .await;
 

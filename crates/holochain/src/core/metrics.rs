@@ -156,3 +156,42 @@ pub(crate) fn send_remote_signal_metric() -> &'static SendRemoteSignalMetric {
             .build()
     })
 }
+
+pub(crate) type SysValidationMissingDepsMetric = metrics::Gauge<u64>;
+
+static SYS_VALIDATION_MISSING_DEPS_METRIC: OnceLock<SysValidationMissingDepsMetric> =
+    OnceLock::new();
+
+/// The number of dependencies sys validation is currently waiting to find.
+///
+/// This is the number that has to reach zero for the ops in `AwaitingSysDeps` to drain. A value
+/// that never falls is the signature of ops referencing data that no peer holds.
+pub(crate) fn sys_validation_missing_deps_metric() -> &'static SysValidationMissingDepsMetric {
+    SYS_VALIDATION_MISSING_DEPS_METRIC.get_or_init(|| {
+        meter("hc.conductor")
+            .u64_gauge("hc.conductor.sys_validation.missing_dependencies")
+            .with_description("Dependencies sys validation is waiting to find.")
+            .build()
+    })
+}
+
+pub(crate) type SysValidationUnfetchableDepsMetric = metrics::Gauge<u64>;
+
+static SYS_VALIDATION_UNFETCHABLE_DEPS_METRIC: OnceLock<SysValidationUnfetchableDepsMetric> =
+    OnceLock::new();
+
+/// The subset of missing dependencies that have failed often enough to be moved to a slow sweep.
+///
+/// These are neither dropped nor treated as valid. A rising value means the node is holding ops
+/// whose dependencies are not obtainable from the current network.
+pub(crate) fn sys_validation_unfetchable_deps_metric() -> &'static SysValidationUnfetchableDepsMetric
+{
+    SYS_VALIDATION_UNFETCHABLE_DEPS_METRIC.get_or_init(|| {
+        meter("hc.conductor")
+            .u64_gauge("hc.conductor.sys_validation.unfetchable_dependencies")
+            .with_description(
+                "Missing sys validation dependencies that repeatedly could not be found.",
+            )
+            .build()
+    })
+}
