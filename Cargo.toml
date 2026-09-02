@@ -36,7 +36,12 @@ members = [
   "crates/test_utils/wasm_common",
 ]
 
-exclude = ["crates/release-automation"]
+exclude = [
+  "crates/release-automation",
+  # ELOHIM: vendored [patch.crates-io] target, built as a path dependency
+  # rather than a workspace member (see the patch note below).
+  "patches/kitsune2_transport_iroh",
+]
 
 resolver = "2"
 
@@ -81,6 +86,30 @@ opt-level = "z"
 lto = true
 
 [patch.crates-io]
+# --- ELOHIM: cross-relay preflight fix (kitsune2_transport_iroh 0.5.0) ---
+# Upstream `IrohTransport::own_url_for_preflight` (src/lib.rs) fails CLOSED when
+# a peer homes to a relay we do not home to, so two peers on different relays
+# can never connect. The caller then reports it as "Connection attempted before
+# home relay URL is known", which names a DIFFERENT condition (no local URL) and
+# sent three separate investigations at the wrong seam.
+#
+# Per-doorway relays are a PROTOCOL REQUIREMENT, not a deployment accident:
+# doorways are different operators and peer-stewards register with several so
+# they keep web2 conveniences without any one portal being able to capture or
+# close them. Heterogeneous home relays inside one network therefore stay, and
+# this patch is permanent rather than transitional. kitsune2 0.5.0 codified the
+# opposite ("exact relay URL match, no fallback"; one relay per space) because
+# upstream assumes one operator per network — see PR #479.
+#
+# The patch falls back to our global (home-relay) URL instead of refusing, and
+# leaves `None` only for the genuinely address-less case.
+#
+# Vendored rather than submoduled: elohim/kitsune2 is pinned at v0.3.2, which
+# predates the transport_iroh crate entirely. Source is the unmodified
+# crates.io 0.5.0 tarball plus the marked ELOHIM PATCH hunks, kept out of the
+# workspace by its own empty [workspace] table.
+# Upstream-candidate: holochain/kitsune2 (Lane H issue + PR).
+kitsune2_transport_iroh = { path = "patches/kitsune2_transport_iroh" }
 # kitsune2_api = { path = "../kitsune2/crates/api" }
 # kitsune2_core = { path = "../kitsune2/crates/core" }
 # kitsune2 = { path = "../kitsune2/crates/kitsune2" }

@@ -4569,8 +4569,6 @@ dependencies = [
 [[package]]
 name = "kitsune2_transport_iroh"
 version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "564abdfe9800443a58e3bf6985b7950c1ff2af2158ac4a22a2278ea4bcc9e31d"
 dependencies = [
  "base64",
  "bytes",
