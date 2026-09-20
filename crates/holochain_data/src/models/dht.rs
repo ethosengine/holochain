@@ -53,6 +53,23 @@ pub(crate) struct AgentActivityRow {
     pub entry_blob: Option<Vec<u8>>,
 }
 
+/// Row from the live-capability-grant read: an `Action` row (flattened) plus
+/// the grant's resolved `Entry` blob.
+///
+/// The action columns are carried so the authorisation read can decode and
+/// validate the action exactly as the per-row `get_action` it replaced did —
+/// a corrupt action must keep failing the read closed rather than being
+/// silently trusted via the denormalised `entry_hash` column.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct LiveCapGrantRow {
+    /// The action columns (see [`ActionRow`]).
+    #[sqlx(flatten)]
+    pub action: ActionRow,
+    /// Serialized grant `Entry` blob (public `Entry`, else the author's
+    /// `PrivateEntry`). Never `NULL`: the query filters absent entries out.
+    pub blob: Vec<u8>,
+}
+
 /// Row pairing an `Action` (flattened) with the joined `ChainOp.validation_status`.
 /// Used by the authority-serving reads, which join `ChainOp` to enforce the
 /// `locally_validated = 1` guard and surface the record's validation status.

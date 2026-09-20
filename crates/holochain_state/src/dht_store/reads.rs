@@ -9,9 +9,7 @@ use super::DhtStore;
 use crate::prelude::ActionSequenceAndHash;
 use crate::query::{StateQueryError, StateQueryResult};
 use crate::scratch::SyncScratch;
-use holo_hash::{
-    ActionHash, AgentPubKey, AnyLinkableHash, DhtOpHash, EntryHash, ExternalHash, HasHash,
-};
+use holo_hash::{AgentPubKey, AnyLinkableHash, DhtOpHash, EntryHash, ExternalHash, HasHash};
 use holochain_data::kind::Dht;
 use holochain_data::DbRead;
 use holochain_state_types::{SourceChainCursor, SourceChainDump, SourceChainDumpRecord};
@@ -2333,7 +2331,69 @@ impl DhtStore<DbRead<Dht>> {
     /// Candidates are restricted to grants authored by `author` (the `CapGrant`
     /// index join filters on `Action.author`) and dropped when their entry has
     /// been updated or deleted by the author.
+    ///
+    /// Cost: one query per access class — two when a secret is supplied, one
+    /// otherwise — regardless of how many grants the author has ever
+    /// committed. It used to be `3N + ceil(N/500) + 1` queries for `N` grants
+    /// of a class, which on a long-lived chain made authorising a single zome
+    /// call take seconds. `valid_cap_grants_reference` below keeps that
+    /// implementation as a differential-test oracle.
+    ///
+    /// A corrupt action on a live grant still fails this read CLOSED (`Err`,
+    /// hence deny-all), matching the old per-row `get_action`, whose
+    /// `else { continue }` arm covered only a MISSING row while a row that
+    /// failed to decode propagated `sqlx::Error::Decode`. See
+    /// `holochain_data`'s `get_live_cap_grant_entries` for how that is
+    /// preserved and for the one deliberate relaxation (a corrupt action on an
+    /// already-revoked grant is filtered out before decode, so it no longer
+    /// errors — strictly more available, and it cannot authorise anything).
     pub async fn valid_cap_grants(
+        &self,
+        author: &AgentPubKey,
+        check_secret: Option<&CapSecret>,
+    ) -> StateQueryResult<Vec<CapGrant>> {
+        // `CapAccess` integer encoding (see the DHT schema): 0=Unrestricted,
+        // 1=Transferable, 2=Assigned. A secret-bearing check looks only at the
+        // grants that carry a secret; an unrestricted check only at unrestricted
+        // grants.
+        let access_types: &[i64] = if check_secret.is_some() {
+            &[1, 2]
+        } else {
+            &[0]
+        };
+
+        let mut grants = Vec::new();
+        for &access in access_types {
+            // One query per access class resolves the author's live grant
+            // entries of that class — the join applies the "not updated or
+            // deleted by the author" exclusion and the private-entry read that
+            // used to cost three queries per row plus a chunked batch read.
+            // The per-class `ORDER BY Action.seq` and the outer class order are
+            // unchanged, so the produced sequence — and therefore the grant
+            // that `SourceChain::valid_cap_grant` returns on a first match — is
+            // identical to the previous implementation. The one caveat is
+            // inherited, not introduced: `Action.seq` is not unique per author
+            // (the primary key is `hash`), so a forked or restored chain can
+            // tie, and neither implementation is stable under a tie.
+            let entries = self
+                .db()
+                .get_live_cap_grant_entries(author.clone(), access)
+                .await?;
+            for entry in entries {
+                if let Some(grant) = entry.as_cap_grant() {
+                    grants.push(grant);
+                }
+            }
+        }
+        Ok(grants)
+    }
+
+    /// The pre-optimisation implementation of
+    /// [`valid_cap_grants`](Self::valid_cap_grants), kept verbatim as a test
+    /// oracle. Differential tests assert the two agree over randomised grant
+    /// populations; nothing outside `cfg(test)` may call it.
+    #[cfg(test)]
+    pub(crate) async fn valid_cap_grants_reference(
         &self,
         author: &AgentPubKey,
         check_secret: Option<&CapSecret>,
@@ -2362,7 +2422,7 @@ impl DhtStore<DbRead<Dht>> {
             // in a single batch rather than one query per grant.
             let mut candidate_hashes: Vec<EntryHash> = Vec::new();
             for row in rows {
-                let action_hash = ActionHash::from_raw_36(row.action_hash);
+                let action_hash = holo_hash::ActionHash::from_raw_36(row.action_hash);
                 let Some(sah) = self.db().get_action(action_hash).await? else {
                     continue;
                 };

@@ -63,7 +63,7 @@ where
     Ok(())
 }
 
-fn row_to_signed_action_hashed(row: ActionRow) -> sqlx::Result<SignedActionHashed> {
+pub(crate) fn row_to_signed_action_hashed(row: ActionRow) -> sqlx::Result<SignedActionHashed> {
     let data: ActionData = holochain_serialized_bytes::decode(&row.action_data).map_err(|e| {
         sqlx::Error::Decode(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
