@@ -89,11 +89,22 @@ where
 ///   semantics (a NULL in the subquery would make the predicate NULL and
 ///   silently deny *every* grant); the columns are declared `NOT NULL` on a
 ///   `STRICT` table, so the guard can never change the result.
-/// - `COALESCE(e.blob, pe.blob)` reproduces `get_entries_by_hashes`'s
-///   visibility rule: a public `Entry` outranks a same-hash `PrivateEntry`, and
-///   the private branch is restricted to this author. A hash with neither is
-///   dropped, matching the old `entries.get(&entry_hash)` -> `None` ->
-///   `continue`.
+/// - The grant entry is read from `PrivateEntry` scoped to `?2` (this author)
+///   and NOWHERE ELSE. This is a correctness invariant, not an optimisation,
+///   and it is load-bearing: **`EntryType::CapGrant` is always
+///   `EntryVisibility::Private`** (`holochain_integrity_types::action`,
+///   `EntryType::visibility`), and the source-chain flush routes a private
+///   entry ONLY to `PrivateEntry` (`source_chain::flush`, the
+///   `private_entry_hashes` branch). A cap grant therefore has exactly one
+///   legitimate home — this author's `PrivateEntry` — and a row in the public
+///   `Entry` table at a grant entry hash cannot be a legitimate grant. Reading
+///   the grant entry with any public-table precedence (the former
+///   `COALESCE(e.blob, pe.blob)` / `get_entries_by_hashes(.., Some(author))`
+///   union) is therefore incorrect: it can resolve a grant entry hash to a
+///   public-table row that is not the author's real grant. **Do not reintroduce
+///   a public-first (or public-fallback) read here.** An `INNER JOIN` on
+///   `PrivateEntry` also drops a grant whose private entry is absent, matching
+///   the old `entries.get(&entry_hash)` -> `None` -> `continue`.
 /// - One output row per surviving `CapGrant` row, so repeated entries stay
 ///   repeated exactly as the old `candidate_hashes` loop kept them.
 ///
@@ -130,15 +141,14 @@ where
         "SELECT a.hash, a.author, a.seq, a.prev_hash, a.timestamp, a.action_type,
                 a.action_data, a.signature, a.entry_hash, a.private_entry,
                 a.record_validity,
-                COALESCE(e.blob, pe.blob) AS blob
+                pe.blob AS blob
          FROM CapGrant cg
          JOIN Action a ON cg.action_hash = a.hash
-         LEFT JOIN Entry e ON e.hash = a.entry_hash
-         LEFT JOIN PrivateEntry pe ON pe.hash = a.entry_hash AND pe.author = ?2
+         JOIN PrivateEntry pe ON pe.hash = a.entry_hash AND pe.author = ?2
          WHERE cg.cap_access = ?1
            AND a.author = ?2
            AND a.entry_hash IS NOT NULL
-           AND COALESCE(e.blob, pe.blob) IS NOT NULL
+           AND pe.blob IS NOT NULL
            AND a.entry_hash NOT IN (
                  SELECT u.original_entry_hash
                  FROM UpdatedRecord u

@@ -65,8 +65,10 @@ pub(crate) struct LiveCapGrantRow {
     /// The action columns (see [`ActionRow`]).
     #[sqlx(flatten)]
     pub action: ActionRow,
-    /// Serialized grant `Entry` blob (public `Entry`, else the author's
-    /// `PrivateEntry`). Never `NULL`: the query filters absent entries out.
+    /// Serialized grant `Entry` blob, read from the author's `PrivateEntry`
+    /// ONLY (a cap grant is always a private entry; the public `Entry` table is
+    /// deliberately not consulted — see `get_live_cap_grant_entries`). Never
+    /// `NULL`: the query filters absent entries out.
     pub blob: Vec<u8>,
 }
 
