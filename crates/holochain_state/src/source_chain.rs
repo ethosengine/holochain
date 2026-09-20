@@ -4375,6 +4375,130 @@ mod tests {
         Ok(())
     }
 
+    /// A capability grant is resolved ONLY from the author's `PrivateEntry`,
+    /// never from the public `Entry` table.
+    ///
+    /// A cap grant is always a private entry (`EntryType::CapGrant` =>
+    /// `EntryVisibility::Private`) and the source-chain flush routes a private
+    /// entry only to `PrivateEntry`, so the author's real grant lives there and
+    /// a row in the public `Entry` table at a grant entry hash is not a
+    /// legitimate grant. This test puts a *different* grant blob in the public
+    /// `Entry` table at the owner's grant entry hash (a raw INSERT) and pins
+    /// that the read resolves the owner's real private grant and never the
+    /// public-table row. It also records that the former public-first read
+    /// resolved a different row, so a regression is unambiguous.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_reads_only_the_private_entry() -> SourceChainResult<()> {
+        let TestCase {
+            chain,
+            agent_key: owner,
+            dht_store,
+            keystore,
+        } = TestCase::new().await;
+
+        let caller = keystore.new_sign_keypair_random().await.unwrap();
+
+        // The owner's real grant: Transferable, one specific function, with a
+        // secret. This is the only legitimate grant at its entry hash.
+        let owner_secret = secret_from(0x5EC1);
+        let owner_fn: GrantedFunction = ("zome_owner".into(), "fn_real".into());
+        let owner_grant = ZomeCallCapGrant::new(
+            "owner-real".into(),
+            CapAccess::Transferable {
+                secret: owner_secret,
+            },
+            listed(&[("zome_owner", "fn_real")]),
+        );
+        let (_action, grant_entry_hash) = put_cap_grant(&chain, &owner_grant).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        // A different grant blob (Unrestricted + All — it would authorise any
+        // agent for any function and ignore the secret) placed in the PUBLIC
+        // `Entry` table at the owner's grant entry hash. The owner's real grant
+        // lives in `PrivateEntry`, so this hash is empty in the public table and
+        // the insert lands cleanly. It is not a legitimate grant and the read
+        // must never consult it.
+        let public_row_grant = ZomeCallCapGrant::new(
+            "public-row".into(),
+            CapAccess::Unrestricted,
+            GrantedFunctions::All,
+        );
+        let public_row_entry = Entry::CapGrant(public_row_grant.clone());
+        let public_row_blob =
+            holochain_serialized_bytes::encode(&public_row_entry).expect("encode entry");
+        sqlx::query("INSERT INTO Entry (hash, blob) VALUES (?, ?)")
+            .bind(grant_entry_hash.get_raw_36())
+            .bind(public_row_blob)
+            .execute(dht_store.db().pool())
+            .await
+            .unwrap();
+
+        // A caller with an unrelated secret and an unrelated function. The
+        // access-class filter only needs *some* secret to reach the
+        // secret-bearing classes; the public-table grant, being Unrestricted,
+        // would then ignore the secret and the function.
+        let unrelated_secret = secret_from(0xBAD1);
+        let unrelated_fn: GrantedFunction = ("anything".into(), "at_all".into());
+
+        // (1) The former public-first read resolved the public-table row rather
+        //     than the owner's real grant. The reference oracle preserves that
+        //     old behaviour verbatim, so this documents the exact difference a
+        //     regression would reintroduce.
+        let reference_decision = oracle_decision(
+            &dht_store,
+            &owner,
+            &unrelated_fn,
+            &caller,
+            Some(unrelated_secret),
+        )
+        .await?;
+        assert_eq!(
+            reference_decision,
+            Some(CapGrant::from(public_row_grant.clone())),
+            "the former public-first read resolved the public-table row"
+        );
+
+        // (2) The fixed read consults only `PrivateEntry`.
+        //     - the candidate set never contains the public-table row;
+        let candidates = dht_store
+            .as_read()
+            .valid_cap_grants(&owner, Some(&owner_secret))
+            .await?;
+        assert!(
+            !candidates.contains(&CapGrant::from(public_row_grant.clone())),
+            "the public-table row must never appear as a candidate"
+        );
+        assert_eq!(
+            candidates,
+            vec![CapGrant::from(owner_grant.clone())],
+            "only the owner's real private grant is a candidate"
+        );
+
+        //     - and the public-table grant authorises nothing, for any secret
+        //       shape.
+        for probe_secret in [Some(unrelated_secret), Some(owner_secret), None] {
+            assert_eq!(
+                chain
+                    .valid_cap_grant(unrelated_fn.clone(), caller.clone(), probe_secret)
+                    .await?,
+                None,
+                "the public-table row must not authorise (secret: {:?})",
+                probe_secret.is_some()
+            );
+        }
+
+        // (3) The owner's own legitimate access is unaffected.
+        let legit = keystore.new_sign_keypair_random().await.unwrap();
+        assert_eq!(
+            chain
+                .valid_cap_grant(owner_fn.clone(), legit.clone(), Some(owner_secret))
+                .await?,
+            Some(owner_grant.into()),
+            "the owner's real grant must still authorise its legitimate caller"
+        );
+        Ok(())
+    }
+
     /// Two grants with identical content share one entry hash but have distinct
     /// actions. The old code produced one candidate per *action* (duplicates
     /// preserved) and a delete keyed on the shared entry hash revoked both;
