@@ -257,10 +257,11 @@ fn build_test_store_record_op_hashed(seed: u8) -> (DhtOpHashed, bool) {
     use holochain_types::prelude::{AppEntryBytes, Entry, Signature};
 
     let author = AgentPubKey::from_raw_36(vec![seed; 36]);
-    let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
     let entry = Entry::App(AppEntryBytes(
         holochain_serialized_bytes::SerializedBytes::from(UnsafeBytes::from(vec![seed; 8])),
     ));
+    // A network op's action carries the hash of its own entry content.
+    let entry_hash = EntryHash::with_data_sync(&entry);
     let sig = Signature::from([seed; 64]);
     let action = Action {
         header: ActionHeader {
@@ -345,6 +346,127 @@ async fn record_incoming_ops_inserts_limbo_chain_op() {
         .expect("LimboChainOp row not found");
     assert_eq!(row.require_receipt, 1, "require_receipt should be 1 (true)");
     assert!(row.serialized_size > 0, "serialized_size should be > 0");
+}
+
+/// Build a `CreateRecord` chain op whose action declares an `entry_hash` that
+/// does NOT hash from the entry content it carries, plus the (bogus) entry hash
+/// the action declares.  Mirrors a network op that claims a key its content does
+/// not produce.
+fn build_incoming_op_with_mismatched_entry_hash(seed: u8) -> (DhtOpHashed, holo_hash::EntryHash) {
+    use holo_hash::{ActionHash, EntryHash};
+    use holochain_serialized_bytes::UnsafeBytes;
+    use holochain_types::prelude::{AppEntryBytes, Entry, Signature};
+
+    let entry = Entry::App(AppEntryBytes(
+        holochain_serialized_bytes::SerializedBytes::from(UnsafeBytes::from(vec![seed; 8])),
+    ));
+    // A key that does not match the entry content above.
+    let declared_entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
+    assert_ne!(
+        declared_entry_hash,
+        EntryHash::with_data_sync(&entry),
+        "test fixture must declare a hash that does not match its content"
+    );
+    let action = Action {
+        header: ActionHeader {
+            author: AgentPubKey::from_raw_36(vec![seed; 36]),
+            timestamp: Timestamp::from_micros(seed as i64 * 1000),
+            action_seq: 1,
+            prev_action: Some(ActionHash::from_raw_36(vec![seed.wrapping_add(200); 36])),
+        },
+        data: ActionData::Create(CreateData {
+            entry_type: EntryType::App(AppEntryDef::new(
+                0.into(),
+                0.into(),
+                EntryVisibility::Public,
+            )),
+            entry_hash: declared_entry_hash.clone(),
+        }),
+    };
+    let op = DhtOp::ChainOp(Box::new(ChainOp::CreateRecord(
+        SignedAction::new(action, Signature::from([seed; 64])),
+        OpEntry::Present(entry),
+    )));
+    (DhtOpHashed::from_content_sync(op), declared_entry_hash)
+}
+
+#[tokio::test]
+async fn record_incoming_ops_stores_entry_when_hash_matches() {
+    // Happy path: a well-formed op whose entry content hashes to the action's
+    // entry hash is stored and its entry is readable by that hash.
+    let store = DhtStore::new_test(dht_id()).await.unwrap();
+    let (op, _action_hash, entry_hash) = store_record_op_with_hashes(21);
+    let op_hash = op.as_hash().clone();
+
+    store.record_incoming_ops(vec![(op, false)]).await.unwrap();
+
+    // The entry is present in the public Entry table under its content hash.
+    let entry = store
+        .db
+        .as_ref()
+        .get_entry(entry_hash, None)
+        .await
+        .unwrap();
+    assert!(
+        entry.is_some(),
+        "entry with a matching hash should be stored"
+    );
+
+    // The op is tracked in limbo, exactly as before this guard existed.
+    let limbo = store
+        .db
+        .as_ref()
+        .get_limbo_chain_op(op_hash)
+        .await
+        .unwrap();
+    assert!(limbo.is_some(), "matching op should be recorded in limbo");
+}
+
+#[tokio::test]
+async fn record_incoming_ops_skips_op_when_entry_hash_mismatches() {
+    // An op whose entry content does not hash to the action's declared entry
+    // hash must not have its entry written, and must not be stored as a pending
+    // op.
+    let store = DhtStore::new_test(dht_id()).await.unwrap();
+    let (op, declared_entry_hash) = build_incoming_op_with_mismatched_entry_hash(22);
+    let op_hash = op.as_hash().clone();
+
+    store.record_incoming_ops(vec![(op, false)]).await.unwrap();
+
+    // Assert directly against the Entry table: no row at the declared hash.
+    let entry = store
+        .db
+        .as_ref()
+        .get_entry(declared_entry_hash.clone(), None)
+        .await
+        .unwrap();
+    assert!(
+        entry.is_none(),
+        "entry whose content does not hash to its key must not be written"
+    );
+
+    // The op is not stored as a pending limbo op.
+    let limbo = store
+        .db
+        .as_ref()
+        .get_limbo_chain_op(op_hash)
+        .await
+        .unwrap();
+    assert!(
+        limbo.is_none(),
+        "an op with a hash/content mismatch must not be recorded for integration"
+    );
+
+    // A subsequent read by that hash never returns the planted content.
+    let read_back = store
+        .as_read()
+        .retrieve_entry(&declared_entry_hash, None)
+        .await
+        .unwrap();
+    assert!(
+        read_back.is_none(),
+        "a read by the declared hash must not return the mismatched content"
+    );
 }
 
 #[tokio::test]
@@ -1422,10 +1544,11 @@ fn store_record_op_with_hashes(
     use holochain_types::prelude::{AppEntryBytes, Entry, Signature};
 
     let author = AgentPubKey::from_raw_36(vec![seed; 36]);
-    let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
     let entry = Entry::App(AppEntryBytes(
         holochain_serialized_bytes::SerializedBytes::from(UnsafeBytes::from(vec![seed; 8])),
     ));
+    // A network op's action carries the hash of its own entry content.
+    let entry_hash = EntryHash::with_data_sync(&entry);
     let sig = Signature::from([seed; 64]);
     let action = Action {
         header: ActionHeader {
@@ -2590,10 +2713,11 @@ fn make_store_entry_op(seed: u8) -> (DhtOpHashed, EntryHash) {
     use holochain_serialized_bytes::UnsafeBytes;
     use holochain_types::prelude::{AppEntryBytes, Entry};
 
-    let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
     let entry = Entry::App(AppEntryBytes(
         holochain_serialized_bytes::SerializedBytes::from(UnsafeBytes::from(vec![seed; 8])),
     ));
+    // A network op's action carries the hash of its own entry content.
+    let entry_hash = EntryHash::with_data_sync(&entry);
     let action = Action {
         header: ActionHeader {
             author: AgentPubKey::from_raw_36(vec![seed; 36]),

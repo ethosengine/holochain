@@ -568,6 +568,22 @@ impl DhtStore<DbWrite<Dht>> {
                     if let Some(holochain_types::op::OpEntry::Present(entry)) = chain_op.op_entry()
                     {
                         let entry_hash = entry_hash_from_chain_op_action(signed_action.data())?;
+                        // The public Entry table is keyed by entry hash, so the
+                        // content must hash to the key the action declares. Recompute
+                        // the hash from the content the same way the render path does
+                        // and require it to match; otherwise a later read by that key
+                        // would return content that does not hash to it. Skip the op
+                        // instead of writing a key that disagrees with its content.
+                        let computed_entry_hash = EntryHash::with_data_sync(entry);
+                        if computed_entry_hash != entry_hash {
+                            tracing::warn!(
+                                msg = "Skipping incoming op: entry content does not hash to the action's entry hash.",
+                                ?op_hash,
+                                action_entry_hash = ?entry_hash,
+                                computed_entry_hash = ?computed_entry_hash,
+                            );
+                            continue;
+                        }
                         tx.insert_entry(&entry_hash, entry)
                             .await
                             .map_err(StateMutationError::from)?;

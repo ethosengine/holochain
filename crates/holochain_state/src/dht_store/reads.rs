@@ -5256,7 +5256,8 @@ mod tests {
             holochain_serialized_bytes::UnsafeBytes::from(vec![seed; 8]),
         );
         let entry = Entry::App(AppEntryBytes(entry_bytes));
-        let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
+        // The action carries the hash of its own entry content.
+        let entry_hash = EntryHash::with_data_sync(&entry);
 
         let action = Action {
             header: ActionHeader {
@@ -5543,12 +5544,35 @@ mod tests {
             .unwrap();
 
         let seed = 110u8;
-        let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
+        // The action carries the hash of its own entry content.
+        let entry_hash = EntryHash::with_data_sync(&make_entry(seed));
         let author = AgentPubKey::from_raw_36(vec![seed; 36]);
         let entry = make_entry(seed);
 
-        // First insert a AgentActivity op so the action is in the store.
-        let act_op = make_chain_op(seed, false);
+        // First insert an AgentActivity op whose action references the entry, so
+        // the record is fully live once the matching entry is stored.
+        let act_action = Action {
+            header: ActionHeader {
+                author: author.clone(),
+                timestamp: Timestamp::from_micros(seed as i64 * 1000),
+                action_seq: 1,
+                prev_action: Some(ActionHash::from_raw_36(vec![seed.wrapping_add(200); 36])),
+            },
+            data: ActionData::Create(CreateData {
+                entry_type: EntryType::App(AppEntryDef::new(
+                    0.into(),
+                    0.into(),
+                    EntryVisibility::Public,
+                )),
+                entry_hash: entry_hash.clone(),
+            }),
+        };
+        let act_op = (
+            DhtOpHashed::from_content_sync(DhtOp::ChainOp(Box::new(ChainOp::AgentActivity(
+                SignedAction::new(act_action, Signature::from([seed; 64])),
+            )))),
+            false,
+        );
         let action = match act_op.0.as_content() {
             DhtOp::ChainOp(c) => c.signed_action().data().clone(),
             _ => unreachable!(),
@@ -5639,12 +5663,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Shared entry hash for both creates.
-        let entry_hash = EntryHash::from_raw_36(vec![150u8; 36]);
+        // Shared entry for both creates; the action carries its content hash.
         let entry_bytes = holochain_serialized_bytes::SerializedBytes::from(
             holochain_serialized_bytes::UnsafeBytes::from(vec![1u8; 8]),
         );
         let entry = Entry::App(AppEntryBytes(entry_bytes));
+        let entry_hash = EntryHash::with_data_sync(&entry);
 
         // Store create by store_author (seed=112).
         let store_author = AgentPubKey::from_raw_36(vec![112u8; 36]);
@@ -5717,7 +5741,8 @@ mod tests {
 
         let seed = 118u8;
         let author = AgentPubKey::from_raw_36(vec![seed; 36]);
-        let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
+        // The action carries the hash of its own entry content.
+        let entry_hash = EntryHash::with_data_sync(&make_entry(seed));
         let entry = make_entry(seed);
 
         // Integrate a CreateEntry op so the create is live in the store.
@@ -5857,7 +5882,8 @@ mod tests {
 
         let seed = 120u8;
         let author = AgentPubKey::from_raw_36(vec![seed; 36]);
-        let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
+        // The action carries the hash of its own entry content.
+        let entry_hash = EntryHash::with_data_sync(&make_entry(seed));
         let entry = make_entry(seed);
 
         // Integrate a CreateRecord so the record exists in the store.
@@ -5995,7 +6021,8 @@ mod tests {
 
         let seed = 122u8;
         let author = AgentPubKey::from_raw_36(vec![seed; 36]);
-        let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
+        // The action carries the hash of its own entry content.
+        let entry_hash = EntryHash::with_data_sync(&make_entry(seed));
         let entry = make_entry(seed);
 
         // Integrate a CreateRecord and a CreateEntry.
@@ -6038,7 +6065,8 @@ mod tests {
 
         let seed = 125u8;
         let author = AgentPubKey::from_raw_36(vec![seed; 36]);
-        let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
+        // The action carries the hash of its own entry content.
+        let entry_hash = EntryHash::with_data_sync(&make_entry(seed));
         let entry = make_entry(seed);
 
         // Integrate a CreateEntry op that is then deleted (by a store delete) so
@@ -6131,7 +6159,8 @@ mod tests {
 
         let seed = 126u8;
         let author = AgentPubKey::from_raw_36(vec![seed; 36]);
-        let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
+        // The action carries the hash of its own entry content.
+        let entry_hash = EntryHash::with_data_sync(&make_entry(seed));
         let entry = make_entry(seed);
 
         // Integrate a live CreateEntry op.
@@ -6229,7 +6258,8 @@ mod tests {
 
         let seed = 127u8;
         let author = AgentPubKey::from_raw_36(vec![seed; 36]);
-        let entry_hash = EntryHash::from_raw_36(vec![seed.wrapping_add(100); 36]);
+        // The action carries the hash of its own entry content.
+        let entry_hash = EntryHash::with_data_sync(&make_entry(seed));
         let entry = make_entry(seed);
 
         // Integrate a live CreateEntry op.
