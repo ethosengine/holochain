@@ -5,6 +5,7 @@ use crate::handles::{DbRead, DbWrite};
 use crate::kind::Dht;
 use crate::models::dht::CapGrantRow;
 use holo_hash::{ActionHash, AgentPubKey};
+use holochain_integrity_types::entry::Entry;
 
 impl DbWrite<Dht> {
     pub async fn insert_cap_grant(
@@ -25,6 +26,24 @@ impl DbRead<Dht> {
     ) -> sqlx::Result<Vec<CapGrantRow>> {
         let mut conn = self.timed_conn().await?;
         cap_grant::get_cap_grants_by_access(&mut *conn, author, cap_access).await
+    }
+
+    /// The author's live capability-grant entries of one access class, in
+    /// source-chain (`Action.seq`) order.
+    ///
+    /// "Live" means: authored by `author`, of the given `cap_access` class, the
+    /// grant entry is resolvable, and the author has neither updated nor
+    /// deleted that entry. This is the authorisation read behind
+    /// `DhtStoreRead::valid_cap_grants` in `holochain_state`; it costs one
+    /// query regardless of how many grants the author has ever committed, and
+    /// replaces a three-queries-per-grant scan.
+    pub async fn get_live_cap_grant_entries(
+        &self,
+        author: AgentPubKey,
+        cap_access: i64,
+    ) -> sqlx::Result<Vec<Entry>> {
+        let mut conn = self.timed_conn().await?;
+        cap_grant::get_live_cap_grant_entries(&mut *conn, author, cap_access).await
     }
 
     pub async fn get_cap_grants_by_tag(

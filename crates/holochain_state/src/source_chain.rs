@@ -3028,6 +3028,1416 @@ mod tests {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Capability-grant lookup at scale.
+    //
+    // `DhtStoreRead::valid_cap_grants` was rewritten from a load-every-grant
+    // scan (three queries per grant plus a chunked batch read) into one query
+    // per access class. These tests pin that the rewrite is decision-preserving:
+    // the differential tests compare it against `valid_cap_grants_reference`
+    // — the verbatim old implementation, kept under `cfg(test)` as an oracle —
+    // over a randomised population, and the targeted tests pin each individual
+    // rule (secret, delete, update, assignee, unrestricted, function scope,
+    // author isolation, first-match order) with hundreds of decoy grants
+    // present so a regression that reintroduces "return the first grant found"
+    // cannot pass.
+    // -----------------------------------------------------------------------
+
+    /// Deterministic, dependency-free PRNG. A differential failure must be
+    /// reproducible from the seed printed in the assertion message.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 11
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    /// A distinct `CapSecret` per seed — injective, because the seed's own
+    /// bytes lead the secret.
+    fn secret_from(seed: u64) -> CapSecret {
+        use holochain_zome_types::prelude::CAP_SECRET_BYTES;
+        let mut bytes = [0u8; CAP_SECRET_BYTES];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        for (i, b) in bytes.iter_mut().enumerate().skip(8) {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(seed as u8);
+        }
+        CapSecret::try_from(bytes.as_slice()).unwrap()
+    }
+
+    fn listed(fns: &[(&str, &str)]) -> GrantedFunctions {
+        GrantedFunctions::Listed(
+            fns.iter()
+                .map(|(z, f)| ((*z).into(), (*f).into()))
+                .collect::<HashSet<GrantedFunction>>(),
+        )
+    }
+
+    /// A `SourceChain` reflecting the CURRENT persisted head.
+    ///
+    /// `SourceChain` snapshots the chain head when it is constructed, so a
+    /// handle that has already been flushed cannot author again — the next
+    /// flush fails with `HeadMoved`. Every batch that follows a flush therefore
+    /// needs a fresh handle (the pre-existing `test_get_cap_grant` does the
+    /// same thing inline).
+    async fn fresh_chain(
+        dht_store: &DhtStore,
+        keystore: &MetaLairClient,
+        author: &AgentPubKey,
+    ) -> SourceChainResult<SourceChain> {
+        SourceChain::new(dht_store.clone(), keystore.clone(), author.clone()).await
+    }
+
+    /// Commit a `Create` of a cap grant to `chain`'s scratch (no flush).
+    async fn put_cap_grant(
+        chain: &SourceChain,
+        grant: &ZomeCallCapGrant,
+    ) -> SourceChainResult<(ActionHash, EntryHash)> {
+        let (entry, entry_hash) =
+            EntryHashed::from_content_sync(Entry::CapGrant(grant.clone())).into_inner();
+        let action = chain
+            .put(
+                ActionData::Create(CreateData {
+                    entry_type: EntryType::CapGrant,
+                    entry_hash: entry_hash.clone(),
+                }),
+                Some(entry),
+                ChainTopOrdering::default(),
+            )
+            .await?;
+        Ok((action, entry_hash))
+    }
+
+    /// Commit an `Update` replacing `(original_action, original_entry)` with
+    /// `grant`.
+    async fn update_cap_grant(
+        chain: &SourceChain,
+        original_action: ActionHash,
+        original_entry: EntryHash,
+        grant: &ZomeCallCapGrant,
+    ) -> SourceChainResult<(ActionHash, EntryHash)> {
+        let (entry, entry_hash) =
+            EntryHashed::from_content_sync(Entry::CapGrant(grant.clone())).into_inner();
+        let action = chain
+            .put(
+                ActionData::Update(UpdateData {
+                    entry_type: EntryType::CapGrant,
+                    entry_hash: entry_hash.clone(),
+                    original_action_address: original_action,
+                    original_entry_address: original_entry,
+                }),
+                Some(entry),
+                ChainTopOrdering::default(),
+            )
+            .await?;
+        Ok((action, entry_hash))
+    }
+
+    /// Commit a `Delete` of `(action, entry)`.
+    async fn delete_cap_grant(
+        chain: &SourceChain,
+        action: ActionHash,
+        entry: EntryHash,
+    ) -> SourceChainResult<()> {
+        chain
+            .put(
+                ActionData::Delete(DeleteData {
+                    deletes_address: action,
+                    deletes_entry_address: entry,
+                }),
+                None,
+                ChainTopOrdering::default(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The decision `SourceChain::valid_cap_grant` would reach if it were still
+    /// driven by the pre-optimisation store read. Mirrors
+    /// `SourceChain::valid_cap_grant` exactly — author fast path, then
+    /// first-match over the candidate vector — but sources its candidates from
+    /// `valid_cap_grants_reference`.
+    async fn oracle_decision(
+        dht_store: &DhtStore,
+        author: &AgentPubKey,
+        function: &GrantedFunction,
+        agent: &AgentPubKey,
+        secret: Option<CapSecret>,
+    ) -> SourceChainResult<Option<CapGrant>> {
+        let author_grant = CapGrant::from(author.clone());
+        if author_grant.is_valid(function, agent, secret.as_ref()) {
+            return Ok(Some(author_grant));
+        }
+        Ok(dht_store
+            .as_read()
+            .valid_cap_grants_reference(author, secret.as_ref())
+            .await?
+            .into_iter()
+            .find(|g| g.is_valid(function, agent, secret.as_ref())))
+    }
+
+    /// What a seeded population looks like to the probes.
+    struct Population {
+        /// `(secret, function, one assignee that should work)` for grants that
+        /// must still authorise after all updates/deletes are applied.
+        live_transferable: Vec<(CapSecret, GrantedFunction)>,
+        live_assigned: Vec<(CapSecret, GrantedFunction, AgentPubKey)>,
+        /// Secrets that must NOT authorise: deleted, or superseded by an update.
+        dead_secrets: Vec<(CapSecret, GrantedFunction)>,
+        /// Secrets introduced by updates, which must authorise.
+        updated_secrets: Vec<(CapSecret, GrantedFunction)>,
+        /// Functions of `Unrestricted` grants that must authorise ANY agent
+        /// with NO secret. This is the highest-blast-radius class, so the
+        /// population deliberately updates and deletes some of them: those are
+        /// the only inputs that exercise the two `NOT IN` anti-joins on the
+        /// `check_secret == None` path.
+        live_unrestricted: Vec<GrantedFunction>,
+        /// Functions of `Unrestricted` grants that were deleted or superseded
+        /// and must NOT authorise.
+        dead_unrestricted: Vec<GrantedFunction>,
+    }
+
+    /// Seed `count` grants across all three access classes, then update a
+    /// slice of them and delete another slice. Flushes twice: once for the
+    /// creates (so updates/deletes can reference committed actions) and once
+    /// for the modifications.
+    async fn seed_population(
+        dht_store: &DhtStore,
+        keystore: &MetaLairClient,
+        author: &AgentPubKey,
+        seed: u64,
+        count: u64,
+    ) -> SourceChainResult<Population> {
+        let mut rng = Lcg::new(seed);
+        let storage_arcs = vec![DhtArc::Empty];
+        let chain = &fresh_chain(dht_store, keystore, author).await?;
+
+        // A small pool of third-party agents to draw assignees from.
+        let mut agents = Vec::new();
+        for _ in 0..4 {
+            agents.push(keystore.new_sign_keypair_random().await.unwrap());
+        }
+
+        let functions = [
+            ("zome_a", "fn_one"),
+            ("zome_a", "fn_two"),
+            ("zome_b", "fn_one"),
+            ("zome_c", "fn_three"),
+        ];
+
+        #[allow(clippy::type_complexity)]
+        let mut created: Vec<(
+            ActionHash,
+            EntryHash,
+            CapSecret,
+            GrantedFunction,
+            (String, String),
+            u64,
+        )> = Vec::new();
+        let mut pop = Population {
+            live_transferable: Vec::new(),
+            live_assigned: Vec::new(),
+            dead_secrets: Vec::new(),
+            updated_secrets: Vec::new(),
+            live_unrestricted: Vec::new(),
+            dead_unrestricted: Vec::new(),
+        };
+
+        for i in 0..count {
+            let secret = secret_from(seed.wrapping_mul(1_000_003).wrapping_add(i));
+            let class = rng.below(3);
+            // Unrestricted grants are parked on a zome the secret-bearing
+            // probes never name, and each gets its OWN function name, so an
+            // absolute "must be denied" assertion can never be satisfied by a
+            // different decoy, and each unrestricted grant can be probed
+            // individually through the no-secret path.
+            let (zome, func) = if class == 0 {
+                ("zome_unrestricted".to_string(), format!("u_{i}"))
+            } else {
+                let (z, f) = functions[rng.below(functions.len() as u64) as usize];
+                (z.to_string(), f.to_string())
+            };
+            let function: GrantedFunction = (zome.as_str().into(), func.as_str().into());
+            let access = match class {
+                0 => CapAccess::Unrestricted,
+                1 => CapAccess::Transferable { secret },
+                _ => {
+                    let mut assignees = BTreeSet::new();
+                    assignees.insert(agents[rng.below(agents.len() as u64) as usize].clone());
+                    CapAccess::Assigned { secret, assignees }
+                }
+            };
+            let grant = ZomeCallCapGrant::new(
+                format!("tag-{i}"),
+                access.clone(),
+                listed(&[(zome.as_str(), func.as_str())]),
+            );
+            let (action, entry) = put_cap_grant(chain, &grant).await?;
+            created.push((action, entry, secret, function.clone(), (zome, func), class));
+
+            match &access {
+                CapAccess::Transferable { .. } => {
+                    pop.live_transferable.push((secret, function));
+                }
+                CapAccess::Assigned { assignees, .. } => {
+                    pop.live_assigned.push((
+                        secret,
+                        function,
+                        assignees.iter().next().unwrap().clone(),
+                    ));
+                }
+                CapAccess::Unrestricted => {
+                    pop.live_unrestricted.push(function);
+                }
+            }
+        }
+        chain.flush(storage_arcs.clone()).await.unwrap();
+
+        // A flushed `SourceChain` cannot author again — take a fresh handle for
+        // the modification pass.
+        let chain = &fresh_chain(dht_store, keystore, author).await?;
+
+        // Update every 7th grant; delete every 11th. Unrestricted grants are
+        // INCLUDED: they are the only inputs that drive the two `NOT IN`
+        // anti-joins on the `check_secret == None` path, which is the path that
+        // authorises any agent with no secret at all. An unrestricted grant is
+        // updated to another unrestricted grant (on a fresh function name) so
+        // the access class — and therefore the code path — is preserved.
+        for (idx, (action, entry, secret, function, (zome, func), class)) in
+            created.iter().enumerate()
+        {
+            if idx % 7 == 0 {
+                if *class == 0 {
+                    let new_func = format!("{func}_updated");
+                    let updated = ZomeCallCapGrant::new(
+                        format!("tag-updated-{idx}"),
+                        CapAccess::Unrestricted,
+                        listed(&[(zome.as_str(), new_func.as_str())]),
+                    );
+                    update_cap_grant(chain, action.clone(), entry.clone(), &updated).await?;
+                    pop.dead_unrestricted.push(function.clone());
+                    pop.live_unrestricted
+                        .push((zome.as_str().into(), new_func.as_str().into()));
+                    pop.live_unrestricted.retain(|f| f != function);
+                } else {
+                    let new_secret =
+                        secret_from(seed.wrapping_mul(7_700_007).wrapping_add(idx as u64));
+                    let updated = ZomeCallCapGrant::new(
+                        format!("tag-updated-{idx}"),
+                        CapAccess::Transferable { secret: new_secret },
+                        listed(&[(zome.as_str(), func.as_str())]),
+                    );
+                    update_cap_grant(chain, action.clone(), entry.clone(), &updated).await?;
+                    pop.dead_secrets.push((*secret, function.clone()));
+                    pop.updated_secrets.push((new_secret, function.clone()));
+                    pop.live_transferable.retain(|(s, _)| s != secret);
+                    pop.live_assigned.retain(|(s, _, _)| s != secret);
+                }
+            } else if idx % 11 == 0 {
+                delete_cap_grant(chain, action.clone(), entry.clone()).await?;
+                if *class == 0 {
+                    pop.dead_unrestricted.push(function.clone());
+                    pop.live_unrestricted.retain(|f| f != function);
+                } else {
+                    pop.dead_secrets.push((*secret, function.clone()));
+                    pop.live_transferable.retain(|(s, _)| s != secret);
+                    pop.live_assigned.retain(|(s, _, _)| s != secret);
+                }
+            }
+        }
+        chain.flush(storage_arcs).await.unwrap();
+
+        Ok(pop)
+    }
+
+    /// The core equivalence test: over a randomised population of 240 grants
+    /// with updates and deletes applied, the rewritten lookup and the old
+    /// implementation must return the *same candidate vector in the same
+    /// order*, and `SourceChain::valid_cap_grant` must return the *same grant*
+    /// (not merely the same allow/deny) for every probe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_lookup_matches_reference_over_random_population() -> SourceChainResult<()> {
+        const SEED: u64 = 0xE101_0001;
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+            ..
+        } = TestCase::new().await;
+
+        drop(chain);
+        let pop = seed_population(&dht_store, &keystore, &alice, SEED, 240).await?;
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        assert!(
+            pop.live_transferable.len() > 20 && pop.live_assigned.len() > 20,
+            "seed {SEED} did not produce a useful population"
+        );
+        assert!(
+            pop.live_unrestricted.len() > 20 && pop.dead_unrestricted.len() > 5,
+            "seed {SEED} produced no revoked unrestricted grants, so the anti-joins \
+             are untested on the no-secret path ({} live / {} dead)",
+            pop.live_unrestricted.len(),
+            pop.dead_unrestricted.len()
+        );
+
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+
+        // 1. Candidate-vector equivalence, including order and duplicates.
+        //    The candidate set depends only on whether a secret was supplied,
+        //    so both shapes are covered here.
+        for probe_secret in [None, Some(pop.live_transferable[0].0)] {
+            let new = dht_store
+                .as_read()
+                .valid_cap_grants(&alice, probe_secret.as_ref())
+                .await?;
+            let old = dht_store
+                .as_read()
+                .valid_cap_grants_reference(&alice, probe_secret.as_ref())
+                .await?;
+            assert_eq!(
+                new,
+                old,
+                "candidate vectors diverged (seed {SEED}, secret supplied: {})",
+                probe_secret.is_some()
+            );
+            assert!(!new.is_empty(), "population produced no candidates");
+        }
+
+        // 2. Decision equivalence — the exact grant returned, for every probe
+        //    class: live secrets, dead secrets, updated secrets, wrong agent,
+        //    wrong function, no secret.
+        let mut probes: Vec<(GrantedFunction, AgentPubKey, Option<CapSecret>)> = Vec::new();
+        for (secret, function) in pop.live_transferable.iter().take(15) {
+            probes.push((function.clone(), bob.clone(), Some(*secret)));
+            // Right secret, wrong function.
+            probes.push((("zome_z".into(), "nope".into()), bob.clone(), Some(*secret)));
+        }
+        for (secret, function, assignee) in pop.live_assigned.iter().take(15) {
+            probes.push((function.clone(), assignee.clone(), Some(*secret)));
+            // Right secret, non-assignee caller.
+            probes.push((function.clone(), bob.clone(), Some(*secret)));
+        }
+        for (secret, function) in pop.dead_secrets.iter().take(15) {
+            probes.push((function.clone(), bob.clone(), Some(*secret)));
+        }
+        for (secret, function) in pop.updated_secrets.iter().take(15) {
+            probes.push((function.clone(), bob.clone(), Some(*secret)));
+        }
+        // No secret at all — the unrestricted path. These are the probes that
+        // drive the anti-joins with `check_secret == None`.
+        for function in pop.live_unrestricted.iter().take(15) {
+            probes.push((function.clone(), bob.clone(), None));
+        }
+        for function in pop.dead_unrestricted.iter().take(15) {
+            probes.push((function.clone(), bob.clone(), None));
+        }
+        // A revoked unrestricted grant must also stay revoked when a secret is
+        // offered (it is not even a candidate then).
+        for function in pop.dead_unrestricted.iter().take(5) {
+            probes.push((function.clone(), bob.clone(), Some(secret_from(u64::MAX))));
+        }
+        probes.push((("zome_a".into(), "fn_one".into()), bob.clone(), None));
+        probes.push((("zome_a".into(), "fn_two".into()), bob.clone(), None));
+        probes.push((("zome_z".into(), "nope".into()), bob.clone(), None));
+        // A secret that was never granted.
+        probes.push((
+            ("zome_a".into(), "fn_one".into()),
+            bob.clone(),
+            Some(secret_from(u64::MAX)),
+        ));
+        // The author's own fast path.
+        probes.push((("zome_a".into(), "fn_one".into()), alice.clone(), None));
+
+        for (function, agent, secret) in probes {
+            let new = chain
+                .valid_cap_grant(function.clone(), agent.clone(), secret)
+                .await?;
+            let old = oracle_decision(&dht_store, &alice, &function, &agent, secret).await?;
+            assert_eq!(
+                new,
+                old,
+                "decision diverged (seed {SEED}, fn {function:?}, agent {agent:?}, \
+                 secret supplied: {})",
+                secret.is_some()
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Order is observable: `call_info` hands the *returned* grant to wasm, so
+    /// first-match must be preserved exactly. The old implementation scanned
+    /// `Transferable` grants (access class 1) before `Assigned` grants (class
+    /// 2), irrespective of chain order — so an `Assigned` grant committed
+    /// *earlier* loses to a `Transferable` grant committed later when both are
+    /// valid for the same (function, agent, secret). A rewrite that collapsed
+    /// both classes into one `ORDER BY seq` query would silently flip this.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_first_match_prefers_transferable_over_earlier_assigned(
+    ) -> SourceChainResult<()> {
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+            ..
+        } = TestCase::new().await;
+
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let secret = secret_from(41);
+        let function: GrantedFunction = ("zome_a".into(), "fn_one".into());
+
+        // Assigned FIRST (lower Action.seq) …
+        let mut assignees = BTreeSet::new();
+        assignees.insert(bob.clone());
+        let assigned = ZomeCallCapGrant::new(
+            "assigned".into(),
+            CapAccess::Assigned { secret, assignees },
+            listed(&[("zome_a", "fn_one")]),
+        );
+        put_cap_grant(&chain, &assigned).await?;
+
+        // … Transferable SECOND (higher Action.seq), same secret and function.
+        let transferable = ZomeCallCapGrant::new(
+            "transferable".into(),
+            CapAccess::Transferable { secret },
+            listed(&[("zome_a", "fn_one")]),
+        );
+        put_cap_grant(&chain, &transferable).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        let got = chain
+            .valid_cap_grant(function.clone(), bob.clone(), Some(secret))
+            .await?;
+        assert_eq!(
+            got,
+            Some(transferable.clone().into()),
+            "class order (Transferable before Assigned) was not preserved"
+        );
+        assert_eq!(
+            got,
+            oracle_decision(&dht_store, &alice, &function, &bob, Some(secret)).await?
+        );
+
+        // And the candidate vector itself is the Transferable block followed by
+        // the Assigned block, not chain order.
+        let candidates = dht_store
+            .as_read()
+            .valid_cap_grants(&alice, Some(&secret))
+            .await?;
+        assert_eq!(
+            candidates,
+            vec![
+                CapGrant::from(transferable.clone()),
+                CapGrant::from(assigned.clone())
+            ]
+        );
+        Ok(())
+    }
+
+    /// The whole point of the change: the matching grant is found among
+    /// hundreds of decoys, and a secret that was never granted is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_secret_match_among_many_grants() -> SourceChainResult<()> {
+        const SEED: u64 = 0x00BE_EF01;
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+        } = TestCase::new().await;
+
+        drop(chain);
+        let pop = seed_population(&dht_store, &keystore, &alice, SEED, 300).await?;
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+
+        let (secret, function) = pop.live_transferable.last().cloned().unwrap();
+        assert!(
+            matches!(
+                chain
+                    .valid_cap_grant(function.clone(), bob.clone(), Some(secret))
+                    .await?,
+                Some(CapGrant::RemoteAgent(_))
+            ),
+            "a live transferable secret must authorise even with hundreds of decoys present"
+        );
+
+        // A secret of the right shape that was never committed.
+        assert_eq!(
+            chain
+                .valid_cap_grant(
+                    function.clone(),
+                    bob.clone(),
+                    Some(secret_from(u64::MAX - 1))
+                )
+                .await?,
+            None,
+            "an ungranted secret must never authorise"
+        );
+
+        // No secret at all must not reach a secret-bearing grant.
+        assert_eq!(
+            chain.valid_cap_grant(function, bob, None).await?,
+            None,
+            "a secret-bearing grant must not be reachable without the secret"
+        );
+
+        // Sanity: alice is unaffected by the decoys.
+        assert_eq!(
+            chain
+                .valid_cap_grant(("zome_a".into(), "fn_one".into()), alice.clone(), None)
+                .await?,
+            Some(CapGrant::ChainAuthor(alice)),
+        );
+        Ok(())
+    }
+
+    /// Deleting one grant among many revokes exactly that grant.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_delete_revokes_only_the_deleted_grant() -> SourceChainResult<()> {
+        const SEED: u64 = 0x00DE_AD02;
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+            ..
+        } = TestCase::new().await;
+
+        drop(chain);
+        let pop = seed_population(&dht_store, &keystore, &alice, SEED, 200).await?;
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+
+        // Every secret the population marked dead (deleted or superseded) must
+        // be refused; every live one must still work.
+        for (secret, function) in &pop.dead_secrets {
+            assert_eq!(
+                chain
+                    .valid_cap_grant(function.clone(), bob.clone(), Some(*secret))
+                    .await?,
+                None,
+                "a deleted/superseded grant must not authorise"
+            );
+        }
+        for (secret, function) in pop.live_transferable.iter().take(10) {
+            assert!(
+                chain
+                    .valid_cap_grant(function.clone(), bob.clone(), Some(*secret))
+                    .await?
+                    .is_some(),
+                "a neighbouring live grant must be unaffected by the deletes"
+            );
+        }
+
+        // Now delete one more, explicitly, and watch it flip.
+        let target = ZomeCallCapGrant::new(
+            "explicit-target".into(),
+            CapAccess::Transferable {
+                secret: secret_from(999),
+            },
+            listed(&[("zome_a", "fn_one")]),
+        );
+        let function: GrantedFunction = ("zome_a".into(), "fn_one".into());
+        let (action, entry) = put_cap_grant(&chain, &target).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+        assert_eq!(
+            chain
+                .valid_cap_grant(function.clone(), bob.clone(), Some(secret_from(999)))
+                .await?,
+            Some(target.clone().into())
+        );
+
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        delete_cap_grant(&chain, action, entry).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+        let after = chain
+            .valid_cap_grant(function.clone(), bob.clone(), Some(secret_from(999)))
+            .await?;
+        assert_eq!(after, None, "delete must revoke immediately");
+        assert_eq!(
+            after,
+            oracle_decision(&dht_store, &alice, &function, &bob, Some(secret_from(999))).await?
+        );
+        Ok(())
+    }
+
+    /// Updating a grant retires the old secret and activates the new one, with
+    /// hundreds of decoys present.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_update_retires_old_secret_among_many() -> SourceChainResult<()> {
+        const SEED: u64 = 0x00FE_ED03;
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+            ..
+        } = TestCase::new().await;
+
+        drop(chain);
+        seed_population(&dht_store, &keystore, &alice, SEED, 200).await?;
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+
+        let old_secret = secret_from(4_242);
+        let new_secret = secret_from(4_243);
+        let function: GrantedFunction = ("zome_b".into(), "fn_one".into());
+
+        let original = ZomeCallCapGrant::new(
+            "update-target".into(),
+            CapAccess::Transferable { secret: old_secret },
+            listed(&[("zome_b", "fn_one")]),
+        );
+        let (action, entry) = put_cap_grant(&chain, &original).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+        assert_eq!(
+            chain
+                .valid_cap_grant(function.clone(), bob.clone(), Some(old_secret))
+                .await?,
+            Some(original.clone().into())
+        );
+
+        let updated = ZomeCallCapGrant::new(
+            "update-target".into(),
+            CapAccess::Transferable { secret: new_secret },
+            listed(&[("zome_b", "fn_one")]),
+        );
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        update_cap_grant(&chain, action, entry, &updated).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        assert_eq!(
+            chain
+                .valid_cap_grant(function.clone(), bob.clone(), Some(old_secret))
+                .await?,
+            None,
+            "the superseded secret must stop authorising"
+        );
+        assert_eq!(
+            chain
+                .valid_cap_grant(function.clone(), bob.clone(), Some(new_secret))
+                .await?,
+            Some(updated.clone().into()),
+            "the updated secret must authorise"
+        );
+        for secret in [old_secret, new_secret] {
+            assert_eq!(
+                chain
+                    .valid_cap_grant(function.clone(), bob.clone(), Some(secret))
+                    .await?,
+                oracle_decision(&dht_store, &alice, &function, &bob, Some(secret)).await?
+            );
+        }
+        Ok(())
+    }
+
+    /// Assignee enforcement and function scoping survive the rewrite at scale.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_assignee_and_function_scope_among_many() -> SourceChainResult<()> {
+        const SEED: u64 = 0x00A5_5104;
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+            ..
+        } = TestCase::new().await;
+
+        drop(chain);
+        seed_population(&dht_store, &keystore, &alice, SEED, 200).await?;
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let carol = keystore.new_sign_keypair_random().await.unwrap();
+
+        let secret = secret_from(77_777);
+        let mut assignees = BTreeSet::new();
+        assignees.insert(bob.clone());
+        let grant = ZomeCallCapGrant::new(
+            "assigned-target".into(),
+            CapAccess::Assigned {
+                secret,
+                assignees: assignees.clone(),
+            },
+            listed(&[("zome_c", "fn_three")]),
+        );
+        put_cap_grant(&chain, &grant).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        let granted: GrantedFunction = ("zome_c".into(), "fn_three".into());
+        let other: GrantedFunction = ("zome_c".into(), "fn_four".into());
+
+        // Assignee + right function + right secret: allowed.
+        assert_eq!(
+            chain
+                .valid_cap_grant(granted.clone(), bob.clone(), Some(secret))
+                .await?,
+            Some(grant.clone().into())
+        );
+        // Non-assignee with the right secret: denied.
+        assert_eq!(
+            chain
+                .valid_cap_grant(granted.clone(), carol.clone(), Some(secret))
+                .await?,
+            None
+        );
+        // Assignee, right secret, ungranted function: denied.
+        assert_eq!(
+            chain
+                .valid_cap_grant(other.clone(), bob.clone(), Some(secret))
+                .await?,
+            None
+        );
+        // Assignee, granted function, no secret: denied.
+        assert_eq!(
+            chain
+                .valid_cap_grant(granted.clone(), bob.clone(), None)
+                .await?,
+            None
+        );
+
+        for (f, a, s) in [
+            (granted.clone(), bob.clone(), Some(secret)),
+            (granted.clone(), carol.clone(), Some(secret)),
+            (other, bob.clone(), Some(secret)),
+            (granted, bob, None),
+        ] {
+            assert_eq!(
+                chain.valid_cap_grant(f.clone(), a.clone(), s).await?,
+                oracle_decision(&dht_store, &alice, &f, &a, s).await?
+            );
+        }
+        Ok(())
+    }
+
+    /// The unrestricted path is untouched: an `Unrestricted` grant authorises
+    /// any agent for its listed functions with no secret, is not reachable
+    /// when a secret *is* supplied, and is scoped to its functions — all with
+    /// hundreds of secret-bearing decoys in the table.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_unrestricted_path_unchanged_among_many() -> SourceChainResult<()> {
+        const SEED: u64 = 0x000F_EE05;
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+            ..
+        } = TestCase::new().await;
+
+        drop(chain);
+        seed_population(&dht_store, &keystore, &alice, SEED, 200).await?;
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+
+        let grant = ZomeCallCapGrant::new(
+            "open".into(),
+            CapAccess::Unrestricted,
+            listed(&[("zome_open", "hello")]),
+        );
+        put_cap_grant(&chain, &grant).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        let open: GrantedFunction = ("zome_open".into(), "hello".into());
+        let closed: GrantedFunction = ("zome_open".into(), "goodbye".into());
+
+        assert_eq!(
+            chain
+                .valid_cap_grant(open.clone(), bob.clone(), None)
+                .await?,
+            Some(grant.clone().into())
+        );
+        assert_eq!(
+            chain
+                .valid_cap_grant(closed.clone(), bob.clone(), None)
+                .await?,
+            None
+        );
+        // Supplying a secret must NOT reach an unrestricted grant — the
+        // candidate set is the secret-bearing classes only.
+        assert_eq!(
+            chain
+                .valid_cap_grant(open.clone(), bob.clone(), Some(secret_from(5)))
+                .await?,
+            None
+        );
+        for (f, s) in [
+            (open.clone(), None),
+            (closed, None),
+            (open, Some(secret_from(5))),
+        ] {
+            assert_eq!(
+                chain.valid_cap_grant(f.clone(), bob.clone(), s).await?,
+                oracle_decision(&dht_store, &alice, &f, &bob, s).await?
+            );
+        }
+        Ok(())
+    }
+
+    /// Two agents of the same DNA share the `CapGrant`, `Action` and
+    /// `PrivateEntry` tables. A grant authored by one must never authorise a
+    /// call on the other's chain — the `Action.author` predicate is the only
+    /// thing preventing a cross-agent capability leak, so it is pinned here
+    /// against a populated table.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_does_not_leak_across_authors_in_the_same_db() -> SourceChainResult<()> {
+        let keystore = test_keystore();
+        let dna_hash = fixt!(DnaHash);
+        let dht_store = crate::test_utils::test_dht_store(dna_hash.clone()).await;
+
+        let alice = keystore.new_sign_keypair_random().await.unwrap();
+        let carol = keystore.new_sign_keypair_random().await.unwrap();
+        for agent in [&alice, &carol] {
+            genesis(
+                dht_store.clone(),
+                keystore.clone(),
+                dna_hash.clone(),
+                agent.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        // Populate alice's chain, then grant carol's caller a secret on
+        // *carol's* chain only.
+        seed_population(&dht_store, &keystore, &alice, 0x00CA_1106, 120).await?;
+        let alice_chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        let carol_chain = fresh_chain(&dht_store, &keystore, &carol).await?;
+
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let secret = secret_from(31_337);
+        let function: GrantedFunction = ("zome_a".into(), "fn_one".into());
+        let carol_grant = ZomeCallCapGrant::new(
+            "carols".into(),
+            CapAccess::Transferable { secret },
+            listed(&[("zome_a", "fn_one")]),
+        );
+        put_cap_grant(&carol_chain, &carol_grant).await?;
+        carol_chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        // Works on carol's chain …
+        assert_eq!(
+            carol_chain
+                .valid_cap_grant(function.clone(), bob.clone(), Some(secret))
+                .await?,
+            Some(carol_grant.into())
+        );
+        // … and must NOT work on alice's, despite sharing the tables.
+        assert_eq!(
+            alice_chain
+                .valid_cap_grant(function.clone(), bob.clone(), Some(secret))
+                .await?,
+            None,
+            "a grant authored by carol must never authorise a call on alice's chain"
+        );
+
+        // Alice's own grants must likewise not appear in carol's candidates.
+        let carol_candidates = dht_store
+            .as_read()
+            .valid_cap_grants(&carol, Some(&secret))
+            .await?;
+        assert_eq!(carol_candidates.len(), 1);
+        assert_eq!(
+            carol_candidates,
+            dht_store
+                .as_read()
+                .valid_cap_grants_reference(&carol, Some(&secret))
+                .await?
+        );
+        Ok(())
+    }
+
+    /// Revoking an `Unrestricted` grant. This is the highest-blast-radius case
+    /// in the whole surface: an unrestricted grant authorises ANY agent with NO
+    /// secret, so if a delete failed to take effect the grant would stay open
+    /// to the world. It is also the only shape that exercises the two `NOT IN`
+    /// anti-joins on the `check_secret == None` path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_delete_revokes_unrestricted_grant() -> SourceChainResult<()> {
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+        } = TestCase::new().await;
+
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let open: GrantedFunction = ("zome_open".into(), "hello".into());
+        let neighbour: GrantedFunction = ("zome_open".into(), "neighbour".into());
+
+        let target = ZomeCallCapGrant::new(
+            "open-target".into(),
+            CapAccess::Unrestricted,
+            listed(&[("zome_open", "hello")]),
+        );
+        let bystander = ZomeCallCapGrant::new(
+            "open-bystander".into(),
+            CapAccess::Unrestricted,
+            listed(&[("zome_open", "neighbour")]),
+        );
+        let (action, entry) = put_cap_grant(&chain, &target).await?;
+        put_cap_grant(&chain, &bystander).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        assert_eq!(
+            chain
+                .valid_cap_grant(open.clone(), bob.clone(), None)
+                .await?,
+            Some(target.clone().into()),
+            "an unrestricted grant must authorise any agent with no secret"
+        );
+
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        delete_cap_grant(&chain, action, entry).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        assert_eq!(
+            chain
+                .valid_cap_grant(open.clone(), bob.clone(), None)
+                .await?,
+            None,
+            "deleting an unrestricted grant must close it to the world immediately"
+        );
+        assert_eq!(
+            chain
+                .valid_cap_grant(neighbour.clone(), bob.clone(), None)
+                .await?,
+            Some(bystander.into()),
+            "the neighbouring unrestricted grant must be unaffected"
+        );
+        for f in [open, neighbour] {
+            assert_eq!(
+                chain.valid_cap_grant(f.clone(), bob.clone(), None).await?,
+                oracle_decision(&dht_store, &alice, &f, &bob, None).await?
+            );
+        }
+        Ok(())
+    }
+
+    /// The update twin of the above: superseding an `Unrestricted` grant closes
+    /// the old function and opens the new one, on the no-secret path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_update_retires_unrestricted_grant() -> SourceChainResult<()> {
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+        } = TestCase::new().await;
+
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let before: GrantedFunction = ("zome_open".into(), "before".into());
+        let after: GrantedFunction = ("zome_open".into(), "after".into());
+
+        let original = ZomeCallCapGrant::new(
+            "open-update".into(),
+            CapAccess::Unrestricted,
+            listed(&[("zome_open", "before")]),
+        );
+        let (action, entry) = put_cap_grant(&chain, &original).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+        assert_eq!(
+            chain
+                .valid_cap_grant(before.clone(), bob.clone(), None)
+                .await?,
+            Some(original.into())
+        );
+
+        let updated = ZomeCallCapGrant::new(
+            "open-update".into(),
+            CapAccess::Unrestricted,
+            listed(&[("zome_open", "after")]),
+        );
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        update_cap_grant(&chain, action, entry, &updated).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        assert_eq!(
+            chain
+                .valid_cap_grant(before.clone(), bob.clone(), None)
+                .await?,
+            None,
+            "the superseded unrestricted function must stop authorising"
+        );
+        assert_eq!(
+            chain
+                .valid_cap_grant(after.clone(), bob.clone(), None)
+                .await?,
+            Some(updated.into()),
+            "the updated unrestricted function must authorise"
+        );
+        for f in [before, after] {
+            assert_eq!(
+                chain.valid_cap_grant(f.clone(), bob.clone(), None).await?,
+                oracle_decision(&dht_store, &alice, &f, &bob, None).await?
+            );
+        }
+        Ok(())
+    }
+
+    /// A private grant's ENTRY HASH is not a secret: it travels in the clear on
+    /// the `Create` action, so any agent can author a `Delete` or an `Update`
+    /// naming another agent's grant entry hash and have it integrated into
+    /// `DeletedRecord` / `UpdatedRecord`. The `ua.author` / `da.author`
+    /// predicates in the anti-joins are the ONLY thing stopping that from
+    /// revoking alice's capabilities network-wide — a denial-of-service on
+    /// every grant she holds. Pinned here with carol genuinely genesis'd into
+    /// the same DNA database, so the shared index tables really do contain her
+    /// rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_foreign_author_cannot_revoke_a_grant() -> SourceChainResult<()> {
+        let keystore = test_keystore();
+        let dna_hash = fixt!(DnaHash);
+        let dht_store = crate::test_utils::test_dht_store(dna_hash.clone()).await;
+
+        let alice = keystore.new_sign_keypair_random().await.unwrap();
+        let carol = keystore.new_sign_keypair_random().await.unwrap();
+        for agent in [&alice, &carol] {
+            genesis(
+                dht_store.clone(),
+                keystore.clone(),
+                dna_hash.clone(),
+                agent.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let secret = secret_from(24_680);
+        let guarded: GrantedFunction = ("zome_a".into(), "fn_one".into());
+        let open: GrantedFunction = ("zome_open".into(), "hello".into());
+
+        // Alice commits one secret-bearing and one unrestricted grant.
+        let alice_chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        let transferable = ZomeCallCapGrant::new(
+            "alice-transferable".into(),
+            CapAccess::Transferable { secret },
+            listed(&[("zome_a", "fn_one")]),
+        );
+        let unrestricted = ZomeCallCapGrant::new(
+            "alice-unrestricted".into(),
+            CapAccess::Unrestricted,
+            listed(&[("zome_open", "hello")]),
+        );
+        let (t_action, t_entry) = put_cap_grant(&alice_chain, &transferable).await?;
+        let (u_action, u_entry) = put_cap_grant(&alice_chain, &unrestricted).await?;
+        alice_chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        // Carol authors a Delete and an Update naming ALICE's grant entry
+        // hashes, on her own chain. Nothing stops her: the hashes are public.
+        let carol_chain = fresh_chain(&dht_store, &keystore, &carol).await?;
+        delete_cap_grant(&carol_chain, t_action, t_entry.clone()).await?;
+        let hijack = ZomeCallCapGrant::new(
+            "carols-hijack".into(),
+            CapAccess::Unrestricted,
+            listed(&[("zome_open", "hijacked")]),
+        );
+        update_cap_grant(&carol_chain, u_action, u_entry.clone(), &hijack).await?;
+        carol_chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        // The foreign modifications really did land in the shared index tables.
+        assert!(
+            !dht_store
+                .as_read()
+                .db()
+                .get_delete_actions_for_entry(&t_entry)
+                .await
+                .unwrap()
+                .is_empty(),
+            "test precondition: carol's Delete must be indexed against alice's grant entry"
+        );
+        assert!(
+            !dht_store
+                .as_read()
+                .db()
+                .get_update_actions_for_entry(&u_entry)
+                .await
+                .unwrap()
+                .is_empty(),
+            "test precondition: carol's Update must be indexed against alice's grant entry"
+        );
+
+        // …and neither of them revokes anything of alice's.
+        assert_eq!(
+            alice_chain
+                .valid_cap_grant(guarded.clone(), bob.clone(), Some(secret))
+                .await?,
+            Some(transferable.into()),
+            "a foreign Delete must not revoke alice's transferable grant"
+        );
+        assert_eq!(
+            alice_chain
+                .valid_cap_grant(open.clone(), bob.clone(), None)
+                .await?,
+            Some(unrestricted.into()),
+            "a foreign Update must not supersede alice's unrestricted grant"
+        );
+
+        // And the rewrite agrees with the reference on both.
+        for (f, sec) in [(guarded, Some(secret)), (open, None)] {
+            assert_eq!(
+                alice_chain
+                    .valid_cap_grant(f.clone(), bob.clone(), sec)
+                    .await?,
+                oracle_decision(&dht_store, &alice, &f, &bob, sec).await?
+            );
+            assert_eq!(
+                dht_store
+                    .as_read()
+                    .valid_cap_grants(&alice, sec.as_ref())
+                    .await?,
+                dht_store
+                    .as_read()
+                    .valid_cap_grants_reference(&alice, sec.as_ref())
+                    .await?
+            );
+        }
+        Ok(())
+    }
+
+    /// A corrupt action on a LIVE grant must fail the authorisation read CLOSED
+    /// — `Err`, which `verify_grant` turns into a denial — exactly as the old
+    /// per-row `get_action` did (its `else { continue }` covered a MISSING row;
+    /// a row that failed to decode propagated `sqlx::Error::Decode`).
+    ///
+    /// This matters because `Action.entry_hash` is a fixed-width value on the
+    /// B-tree leaf while the variable-length `action_data` spills to overflow
+    /// pages: one bad block can corrupt the blob and leave the row readable, so
+    /// a rewrite that trusted the column alone would silently fail OPEN.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_corrupt_live_action_fails_closed() -> SourceChainResult<()> {
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+        } = TestCase::new().await;
+
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let secret = secret_from(5_150);
+        let function: GrantedFunction = ("zome_a".into(), "fn_one".into());
+        let grant = ZomeCallCapGrant::new(
+            "corruptible".into(),
+            CapAccess::Transferable { secret },
+            listed(&[("zome_a", "fn_one")]),
+        );
+        let (action, entry) = put_cap_grant(&chain, &grant).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        // Healthy first.
+        assert_eq!(
+            chain
+                .valid_cap_grant(function.clone(), bob.clone(), Some(secret))
+                .await?,
+            Some(grant.into())
+        );
+
+        // Corrupt the action_data blob in place, leaving every other column —
+        // including entry_hash — perfectly readable.
+        sqlx::query("UPDATE Action SET action_data = ? WHERE hash = ?")
+            .bind(vec![0xFF_u8; 24])
+            .bind(action.get_raw_36())
+            .execute(dht_store.db().pool())
+            .await
+            .unwrap();
+
+        let new = dht_store
+            .as_read()
+            .valid_cap_grants(&alice, Some(&secret))
+            .await;
+        let old = dht_store
+            .as_read()
+            .valid_cap_grants_reference(&alice, Some(&secret))
+            .await;
+        assert!(
+            new.is_err(),
+            "a corrupt action on a live grant must fail the read closed, got {new:?}"
+        );
+        assert!(old.is_err(), "the reference must also fail closed");
+
+        // And the decision path denies rather than authorising.
+        assert!(
+            chain
+                .valid_cap_grant(function, bob.clone(), Some(secret))
+                .await
+                .is_err(),
+            "a corrupt live grant must not authorise"
+        );
+
+        // A corrupt action on an ALREADY-REVOKED grant is filtered out before
+        // anything is decoded, so it no longer errors. That is the one
+        // deliberate divergence from the old behaviour: strictly more
+        // available, and it cannot authorise anything that was not already
+        // authorised.
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        delete_cap_grant(&chain, action, entry).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+        let after = dht_store
+            .as_read()
+            .valid_cap_grants(&alice, Some(&secret))
+            .await;
+        assert!(
+            matches!(&after, Ok(v) if v.is_empty()),
+            "a corrupt action on a revoked grant is filtered before decode, got {after:?}"
+        );
+        Ok(())
+    }
+
+    /// Structural guard against the regression this change removes: the old
+    /// lookup paid `3N + ceil(N/500) + 1` queries (and as many pool
+    /// acquisitions) for `N` grants of a class; the new one pays exactly one
+    /// per access class. The two are compared over the *same* populated store,
+    /// so a shared slowdown (loaded CI host, cold cache) moves both sides
+    /// together and only the per-grant query fan-out shows up in the ratio.
+    /// The real gap is two orders of magnitude; the threshold is 3x so this
+    /// can only fail if the per-row reads come back.
+    ///
+    /// A direct query-count assertion would be strictly better, and was
+    /// considered. There is no statement counter on `DbRead`/`sqlx::Pool`, and
+    /// the only hook is sqlx's `tracing` event per statement, which needs a
+    /// GLOBAL subscriber — process-wide, so it would count the queries of every
+    /// other test running in parallel and would have to be serialised behind a
+    /// mutex. That machinery was judged not worth it for a property that is
+    /// provable by reading `get_live_cap_grant_entries`: one `fetch_all`, no
+    /// loop. Left as a timing ratio deliberately; if it ever flakes, delete it
+    /// rather than widening the threshold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_lookup_cost_does_not_scale_with_grant_count() -> SourceChainResult<()> {
+        const SEED: u64 = 0x005C_A107;
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+            ..
+        } = TestCase::new().await;
+
+        drop(chain);
+        seed_population(&dht_store, &keystore, &alice, SEED, 600).await?;
+        let probe = secret_from(1);
+
+        // Warm the pool and the page cache for both paths before timing.
+        let warm_new = dht_store
+            .as_read()
+            .valid_cap_grants(&alice, Some(&probe))
+            .await?;
+        let warm_old = dht_store
+            .as_read()
+            .valid_cap_grants_reference(&alice, Some(&probe))
+            .await?;
+        assert_eq!(warm_new, warm_old);
+        assert!(
+            warm_new.len() > 200,
+            "expected a large candidate set, got {}",
+            warm_new.len()
+        );
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            dht_store
+                .as_read()
+                .valid_cap_grants(&alice, Some(&probe))
+                .await?;
+        }
+        let new_elapsed = t0.elapsed();
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..3 {
+            dht_store
+                .as_read()
+                .valid_cap_grants_reference(&alice, Some(&probe))
+                .await?;
+        }
+        let old_elapsed = t1.elapsed();
+
+        assert!(
+            new_elapsed * 3 < old_elapsed,
+            "the per-grant query fan-out appears to have returned: \
+             new {new_elapsed:?} vs reference {old_elapsed:?} over {} candidates",
+            warm_new.len()
+        );
+        Ok(())
+    }
+
+    /// Two grants with identical content share one entry hash but have distinct
+    /// actions. The old code produced one candidate per *action* (duplicates
+    /// preserved) and a delete keyed on the shared entry hash revoked both;
+    /// the rewrite must behave the same.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_duplicate_entries_match_reference() -> SourceChainResult<()> {
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+            ..
+        } = TestCase::new().await;
+
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let secret = secret_from(12_345);
+        let function: GrantedFunction = ("zome_a".into(), "fn_one".into());
+        let grant = ZomeCallCapGrant::new(
+            "dupe".into(),
+            CapAccess::Transferable { secret },
+            listed(&[("zome_a", "fn_one")]),
+        );
+
+        let (first_action, entry) = put_cap_grant(&chain, &grant).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        let (_second_action, entry2) = put_cap_grant(&chain, &grant).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+        assert_eq!(entry, entry2, "identical grants must share an entry hash");
+
+        let new = dht_store
+            .as_read()
+            .valid_cap_grants(&alice, Some(&secret))
+            .await?;
+        let old = dht_store
+            .as_read()
+            .valid_cap_grants_reference(&alice, Some(&secret))
+            .await?;
+        assert_eq!(new, old);
+        assert_eq!(new.len(), 2, "one candidate per action, duplicates kept");
+
+        // Deleting one action deletes the shared entry hash, so both go.
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        delete_cap_grant(&chain, first_action, entry).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+        let new = dht_store
+            .as_read()
+            .valid_cap_grants(&alice, Some(&secret))
+            .await?;
+        assert_eq!(
+            new,
+            dht_store
+                .as_read()
+                .valid_cap_grants_reference(&alice, Some(&secret))
+                .await?
+        );
+        assert_eq!(
+            chain.valid_cap_grant(function, bob, Some(secret)).await?,
+            None
+        );
+        Ok(())
+    }
+
     struct TestCase {
         chain: SourceChain,
         agent_key: AgentPubKey,
