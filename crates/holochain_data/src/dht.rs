@@ -30,6 +30,12 @@ pub use inner::scheduled_function::InsertScheduledFunction;
 pub use inner::updated_record::InsertUpdatedRecord;
 pub use inner::warrant::InsertWarrant;
 
+/// ELOHIM PATCH: create the K2 sync-read indexes on an opened DHT database.
+/// See `inner::sync_queries::DHT_SYNC_INDEXES`.
+pub(crate) async fn ensure_sync_indexes(pool: &sqlx::Pool<sqlx::Sqlite>) -> sqlx::Result<()> {
+    inner::sync_queries::ensure_sync_indexes(pool).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
