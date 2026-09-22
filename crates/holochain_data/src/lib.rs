@@ -46,6 +46,16 @@ fn migrator_for(db_kind: kind::DbKind) -> &'static sqlx::migrate::Migrator {
     }
 }
 
+/// ELOHIM PATCH: schema objects applied after migrations, idempotently, that
+/// must not be recorded as migrations (an older binary would then refuse to
+/// open the database — see `dht::ensure_sync_indexes`).
+async fn post_migrate(db_kind: kind::DbKind, pool: &Pool<Sqlite>) -> sqlx::Result<()> {
+    match db_kind {
+        kind::DbKind::Dht => dht::ensure_sync_indexes(pool).await,
+        kind::DbKind::Wasm | kind::DbKind::Conductor | kind::DbKind::PeerMetaStore => Ok(()),
+    }
+}
+
 /// SQLite synchronous level configuration.
 ///
 /// Corresponds to the `PRAGMA synchronous` pragma.
@@ -166,6 +176,7 @@ pub async fn open_db<I: DatabaseIdentifier>(
 
     // Run migrations for this database kind
     migrator_for(database_id.db_kind()).run(&pool).await?;
+    post_migrate(database_id.db_kind(), &pool).await?;
 
     Ok(DbWrite::new(pool, database_id))
 }
@@ -176,6 +187,7 @@ pub async fn test_open_db<I: DatabaseIdentifier>(database_id: I) -> sqlx::Result
 
     // Run migrations for this database kind
     migrator_for(database_id.db_kind()).run(&pool).await?;
+    post_migrate(database_id.db_kind(), &pool).await?;
 
     Ok(DbWrite::new(pool, database_id))
 }
