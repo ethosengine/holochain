@@ -667,17 +667,21 @@ impl State {
                 )
             })
             .unwrap_or((false, 0, 0.0, None, None, true, true));
-        let Some(next_rows_affected) = (rows_affected_complete && visitor.rows_affected.is_some())
-            .then(|| checked_optional_sum(rows_affected, visitor.rows_affected))
-            .unwrap_or(Some(None))
-        else {
+        let next_rows_affected = if rows_affected_complete && visitor.rows_affected.is_some() {
+            checked_optional_sum(rows_affected, visitor.rows_affected)
+        } else {
+            Some(None)
+        };
+        let Some(next_rows_affected) = next_rows_affected else {
             checked_increment(&mut data.arithmetic_overflow_events);
             return None;
         };
-        let Some(next_rows_returned) = (rows_returned_complete && visitor.rows_returned.is_some())
-            .then(|| checked_optional_sum(rows_returned, visitor.rows_returned))
-            .unwrap_or(Some(None))
-        else {
+        let next_rows_returned = if rows_returned_complete && visitor.rows_returned.is_some() {
+            checked_optional_sum(rows_returned, visitor.rows_returned)
+        } else {
+            Some(None)
+        };
+        let Some(next_rows_returned) = next_rows_returned else {
             checked_increment(&mut data.arithmetic_overflow_events);
             return None;
         };

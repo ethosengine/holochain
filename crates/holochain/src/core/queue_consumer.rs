@@ -64,7 +64,10 @@ use tracing_subscriber::{filter::filter_fn, fmt::MakeWriter, prelude::*};
 
 static NEXT_CELL_TRACE_TOKEN: AtomicU64 = AtomicU64::new(1);
 static NEXT_WORKFLOW_RUN_ID: AtomicU64 = AtomicU64::new(1);
-static CELL_TRACE_TOKENS: OnceLock<Mutex<HashMap<CellId, (u64, Weak<()>)>>> = OnceLock::new();
+/// Per-cell opaque trace token and the lease that keeps it live while any of
+/// the cell's workflow tasks still runs.
+type CellTraceTokens = Mutex<HashMap<CellId, (u64, Weak<()>)>>;
+static CELL_TRACE_TOKENS: OnceLock<CellTraceTokens> = OnceLock::new();
 const WORKFLOW_TELEMETRY_VERSION: u8 = 1;
 const WORKFLOW_DIAGNOSTIC_MAX_SECONDS: u64 = 15 * 60;
 const WORKFLOW_DIAGNOSTIC_MAX_EVENTS: u64 = 10_000;
