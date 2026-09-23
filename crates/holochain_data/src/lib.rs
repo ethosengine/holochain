@@ -51,7 +51,10 @@ fn migrator_for(db_kind: kind::DbKind) -> &'static sqlx::migrate::Migrator {
 /// open the database — see `dht::ensure_sync_indexes`).
 async fn post_migrate(db_kind: kind::DbKind, pool: &Pool<Sqlite>) -> sqlx::Result<()> {
     match db_kind {
-        kind::DbKind::Dht => dht::ensure_sync_indexes(pool).await,
+        kind::DbKind::Dht => {
+            dht::ensure_sync_indexes(pool).await?;
+            dht::ensure_chain_read_indexes(pool).await
+        }
         kind::DbKind::Wasm | kind::DbKind::Conductor | kind::DbKind::PeerMetaStore => Ok(()),
     }
 }

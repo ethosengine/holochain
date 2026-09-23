@@ -1,6 +1,7 @@
 //! `DbRead<Dht>` / `DbWrite<Dht>` API for the `Action` table.
 
 use super::super::inner::action;
+use super::super::inner::action::AuthorChainPrefilter;
 use crate::handles::{DbRead, DbWrite};
 use crate::kind::Dht;
 use crate::models::dht::AgentActivityItem;
@@ -34,6 +35,19 @@ impl DbRead<Dht> {
     ) -> sqlx::Result<Vec<SignedActionHashed>> {
         let mut conn = self.timed_conn().await?;
         action::get_actions_by_author(&mut *conn, author).await
+    }
+
+    /// Fetch the author's accepted actions narrowed by `filter`, ordered by
+    /// `action_seq` ascending. See [`AuthorChainPrefilter`] for the contract:
+    /// the result is exactly [`get_actions_by_author`](Self::get_actions_by_author)
+    /// restricted to the rows `filter` keeps.
+    pub async fn get_actions_by_author_filtered(
+        &self,
+        author: &AgentPubKey,
+        filter: AuthorChainPrefilter<'_>,
+    ) -> sqlx::Result<Vec<SignedActionHashed>> {
+        let mut conn = self.timed_conn().await?;
+        action::get_actions_by_author_filtered(&mut *conn, author, filter).await
     }
 
     /// Fetch an exclusive page of accepted actions authored by `author`.

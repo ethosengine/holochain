@@ -849,32 +849,118 @@ where
     /// used by the `query` host function, which crosses the wasm boundary.
     ///
     /// Returns [`holochain_zome_types::prelude::Record`]s, matching
-    /// [`DhtStore::source_chain_records`], with the scratch overlaid afterwards.
+    /// [`DhtStore::source_chain_records`] filtered by `query`, with the scratch
+    /// overlaid afterwards.
+    ///
+    /// Cost is bounded by the filter, not by the chain: a sequence range (and,
+    /// alongside it or unbounded, the action-type and entry-hash filters) is
+    /// applied in the SQL that reads the committed chain, and entries are
+    /// loaded only for the records that survive the full filter.
+    /// [`ChainQueryFilter::filter_actions`] is still the final authority over
+    /// which records come back and in what order; see
+    /// `committed_chain_prefilter` for why pushing the per-row predicates
+    /// down cannot change that answer.
     pub async fn query(
         &self,
         query: QueryFilter,
     ) -> SourceChainResult<Vec<holochain_zome_types::prelude::Record>> {
         let public_only = self.public_only;
+        let store = self.dht_store.as_read();
 
-        // Fetch the author's committed records from the DhtStore (no filtering
-        // applied here). Ordering and filtering are handled below;
-        // `ChainQueryFilter::filter_records` is the final authority.
+        // 1. The committed actions — headers only — narrowed in SQL.
+        let entry_hashes = prefilter_entry_hashes(&query);
+        let mut committed = store
+            .source_chain_actions(
+                self.author.as_ref(),
+                committed_chain_prefilter(&query, entry_hashes.as_deref()),
+            )
+            .await?;
+
+        // The store returns committed actions in ascending sequence order.
+        // `order_descending` applies to the committed records only (the scratch
+        // is always appended in ascending order below), so reverse the
+        // committed actions for a descending query.
+        if query.order_descending {
+            committed.reverse();
+        }
+
+        // 2. The scratch, exactly as before: every uncommitted action, with its
+        // in-memory entry when entries are requested.
+        let scratch_records = self.scratch.apply(|scratch| {
+            let mut scratch_records: Vec<_> = scratch
+                .actions()
+                .filter_map(|sah| {
+                    let entry = match sah.action().entry_hash() {
+                        Some(eh) if query.include_entries => scratch.get_entry(eh).ok()?,
+                        _ => None,
+                    };
+                    let record_entry = RecordEntry::new(sah.action().entry_visibility(), entry);
+                    Some(Record::new(sah.clone(), record_entry))
+                })
+                .collect();
+            scratch_records.sort_unstable_by_key(|e| e.action().action_seq());
+            scratch_records
+        })?;
+
+        // 3. The authoritative filter, over committed actions and scratch
+        // records together (a hash-bounded range walks `prev_action` across
+        // both).
+        let candidates: Vec<QueryCandidate> = committed
+            .into_iter()
+            .map(QueryCandidate::Committed)
+            .chain(scratch_records.into_iter().map(QueryCandidate::Scratch))
+            .collect();
+        let survivors = query.filter_actions(candidates);
+
+        // 4. Entries for the surviving committed actions only, then the
+        // records in the filter's order.
+        let mut committed_survivors = Vec::new();
+        let slots: Vec<Option<Record>> = survivors
+            .into_iter()
+            .map(|candidate| match candidate {
+                QueryCandidate::Committed(sah) => {
+                    committed_survivors.push(sah);
+                    None
+                }
+                QueryCandidate::Scratch(record) => Some(record),
+            })
+            .collect();
+        let committed_len = committed_survivors.len();
+        let committed_records = store
+            .source_chain_records_for_actions(
+                self.author.as_ref(),
+                committed_survivors,
+                query.include_entries,
+                public_only,
+            )
+            .await?;
+        debug_assert_eq!(committed_records.len(), committed_len);
+        let mut committed_records = committed_records.into_iter();
+
+        Ok(slots
+            .into_iter()
+            .filter_map(|slot| slot.or_else(|| committed_records.next()))
+            .collect())
+    }
+
+    /// The pre-pushdown implementation of [`query`](Self::query), kept
+    /// verbatim as a test oracle: read the whole committed chain with entries,
+    /// overlay the scratch, filter in Rust. Differential tests assert the two
+    /// agree for every filter shape; nothing outside `cfg(test)` may call it.
+    #[cfg(test)]
+    pub(crate) async fn query_reference(
+        &self,
+        query: QueryFilter,
+    ) -> SourceChainResult<Vec<holochain_zome_types::prelude::Record>> {
+        let public_only = self.public_only;
         let mut records = self
             .dht_store
             .as_read()
             .source_chain_records(self.author.as_ref(), query.include_entries, public_only)
             .await?;
-
-        // The store returns committed records in ascending sequence order.
-        // `order_descending` applies to the committed records only (the scratch
-        // is always appended in ascending order below), so reverse the
-        // committed records for a descending query.
         if query.order_descending {
             records.reverse();
         }
-
-        // Just take anything from the scratch for now. More filtering is possibly needed against
-        // the results returned from the database anyway.
         self.scratch.apply(|scratch| {
             let mut scratch_records: Vec<_> = scratch
                 .actions()
@@ -890,7 +976,6 @@ where
             scratch_records.sort_unstable_by_key(|e| e.action().action_seq());
             records.extend(scratch_records);
         })?;
-
         Ok(query.filter_records(records))
     }
 
@@ -931,6 +1016,86 @@ where
 
     pub async fn dump(&self) -> SourceChainResult<SourceChainDump> {
         dump_state(&self.dht_store.as_read(), (*self.author).clone()).await
+    }
+}
+
+/// A record candidate for [`SourceChain::query`]: a committed action whose
+/// entry has not been read yet, or a scratch record (entry already in memory).
+#[derive(Clone)]
+enum QueryCandidate {
+    Committed(SignedActionHashed),
+    Scratch(Record),
+}
+
+impl holochain_zome_types::prelude::ActionSequenceAndHash for QueryCandidate {
+    fn action_seq(&self) -> u32 {
+        holochain_zome_types::prelude::ActionHashedContainer::action(self).action_seq()
+    }
+
+    fn address(&self) -> &ActionHash {
+        holochain_zome_types::prelude::ActionHashedContainer::action_hash(self)
+    }
+}
+
+impl holochain_zome_types::prelude::ActionHashedContainer for QueryCandidate {
+    fn action(&self) -> &Action {
+        match self {
+            Self::Committed(sah) => sah.action(),
+            Self::Scratch(record) => record.action(),
+        }
+    }
+
+    fn action_hash(&self) -> &ActionHash {
+        match self {
+            Self::Committed(sah) => sah.as_hash(),
+            Self::Scratch(record) => record.action_address(),
+        }
+    }
+}
+
+/// The entry hashes of `query` as a pre-filter slice, when there are few
+/// enough to bind (above the cap the store would ignore them anyway, so they
+/// are not even collected).
+fn prefilter_entry_hashes(query: &QueryFilter) -> Option<Vec<EntryHash>> {
+    query
+        .entry_hashes
+        .as_ref()
+        .filter(|hashes| hashes.len() <= holochain_data::dht::MAX_PREFILTER_ENTRY_HASHES)
+        .map(|hashes| hashes.iter().cloned().collect())
+}
+
+/// The SQL pre-filter for the committed half of [`SourceChain::query`].
+///
+/// Why this cannot change the result: under an `Unbounded` or
+/// `ActionSeqRange` range, [`ChainQueryFilter::filter_actions`] is a
+/// conjunction of independent per-record predicates — `seq` in range,
+/// `action_type` in the list, `entry_hash` in the set — that keeps the
+/// survivors in their input order. Removing, in SQL, only records one of those
+/// predicates rejects therefore leaves the survivors and their order
+/// unchanged; the Rust filter runs afterwards regardless. `entry_type` has no
+/// column and stays Rust-side.
+///
+/// A hash-bounded range (`ActionHashRange`, `ActionHashTerminated`) is a walk
+/// along `prev_action` that happens BEFORE the per-record predicates; removing
+/// any record (even one the predicates would reject) could cut the walk short.
+/// Those ranges read the whole committed chain's actions, as before — but
+/// still load entries only for the records that survive.
+fn committed_chain_prefilter<'a>(
+    query: &'a QueryFilter,
+    entry_hashes: Option<&'a [EntryHash]>,
+) -> holochain_data::dht::AuthorChainPrefilter<'a> {
+    let seq_range = match &query.sequence_range {
+        ChainQueryFilterRange::Unbounded => None,
+        ChainQueryFilterRange::ActionSeqRange(start, end) => Some((*start, *end)),
+        ChainQueryFilterRange::ActionHashRange(..)
+        | ChainQueryFilterRange::ActionHashTerminated(..) => {
+            return holochain_data::dht::AuthorChainPrefilter::default();
+        }
+    };
+    holochain_data::dht::AuthorChainPrefilter {
+        seq_range,
+        action_types: query.action_type.as_deref(),
+        entry_hashes,
     }
 }
 
@@ -2510,6 +2675,201 @@ mod tests {
         assert!(
             matches!(scratch_record.entry(), RecordEntry::Present(_)),
             "scratch entry (own data) should remain present under public_only"
+        );
+    }
+
+    /// `query` pushes the sequence range, action types and entry hashes into
+    /// SQL and loads entries only for survivors; the result must equal the
+    /// whole-chain-then-Rust-filter oracle for EVERY filter shape — every
+    /// range variant (including hash ranges that start in the committed chain
+    /// and end in the scratch, empty and inverted ranges), every per-record
+    /// predicate alone and combined, both orders, with and without entries,
+    /// with and without `public_only`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn source_chain_query_pushdown_matches_whole_chain_filter() {
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+        } = TestCase::new().await;
+        drop(chain);
+
+        let public_type = EntryType::App(AppEntryDef {
+            zome_index: 0.into(),
+            entry_index: 0.into(),
+            visibility: EntryVisibility::Public,
+        });
+        let private_type = EntryType::App(AppEntryDef {
+            zome_index: 0.into(),
+            entry_index: 1.into(),
+            visibility: EntryVisibility::Private,
+        });
+        let app_entry = |i: u32| {
+            Entry::App(AppEntryBytes(SerializedBytes::from(
+                holochain_serialized_bytes::UnsafeBytes::from(
+                    holochain_serialized_bytes::encode(&(i, "pushdown")).unwrap(),
+                ),
+            )))
+        };
+        let create = |entry_type: EntryType, entry: &Entry| {
+            ActionData::Create(CreateData {
+                entry_type,
+                entry_hash: EntryHash::with_data_sync(entry),
+            })
+        };
+
+        // Committed: public creates, private creates, entry-less actions and
+        // an update, interleaved.
+        let committed = fresh_chain(&dht_store, &keystore, &alice).await.unwrap();
+        let mut first_public: Option<(ActionHash, EntryHash)> = None;
+        for i in 0..12u32 {
+            let (data, entry) = match i % 4 {
+                0 | 3 => {
+                    let e = app_entry(i);
+                    (create(public_type.clone(), &e), Some(e))
+                }
+                1 => {
+                    let e = app_entry(i);
+                    (create(private_type.clone(), &e), Some(e))
+                }
+                _ => match &first_public {
+                    Some((action, entry_hash)) if i == 6 => {
+                        let e = app_entry(i);
+                        (
+                            ActionData::Update(UpdateData {
+                                original_action_address: action.clone(),
+                                original_entry_address: entry_hash.clone(),
+                                entry_type: public_type.clone(),
+                                entry_hash: EntryHash::with_data_sync(&e),
+                            }),
+                            Some(e),
+                        )
+                    }
+                    _ => (
+                        ActionData::InitZomesComplete(InitZomesCompleteData {}),
+                        None,
+                    ),
+                },
+            };
+            let entry_hash = data.entry_hash().cloned();
+            let hash = committed
+                .put(data, entry, ChainTopOrdering::default())
+                .await
+                .unwrap();
+            if first_public.is_none() {
+                first_public = entry_hash.map(|eh| (hash, eh));
+            }
+        }
+        committed.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        // Scratch: two uncommitted actions on top of the committed head.
+        let mut chain = fresh_chain(&dht_store, &keystore, &alice).await.unwrap();
+        let scratch_entry = app_entry(100);
+        chain
+            .put(
+                create(public_type.clone(), &scratch_entry),
+                Some(scratch_entry.clone()),
+                ChainTopOrdering::default(),
+            )
+            .await
+            .unwrap();
+        chain
+            .put(
+                ActionData::InitZomesComplete(InitZomesCompleteData {}),
+                None,
+                ChainTopOrdering::default(),
+            )
+            .await
+            .unwrap();
+
+        let all = chain
+            .query_reference(ChainQueryFilter::default())
+            .await
+            .unwrap();
+        // 3 genesis + 12 committed + 2 scratch.
+        assert_eq!(all.len(), 17);
+        let hash_at = |seq: usize| all[seq].action_address().clone();
+        let head = all.len() as u32 - 1;
+        let committed_entry_hash = all[4].action().entry_hash().unwrap().clone();
+        let scratch_entry_hash = EntryHash::with_data_sync(&scratch_entry);
+
+        let ranges = [
+            ChainQueryFilterRange::Unbounded,
+            ChainQueryFilterRange::ActionSeqRange(0, u32::MAX),
+            ChainQueryFilterRange::ActionSeqRange(4, 9),
+            ChainQueryFilterRange::ActionSeqRange(7, 7),
+            ChainQueryFilterRange::ActionSeqRange(9, 4),
+            ChainQueryFilterRange::ActionSeqRange(head - 3, head + 5),
+            ChainQueryFilterRange::ActionHashRange(hash_at(2), hash_at(9)),
+            ChainQueryFilterRange::ActionHashRange(hash_at(10), hash_at(head as usize)),
+            // `start` after `end`: the walk never meets it and runs to genesis.
+            ChainQueryFilterRange::ActionHashRange(hash_at(12), hash_at(5)),
+            ChainQueryFilterRange::ActionHashTerminated(hash_at(8), 3),
+            ChainQueryFilterRange::ActionHashTerminated(hash_at(head as usize), 4),
+            ChainQueryFilterRange::ActionHashTerminated(ActionHash::from_raw_36(vec![7; 36]), 2),
+        ];
+        let action_types = [
+            None,
+            Some(vec![ActionType::Create]),
+            Some(vec![ActionType::InitZomesComplete, ActionType::Dna]),
+            Some(vec![]),
+        ];
+        let entry_types = [
+            None,
+            Some(vec![EntryType::AgentPubKey]),
+            Some(vec![public_type.clone(), private_type.clone()]),
+        ];
+        let entry_hash_sets = [
+            None,
+            Some(
+                [committed_entry_hash, scratch_entry_hash]
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+            ),
+        ];
+
+        let mut compared = 0usize;
+        let mut nonempty = 0usize;
+        for public_only in [false, true] {
+            if public_only {
+                chain.public_only();
+            }
+            for sequence_range in &ranges {
+                for action_type in &action_types {
+                    for entry_type in &entry_types {
+                        for entry_hashes in &entry_hash_sets {
+                            for include_entries in [false, true] {
+                                for order_descending in [false, true] {
+                                    let query = ChainQueryFilter {
+                                        sequence_range: sequence_range.clone(),
+                                        entry_type: entry_type.clone(),
+                                        entry_hashes: entry_hashes.clone(),
+                                        action_type: action_type.clone(),
+                                        include_entries,
+                                        order_descending,
+                                    };
+                                    let got = chain.query(query.clone()).await.unwrap();
+                                    let expected =
+                                        chain.query_reference(query.clone()).await.unwrap();
+                                    assert_eq!(
+                                        got, expected,
+                                        "public_only={public_only} {query:?}"
+                                    );
+                                    compared += 1;
+                                    nonempty += usize::from(!got.is_empty());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 2 * 12 * 4 * 3 * 2 * 2 * 2);
+        // Guard against a vacuous pass where every shape returned nothing.
+        assert!(
+            nonempty > compared / 4,
+            "{nonempty} of {compared} non-empty"
         );
     }
 
