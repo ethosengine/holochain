@@ -18,7 +18,6 @@
 //! renderer over the SDK's public data model and a one-route HTTP/1.1
 //! responder — no framework, no new transitive dependencies.
 
-use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, Metric, MetricData, ResourceMetrics};
@@ -395,6 +394,7 @@ impl Number for f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::metrics::MeterProvider as _;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
