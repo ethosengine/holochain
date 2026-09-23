@@ -18,10 +18,24 @@ tracing = "0.1"
 # influxive dependencies
 hostname = "0.4"
 influxdb = "0.8"
-opentelemetry_sdk = "0.31"
+# ELOHIM: `experimental_metrics_custom_reader` exposes `ManualReader` + the
+# `MetricReader` trait, which the pull-based Prometheus exposition
+# (src/prometheus.rs) is built on. Same feature the discontinued
+# opentelemetry-prometheus crate used; no other SDK surface changes.
+opentelemetry_sdk = { version = "0.31", features = [
+  "experimental_metrics_custom_reader",
+] }
 tempfile = "3"
 thiserror = "2.0.18"
-tokio = { version = "1", features = ["process", "fs"] }
+# ELOHIM: net + io-util + time + rt for the Prometheus /metrics listener.
+tokio = { version = "1", features = [
+  "process",
+  "fs",
+  "net",
+  "io-util",
+  "time",
+  "rt",
+] }
 
 # influxd downloader dependencies
 digest = { version = "0.10", optional = true }
