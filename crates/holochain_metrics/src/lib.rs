@@ -16,6 +16,11 @@
 //!
 //! If you wish to enable metrics, the current options are:
 //!
+//! - **Prometheus text exposition, pull-based (ELOHIM addition).**
+//!   - Enable via environment variable: `HOLOCHAIN_PROMETHEUS_LISTEN=0.0.0.0:9464`
+//!   - Serves `GET /metrics` on that address; every instrument below is
+//!     collected on each scrape. Takes precedence over the InfluxDB options
+//!     when both are set. See [`prometheus`].
 //! - A file, containing InfluxDB line protocol metrics. These can be pushed to InfluxDB later with Telegraf.
 //!   - Enable and configure via environment variable: `HOLOCHAIN_INFLUXIVE_FILE="path/to/influx/file"`
 //! - InfluxDB as a zero-config child-process.
@@ -136,9 +141,17 @@ const DASH_WASM: &[u8] = include_bytes!("dashboards/wasm.json");
 
 const VAR_CELL_ID: &[u8] = include_bytes!("variables/cellid.json");
 
+/// Prometheus text exposition of the same instruments (ELOHIM addition).
+pub mod prometheus;
+pub use prometheus::PrometheusExporter;
+
 /// Configuration for holochain metrics set by environment variables.
 enum HolochainMetricsEnv {
     None,
+
+    Prometheus {
+        listen: std::net::SocketAddr,
+    },
 
     InfluxiveFile {
         filepath: String,
@@ -169,6 +182,26 @@ impl HolochainMetricsEnv {
 
         // Environment variable to set for enabling metrics to a file on disk.
         const ENV_FILE: &str = "HOLOCHAIN_INFLUXIVE_FILE";
+
+        // ELOHIM: Prometheus pull exposition. Checked first so a fleet that
+        // sets it can never be silently downgraded by a stray influxive var.
+        const ENV_PROMETHEUS_LISTEN: &str = "HOLOCHAIN_PROMETHEUS_LISTEN";
+
+        if let Some(listen) = std::env::var_os(ENV_PROMETHEUS_LISTEN) {
+            let listen = listen.to_string_lossy();
+            return match listen.parse::<std::net::SocketAddr>() {
+                Ok(listen) => Self::Prometheus { listen },
+                Err(err) => {
+                    tracing::error!(
+                        env = %ENV_PROMETHEUS_LISTEN,
+                        value = %listen,
+                        ?err,
+                        "invalid socket address; running without metrics"
+                    );
+                    Self::None
+                }
+            };
+        }
 
         if let Some(filepath) = std::env::var_os(ENV_FILE) {
             return Self::InfluxiveFile {
@@ -216,6 +249,13 @@ impl HolochainMetricsEnv {
 pub enum HolochainMetricsConfig {
     /// Metrics are disabled.
     Disabled,
+
+    /// Serve the Prometheus text exposition at `GET /metrics` on `listen`
+    /// (ELOHIM addition; see [`prometheus`]).
+    Prometheus {
+        /// Socket address the `/metrics` listener binds.
+        listen: std::net::SocketAddr,
+    },
 
     /// Use influxive to write metrics to a file.
     ///
@@ -310,6 +350,8 @@ impl HolochainMetricsConfig {
         }
 
         match env {
+            HolochainMetricsEnv::Prometheus { listen } => Self::Prometheus { listen },
+
             HolochainMetricsEnv::InfluxiveFile { filepath } => Self::InfluxiveFile {
                 writer_config: influxive::InfluxiveWriterConfig::create_with_influx_file(
                     PathBuf::from(filepath),
@@ -353,6 +395,10 @@ impl HolochainMetricsConfig {
                 tracing::info!("Running without metrics");
             }
 
+            Self::Prometheus { listen } => {
+                Self::init_prometheus(listen).await;
+            }
+
             Self::InfluxiveFile {
                 writer_config,
                 otel_config,
@@ -376,6 +422,29 @@ impl HolochainMetricsConfig {
                 Self::init_influxive_child_svc(*child_svc_config, otel_config).await;
             }
         }
+    }
+
+    /// Bind the `/metrics` listener, install the collecting meter provider
+    /// globally and spawn the responder. A bind failure logs and leaves the
+    /// process running without metrics rather than refusing to start: the
+    /// conductor's job is the DHT, and an exposition port is an operator
+    /// convenience — the missing series is the signal.
+    async fn init_prometheus(listen: std::net::SocketAddr) {
+        let listener = match tokio::net::TcpListener::bind(listen).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                tracing::error!(
+                    ?err,
+                    %listen,
+                    "prometheus metrics listener could not bind; running without metrics"
+                );
+                return;
+            }
+        };
+        let (exporter, meter_provider) = prometheus::PrometheusExporter::install();
+        opentelemetry::global::set_meter_provider(meter_provider);
+        tokio::spawn(prometheus::serve(std::sync::Arc::new(exporter), listener));
+        tracing::info!(%listen, "prometheus metrics exposition running at /metrics");
     }
 
     fn init_influxive_file(
