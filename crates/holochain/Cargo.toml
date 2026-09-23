@@ -107,6 +107,7 @@ schemars = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 sd-notify = "0.4"
+libc = { version = "0.2", optional = true }
 # Production allocator: jemalloc in place of glibc ptmalloc2. The base dep carries ONLY
 # `unprefixed_malloc_on_supported_platforms` — this interposes the bare malloc/free symbols so
 # C-side allocations (statically-linked SQLCipher codec, OpenSSL, CGo shims) ALSO route through
@@ -117,6 +118,7 @@ sd-notify = "0.4"
 tikv-jemallocator = { version = "0.6", features = [
   "unprefixed_malloc_on_supported_platforms",
 ], optional = true }
+tikv-jemalloc-sys = { version = "0.6", optional = true }
 
 [dev-dependencies]
 holochain = { path = ".", default-features = false, features = [
@@ -182,15 +184,21 @@ jemalloc = ["dep:tikv-jemallocator"]
 
 # Leak-hunt canary: the production `jemalloc` allocator PLUS heap profiling (--enable-prof).
 # A debug-only SUPERSET of `jemalloc` — adds profiling overhead; revert to plain `jemalloc`
-# once a leak site is named. Activate the profiler at runtime via
-# `_RJEM_MALLOC_CONF=prof:true,prof_active:true,...` (see the canary runbook).
+# once a leak site is named. The isolated canary must start with `prof:true,prof_active:false`,
+# automatic dumps disabled, and the private heap-capture startup gate configured; the controller
+# activates profiling only for its one admitted pair.
 # ⚠ Enabling this feature is NECESSARY BUT NOT SUFFICIENT for dumps: the build must also compile
 # tikv-jemalloc-sys WITH --enable-prof. Verify `Compiling tikv-jemalloc-sys` in the build log AND
 # `strings <holochain binary> | grep -i prof_prefix` is non-empty before trusting a profiler run —
 # a cached -sys layer silently yields a no-dump profiler (this happened on the 2026-06-18 canary).
 # Build:   cargo build --release --bin holochain --no-default-features \
 #            --features encryption,wasmer-sys-cranelift,jemalloc-prof
-jemalloc-prof = ["jemalloc", "tikv-jemallocator/profiling"]
+jemalloc-prof = [
+  "jemalloc",
+  "tikv-jemallocator/profiling",
+  "dep:libc",
+  "dep:tikv-jemalloc-sys",
+]
 
 # Exposes additional functionality only needed for integration tests.
 # This feature should be turned off for production builds.

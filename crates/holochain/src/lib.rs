@@ -18,6 +18,8 @@ pub mod conductor;
 pub mod core;
 #[cfg(feature = "test_utils")]
 pub mod fixt;
+/// Private, process-local heap capture for an isolated profiling canary.
+pub mod heap_capture;
 
 #[cfg(any(test, feature = "test_utils"))]
 pub mod sweettest;

@@ -888,6 +888,12 @@ impl DhtStore<DbWrite<Dht>> {
     /// inserted instead (the `PRIMARY KEY ON CONFLICT IGNORE` keeps the first
     /// publish time if the same warrant is recorded again). The publish queue
     /// excludes any warrant that has a `WarrantPublish` row.
+    #[tracing::instrument(
+        target = "holochain::sql_site",
+        name = "dht.publish.record_sent",
+        level = "trace",
+        skip_all
+    )]
     pub async fn record_published_op_hashes(
         &self,
         op_hashes: Vec<DhtOpHash>,

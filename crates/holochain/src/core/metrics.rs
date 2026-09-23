@@ -2,37 +2,129 @@ use holo_hash::DnaHash;
 use opentelemetry::{global::meter, metrics, KeyValue};
 use std::sync::{Arc, OnceLock};
 
-pub(crate) struct Histogram {
-    histogram: metrics::Histogram<f64>,
-    attributes: Vec<KeyValue>,
+#[cfg(test)]
+#[derive(Default)]
+struct WorkflowRunTestCounts {
+    started: std::sync::atomic::AtomicU64,
+    finished: std::sync::atomic::AtomicU64,
+    in_flight: std::sync::atomic::AtomicI64,
+    complete: std::sync::atomic::AtomicU64,
+    dropped: std::sync::atomic::AtomicU64,
+    other: std::sync::atomic::AtomicU64,
 }
 
-impl Histogram {
-    pub fn record(&self, value: f64) {
-        self.histogram.record(value, &self.attributes);
+pub(crate) struct WorkflowRunMetrics {
+    duration: metrics::Histogram<f64>,
+    runs: metrics::Counter<u64>,
+    in_flight: metrics::UpDownCounter<i64>,
+    attributes: Vec<KeyValue>,
+    #[cfg(test)]
+    test_counts: Arc<WorkflowRunTestCounts>,
+}
+
+impl WorkflowRunMetrics {
+    pub fn started(&self, trigger: &'static str) -> WorkflowRunGuard<'_> {
+        #[cfg(test)]
+        {
+            self.test_counts
+                .started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.test_counts
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut attributes = self.attributes.clone();
+        attributes.push(KeyValue::new("trigger", trigger));
+        self.runs.add(1, &attributes);
+        self.in_flight.add(1, &self.attributes);
+        WorkflowRunGuard {
+            metrics: self,
+            started: std::time::Instant::now(),
+            outcome: "dropped",
+        }
     }
 }
 
-pub(crate) type WorkflowDurationMetric = Histogram;
+pub(crate) struct WorkflowRunGuard<'a> {
+    metrics: &'a WorkflowRunMetrics,
+    started: std::time::Instant,
+    outcome: &'static str,
+}
 
-pub(crate) fn create_workflow_duration_metric(
+impl WorkflowRunGuard<'_> {
+    pub fn finish(mut self, outcome: &'static str) {
+        self.outcome = outcome;
+    }
+}
+
+impl Drop for WorkflowRunGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        {
+            self.metrics
+                .test_counts
+                .finished
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.metrics
+                .test_counts
+                .in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            match self.outcome {
+                "complete" => &self.metrics.test_counts.complete,
+                "dropped" => &self.metrics.test_counts.dropped,
+                _ => &self.metrics.test_counts.other,
+            }
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut attributes = self.metrics.attributes.clone();
+        attributes.push(KeyValue::new("outcome", self.outcome));
+        self.metrics
+            .duration
+            .record(self.started.elapsed().as_secs_f64(), &attributes);
+        self.metrics.in_flight.add(-1, &self.metrics.attributes);
+    }
+}
+
+#[cfg(test)]
+impl WorkflowRunMetrics {
+    pub(crate) fn test_counts(&self) -> (u64, u64, i64, u64, u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (
+            self.test_counts.started.load(SeqCst),
+            self.test_counts.finished.load(SeqCst),
+            self.test_counts.in_flight.load(SeqCst),
+            self.test_counts.complete.load(SeqCst),
+            self.test_counts.dropped.load(SeqCst),
+        )
+    }
+}
+
+pub(crate) fn create_workflow_run_metrics(
     workflow_name: String,
     dna_hash: Arc<DnaHash>,
-) -> WorkflowDurationMetric {
+) -> WorkflowRunMetrics {
     let attributes = vec![
         KeyValue::new("workflow", workflow_name),
         KeyValue::new("dna_hash", dna_hash.to_string()),
     ];
-
-    let histogram = meter("hc.conductor")
-        .f64_histogram("hc.conductor.workflow.duration")
-        .with_unit("s")
-        .with_description("The time spent running a workflow")
-        .build();
-
-    Histogram {
-        histogram,
+    let meter = meter("hc.conductor");
+    WorkflowRunMetrics {
+        duration: meter
+            .f64_histogram("hc.conductor.workflow.duration")
+            .with_unit("s")
+            .with_description("Duration of a workflow run, including its terminal outcome")
+            .build(),
+        runs: meter
+            .u64_counter("hc.conductor.workflow.run")
+            .with_description("Workflow runs started, classified by their wake source")
+            .build(),
+        in_flight: meter
+            .i64_up_down_counter("hc.conductor.workflow.in_flight")
+            .with_description("Workflow runs currently in flight")
+            .build(),
         attributes,
+        #[cfg(test)]
+        test_counts: Arc::default(),
     }
 }
 

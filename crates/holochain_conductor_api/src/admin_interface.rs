@@ -7,6 +7,239 @@ use holochain_zome_types::cell::CellId;
 use kitsune2_api::Url;
 use std::collections::{BTreeMap, HashMap};
 
+/// Version of the private runtime-diagnostic admin wire contract.
+pub const DIAGNOSTIC_CAPTURE_SCHEMA_VERSION: u8 = 1;
+
+/// Request to open one bounded private diagnostic window.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureDiagnosticRequest {
+    /// Exact wire schema version. Only version 1 is accepted.
+    pub schema_version: u8,
+    /// Caller-generated operation nonce (1..=64 ASCII alphanumeric, `_`, or `-`).
+    pub nonce: String,
+    /// Requested active window in seconds (1..=900).
+    pub requested_seconds: u64,
+}
+
+/// Diagnostic family controlled by an admission response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiagnosticCaptureFamily {
+    /// Bounded SQLx statement timing aggregation.
+    SqlTiming,
+    /// Bounded workflow lifecycle detail.
+    Workflow,
+}
+
+/// Immediate result of asking a dormant private diagnostic controller to arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptureAdmissionOutcome {
+    /// A new generation is active. This is not a completion claim.
+    Admitted,
+    /// The family was not authorized at process startup.
+    RefusedDisabled,
+    /// Another generation is active or its terminal witness is still serializing.
+    RefusedBusy,
+    /// This process has already seen the supplied nonce for this family.
+    RefusedDuplicateNonce,
+    /// The process-lifetime generation budget is exhausted.
+    RefusedGenerationBudget,
+    /// A version, nonce, duration, or another bounded field is invalid.
+    RefusedInvalidRequest,
+    /// Required TRACE instrumentation is unavailable for this process.
+    RefusedTraceUnavailable,
+    /// The private artifact could not be created or its timer could not be armed.
+    RefusedIo,
+}
+
+/// State of a newly admitted timed diagnostic window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CaptureWindowState {
+    /// The admission returned while this generation was active.
+    Active,
+}
+
+/// Bounds attached to an admitted diagnostic window.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticWindowStatus {
+    /// Requested active duration after validation.
+    pub requested_seconds: u64,
+    /// Hard detail-event cap for this family.
+    pub event_limit: u64,
+    /// Immediate state at admin-response serialization time.
+    pub state: CaptureWindowState,
+}
+
+/// Process-lifetime admission and refusal counters for one diagnostic family.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureAdmissionCounters {
+    /// Admitted generations.
+    pub admitted: u64,
+    /// Requests refused because startup authorization was absent.
+    pub refused_disabled: u64,
+    /// Requests refused because the controller was busy.
+    pub refused_busy: u64,
+    /// Requests refused because their nonce was already retained.
+    pub refused_duplicate_nonce: u64,
+    /// Requests refused because the generation budget was exhausted.
+    pub refused_generation_budget: u64,
+    /// Requests refused by strict request validation.
+    pub refused_invalid_request: u64,
+    /// Requests refused because required TRACE instrumentation was unavailable.
+    pub refused_trace_unavailable: u64,
+    /// Requests refused because private artifact or timer setup failed.
+    pub refused_io: u64,
+}
+
+/// Immediate admission response for a timed diagnostic family.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureDiagnosticResponse {
+    /// Wire schema version emitted by the controller.
+    pub schema_version: u8,
+    /// Family which handled the request.
+    pub family: DiagnosticCaptureFamily,
+    /// Validated caller nonce, or the bounded original value for a refusal.
+    pub nonce: String,
+    /// Typed admission or refusal result.
+    pub outcome: CaptureAdmissionOutcome,
+    /// Actual process-local producer identifier, only on admission.
+    pub producer_id: Option<String>,
+    /// Monotonic process-local generation, only on admission.
+    pub generation: Option<u8>,
+    /// Artifact basename only; the startup-authorized directory remains private.
+    pub output_basename: Option<String>,
+    /// Active window bounds, only on admission.
+    pub window: Option<DiagnosticWindowStatus>,
+    /// Saturating process-lifetime counts observed after this decision.
+    pub counters: CaptureAdmissionCounters,
+}
+
+/// Kernel-derived identity bound into private native diagnostic receipts.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticNativeProcess {
+    /// Native witness schema.
+    pub schema: u8,
+    /// PID in the producer's process namespace.
+    pub process_id: u32,
+    /// Kernel process birth ticks.
+    pub process_start_ticks: u64,
+    /// Kernel boot identifier.
+    pub boot_id: String,
+    /// Kernel-observed executable path on the private admin surface.
+    pub executable: String,
+    /// Clock used by receipt interval fields (`CLOCK_MONOTONIC`).
+    pub clock: String,
+}
+
+/// Phase of the single heap-capture pair allowed in a disposable process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HeapCapturePhase {
+    /// Baseline heap profile.
+    Before,
+    /// Post-operation heap profile for the same nonce.
+    After,
+}
+
+/// Strict request for one heap-capture phase.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HeapCaptureRequest {
+    /// Exact wire schema version. Only version 1 is accepted.
+    pub schema_version: u8,
+    /// Pair nonce (1..=64 bounded printable ASCII characters).
+    pub nonce: String,
+    /// Requested pair phase; no caller path or PID is accepted.
+    pub phase: HeapCapturePhase,
+}
+
+/// Typed refusal from the native heap-capture controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HeapCaptureRefusal {
+    /// Startup authorization was absent.
+    Disabled,
+    /// Another native traversal is active.
+    Busy,
+    /// This nonce was already consumed in a terminal state.
+    DuplicateNonce,
+    /// The one-pair process budget is exhausted.
+    GenerationBudget,
+    /// Version, nonce, or another strict request field is invalid.
+    InvalidRequest,
+    /// The current target cannot provide the native profiler.
+    Unsupported,
+    /// Jemalloc profiling was not active for this process.
+    ProfilerUnavailable,
+    /// The requested phase does not follow the admitted pair sequence.
+    InvalidSequence,
+    /// The startup-authorized process window has expired.
+    Deadline,
+    /// A bounded collector reported byte overflow.
+    ByteLimit,
+    /// A private descriptor or native profiler operation failed.
+    Io,
+    /// The native operation returned without all required completion witnesses.
+    Incomplete,
+}
+
+/// Redacted typed native heap-capture failure.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HeapCaptureFailure {
+    /// Machine-readable refusal.
+    pub refusal: HeapCaptureRefusal,
+    /// Fixed bounded message which never contains a path or mallctl input.
+    pub message: String,
+}
+
+/// Native-only completion receipt for one heap-capture phase.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HeapCaptureReceipt {
+    /// Wire schema version emitted by the controller.
+    pub schema_version: u8,
+    /// Pair nonce.
+    pub nonce: String,
+    /// Completed pair phase.
+    pub phase: HeapCapturePhase,
+    /// Actual process-local producer identifier.
+    pub producer_id: String,
+    /// Process-local generation (the disposable canary admits only generation 1).
+    pub generation: u8,
+    /// Artifact basename only; the private directory remains undisclosed.
+    pub artifact_basename: String,
+    /// Kernel-derived producer identity.
+    pub native_process: DiagnosticNativeProcess,
+    /// Per-phase timer origin before blocking-worker scheduling, in monotonic milliseconds.
+    pub started_monotonic_ms: u64,
+    /// Finish after native traversal and signal cleanup, on the same monotonic clock.
+    pub finished_monotonic_ms: u64,
+    /// Startup-pinned per-phase native dump timeout, in milliseconds.
+    pub dump_timeout_ms: u64,
+    /// Absolute `CLOCK_MONOTONIC` deadline for this phase, in milliseconds.
+    pub deadline_monotonic_ms: u64,
+    /// True only when the native mallctl traversal returned successfully.
+    pub native_completed: bool,
+}
+
+/// Completed or refused native heap-capture response.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", content = "value", rename_all = "camelCase")]
+pub enum HeapCaptureResponse {
+    /// The native mallctl call completed; collector completeness remains separate evidence.
+    Completed(HeapCaptureReceipt),
+    /// The operation was not completed.
+    Refused(HeapCaptureFailure),
+}
+
 /// Represents the available conductor functions to call over an admin interface.
 ///
 /// Enum variants follow a general convention of `verb_noun` as opposed to
@@ -21,6 +254,24 @@ use std::collections::{BTreeMap, HashMap};
 #[derive(Debug, serde::Serialize, serde::Deserialize, SerializedBytes)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum AdminRequest {
+    /// Arm one bounded SQL timing generation in the startup-authorized private directory.
+    CaptureSqlTiming {
+        /// Strict versioned admission request.
+        request: CaptureDiagnosticRequest,
+    },
+
+    /// Arm one bounded workflow-detail generation in the startup-authorized private directory.
+    CaptureWorkflowDiagnostics {
+        /// Strict versioned admission request.
+        request: CaptureDiagnosticRequest,
+    },
+
+    /// Capture one phase of the disposable process's private heap-profile pair.
+    CaptureHeap {
+        /// Strict versioned phase request with no caller path or PID.
+        request: HeapCaptureRequest,
+    },
+
     /// Set up and register one or more new admin interfaces
     /// as specified by a list of configurations.
     ///
@@ -457,6 +708,12 @@ pub enum AdminResponse {
     /// There has been an error during the handling of the request.
     Error(ExternalApiWireError),
 
+    /// Immediate admission decision for a private timed diagnostic generation.
+    DiagnosticCapture(CaptureDiagnosticResponse),
+
+    /// Native heap-capture completion or typed refusal.
+    HeapCapture(HeapCaptureResponse),
+
     /// The successful response to an [`AdminRequest::GetDnaDefinition`]
     DnaDefinitionReturned(DnaDef),
 
@@ -757,7 +1014,11 @@ pub struct AppAuthenticationTokenIssued {
 
 #[cfg(test)]
 mod tests {
-    use crate::{AdminRequest, AdminResponse, DhtOpsCursor, ExternalApiWireError, OpTimingsCursor};
+    use crate::{
+        AdminRequest, AdminResponse, CaptureDiagnosticRequest, DhtOpsCursor,
+        DiagnosticNativeProcess, ExternalApiWireError, HeapCapturePhase, HeapCaptureReceipt,
+        HeapCaptureRequest, HeapCaptureResponse, OpTimingsCursor,
+    };
     use holo_hash::{AgentPubKey, DhtOpHash, DnaHash};
     use holochain_zome_types::cell::CellId;
     use serde::Deserialize;
@@ -809,6 +1070,116 @@ mod tests {
         let json_actual = serde_json::to_string(&json_value).unwrap();
 
         assert_eq!(json_actual, json_expected);
+    }
+
+    #[test]
+    fn diagnostic_capture_request_is_strict_camel_case() {
+        let value = serde_json::json!({
+            "type": "capture_sql_timing",
+            "value": {
+                "request": {
+                    "schemaVersion": 1,
+                    "nonce": "capture_1",
+                    "requestedSeconds": 30
+                }
+            }
+        });
+        let request: AdminRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(
+            request,
+            AdminRequest::CaptureSqlTiming {
+                request: CaptureDiagnosticRequest {
+                    schema_version: 1,
+                    requested_seconds: 30,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+
+        let unknown = serde_json::json!({
+            "type": "capture_workflow_diagnostics",
+            "value": {
+                "request": {
+                    "schemaVersion": 1,
+                    "nonce": "capture_2",
+                    "requestedSeconds": 30,
+                    "outputPath": "/tmp/not-authorized"
+                }
+            }
+        });
+        assert!(serde_json::from_value::<AdminRequest>(unknown).is_err());
+    }
+
+    #[test]
+    fn heap_capture_request_is_strict_and_accepts_no_path_or_pid() {
+        let value = serde_json::json!({
+            "type": "capture_heap",
+            "value": {
+                "request": {
+                    "schemaVersion": 1,
+                    "nonce": "canary_1",
+                    "phase": "before"
+                }
+            }
+        });
+        let request: AdminRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(
+            request,
+            AdminRequest::CaptureHeap {
+                request: HeapCaptureRequest {
+                    schema_version: 1,
+                    phase: HeapCapturePhase::Before,
+                    ..
+                }
+            }
+        ));
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+
+        let unknown = serde_json::json!({
+            "type": "capture_heap",
+            "value": {
+                "request": {
+                    "schemaVersion": 1,
+                    "nonce": "canary_1",
+                    "phase": "after",
+                    "outputPath": "/tmp/caller-chosen",
+                    "processId": 1
+                }
+            }
+        });
+        assert!(serde_json::from_value::<AdminRequest>(unknown).is_err());
+    }
+
+    #[test]
+    fn heap_capture_receipt_carries_the_absolute_native_deadline() {
+        let response =
+            AdminResponse::HeapCapture(HeapCaptureResponse::Completed(HeapCaptureReceipt {
+                schema_version: 1,
+                nonce: "canary_1".to_owned(),
+                phase: HeapCapturePhase::Before,
+                producer_id: "producer-1".to_owned(),
+                generation: 1,
+                artifact_basename: "before.heap.fifo".to_owned(),
+                native_process: DiagnosticNativeProcess {
+                    schema: 1,
+                    process_id: 42,
+                    process_start_ticks: 100,
+                    boot_id: "boot".to_owned(),
+                    executable: "/bin/holochain".to_owned(),
+                    clock: "CLOCK_MONOTONIC".to_owned(),
+                },
+                started_monotonic_ms: 1_000,
+                finished_monotonic_ms: 1_100,
+                dump_timeout_ms: 30_000,
+                deadline_monotonic_ms: 31_000,
+                native_completed: true,
+            }));
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["value"]["value"]["dumpTimeoutMs"], 30_000);
+        assert_eq!(value["value"]["value"]["deadlineMonotonicMs"], 31_000);
+        let decoded = serde_json::from_value::<AdminResponse>(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
     }
 
     #[test]

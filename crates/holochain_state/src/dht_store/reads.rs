@@ -273,6 +273,12 @@ impl DhtStore<DbRead<Dht>> {
     /// The basis is reconstructed as an [`ExternalHash`]: the publish path
     /// routes purely by the basis location, so the hash-type wrapper is
     /// irrelevant and the stored 36-byte basis is sufficient.
+    #[tracing::instrument(
+        target = "holochain::sql_site",
+        name = "dht.publish.select_ready",
+        level = "trace",
+        skip_all
+    )]
     pub async fn get_ops_to_publish(
         &self,
         author: &AgentPubKey,
@@ -294,6 +300,12 @@ impl DhtStore<DbRead<Dht>> {
     /// Count ops authored by `author` that may still need publishing in the
     /// future (ignoring the recency window). The publish workflow uses this to
     /// decide whether to keep looping.
+    #[tracing::instrument(
+        target = "holochain::sql_site",
+        name = "dht.publish.pending_count",
+        level = "trace",
+        skip_all
+    )]
     pub async fn num_still_needing_publish(&self, author: &AgentPubKey) -> StateQueryResult<usize> {
         Ok(self.db().num_still_needing_publish(author).await? as usize)
     }
@@ -1853,6 +1865,12 @@ impl DhtStore<DbRead<Dht>> {
     /// Return chain ops that have passed system validation and are awaiting
     /// app validation. Warrants have no app-validation stage, so they are not
     /// included.
+    #[tracing::instrument(
+        target = "holochain::sql_site",
+        name = "dht.validation.app.pending_ops",
+        level = "trace",
+        skip_all
+    )]
     pub async fn ops_pending_app_validation(
         &self,
         limit: u32,
@@ -2059,6 +2077,12 @@ impl DhtStore<DbRead<Dht>> {
     /// Return ops awaiting system validation, sorted across chain ops and
     /// warrants by `(sys_validation_attempts, when_received)`, up to `limit`
     /// rows total.
+    #[tracing::instrument(
+        target = "holochain::sql_site",
+        name = "dht.validation.sys.pending_ops",
+        level = "trace",
+        skip_all
+    )]
     pub async fn ops_pending_sys_validation(
         &self,
         limit: u32,

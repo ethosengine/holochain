@@ -80,7 +80,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tracing::Subscriber;
 use tracing_subscriber::{
-    filter::EnvFilter,
+    filter::{filter_fn, EnvFilter, FilterExt},
     fmt::{
         format::{DefaultFields, FmtSpan, Format},
         time::UtcTime,
@@ -97,6 +97,15 @@ pub mod metrics;
 mod writer;
 
 mod open;
+pub mod private_capture;
+mod sql_timing;
+
+pub use sql_timing::{
+    capture_sql_timing, SqlCaptureAdmission, SqlCaptureCounters, SqlCaptureOutcome,
+};
+
+/// Native process and clock witnesses for opt-in local diagnostic captures.
+pub mod diagnostic_identity;
 
 use crate::writer::InMemoryWriter;
 pub use open::{Config, Context, MsgWrap, OpenSpanExt};
@@ -187,9 +196,11 @@ pub fn test_run_timed_flame() -> Result<Option<Box<impl Drop>>, errors::TracingE
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let writer_handle = InMemoryWriter::new(buffer.clone());
 
-    init_fmt_with_opts(Output::FlameTimed, move || {
-        InMemoryWriter::new(buffer.clone())
-    })?;
+    init_fmt_with_opts(
+        Output::FlameTimed,
+        move || InMemoryWriter::new(buffer.clone()),
+        None,
+    )?;
     Ok(Some(Box::new(FlameTimed::new(writer_handle))))
 }
 
@@ -202,14 +213,22 @@ pub fn test_run_timed_ice() -> Result<Option<Box<impl Drop>>, errors::TracingErr
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let writer_handle = InMemoryWriter::new(buffer.clone());
 
-    init_fmt_with_opts(Output::IceTimed, move || {
-        InMemoryWriter::new(buffer.clone())
-    })?;
+    init_fmt_with_opts(
+        Output::IceTimed,
+        move || InMemoryWriter::new(buffer.clone()),
+        None,
+    )?;
     Ok(Some(Box::new(FlameTimed::new(writer_handle))))
 }
 
 /// Build the canonical filter based on env
 pub fn standard_filter() -> Result<EnvFilter, errors::TracingError> {
+    standard_filter_with_sql_timing(false)
+}
+
+fn standard_filter_with_sql_timing(
+    sql_timing_enabled: bool,
+) -> Result<EnvFilter, errors::TracingError> {
     let mut filter = EnvFilter::from_default_env().add_directive("[wasm_debug]=debug".parse()?);
     if std::env::var("CUSTOM_FILTER").is_ok() {
         EnvFilter::try_from_env("CUSTOM_FILTER")
@@ -219,7 +238,30 @@ pub fn standard_filter() -> Result<EnvFilter, errors::TracingError> {
             })
             .ok();
     }
+    // A private SQL capture enables SQLx DEBUG callsites independently. Never let that
+    // additional interest expose statement text through the public formatting layer,
+    // even when an operator supplied a broad log filter.
+    if sql_timing_enabled {
+        filter = filter.add_directive("sqlx::query=off".parse()?);
+    }
     Ok(filter)
+}
+
+/// Apply the public-formatting privacy boundary to a configured environment filter.
+///
+/// SQL timing needs SQLx DEBUG interest privately, but SQL statement fields must
+/// never reach the public formatter while that capture is active.
+fn formatter_filter<S>(
+    filter: EnvFilter,
+    sql_timing_enabled: bool,
+) -> impl tracing_subscriber::layer::Filter<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    filter.and(filter_fn(move |metadata| {
+        metadata.target() != sql_timing::SQL_SITE_TARGET
+            && (!sql_timing_enabled || metadata.target() != "sqlx::query")
+    }))
 }
 
 /// Return a subscriber builder directly, for times when you need more control over the
@@ -254,78 +296,109 @@ where
 /// This checks RUST_LOG for a filter but doesn't complain if there is none or it doesn't parse.
 /// It then checks for CUSTOM_FILTER which if set will output an error if it doesn't parse.
 pub fn init_fmt(output: Output) -> Result<(), errors::TracingError> {
-    init_fmt_with_opts(output, std::io::stderr)
+    init_fmt_with_opts(output, std::io::stderr, None)
 }
 
-fn init_fmt_with_opts<W>(output: Output, writer: W) -> Result<(), errors::TracingError>
+/// Initialize conductor logging with an optional bounded SQL timing capture.
+///
+/// The capture is disabled unless its explicit environment controls are valid.
+/// Keep the returned guard alive until graceful process shutdown.
+pub fn init_fmt_with_sql_timing(
+    output: Output,
+) -> Result<sql_timing::SqlTimingGuard, errors::TracingError> {
+    let (layer, guard) = sql_timing::SqlTimingLayer::from_env()?;
+    init_fmt_with_opts(output, std::io::stderr, layer)?;
+    Ok(guard)
+}
+
+fn init_fmt_with_opts<W>(
+    output: Output,
+    writer: W,
+    sql_timing: Option<sql_timing::SqlTimingLayer>,
+) -> Result<(), errors::TracingError>
 where
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
-    let filter = standard_filter()?;
+    let sql_timing_enabled = sql_timing.is_some();
+    let filter = standard_filter_with_sql_timing(sql_timing_enabled)?;
+    // This metadata gate is deliberately separate from EnvFilter directives: span/field
+    // directives must never re-enable SQLx fields in the public formatter.
+    let formatter_filter = formatter_filter(filter, sql_timing_enabled);
+    let sql_timing = sql_timing.map(|layer| layer.clone().with_filter(layer));
 
     println!("Initialising log output formatting with option {output:?}");
 
-    match output {
-        Output::Json => Registry::default()
+    match (output, sql_timing) {
+        (Output::Json, sql_timing) => Registry::default()
+            .with(sql_timing)
             .with(
                 standard_layer_unfiltered(writer)?
                     .with_timer(UtcTime::rfc_3339())
                     .json()
                     .event_format(FormatEvent)
-                    .with_filter(filter),
+                    .with_filter(formatter_filter),
             )
             .init(),
 
-        Output::JsonTimed => Registry::default()
+        (Output::JsonTimed, sql_timing) => Registry::default()
+            .with(sql_timing)
             .with(
                 standard_layer_unfiltered(writer)?
                     .with_span_events(FmtSpan::CLOSE)
                     .with_timer(UtcTime::rfc_3339())
                     .json()
                     .event_format(FormatEvent)
-                    .with_filter(filter),
+                    .with_filter(formatter_filter),
             )
             .init(),
 
-        Output::Log => Registry::default().with(standard_layer(writer)?).init(),
+        (Output::Log, sql_timing) => Registry::default()
+            .with(sql_timing)
+            .with(standard_layer_unfiltered(writer)?.with_filter(formatter_filter))
+            .init(),
 
-        Output::LogTimed => Registry::default()
+        (Output::LogTimed, sql_timing) => Registry::default()
+            .with(sql_timing)
             .with(
                 standard_layer_unfiltered(writer)?
                     .with_span_events(FmtSpan::FULL)
-                    .with_filter(filter),
+                    .with_filter(formatter_filter),
             )
             .init(),
 
-        Output::FlameTimed => Registry::default()
+        (Output::FlameTimed, sql_timing) => Registry::default()
+            .with(sql_timing)
             .with(
                 standard_layer_unfiltered(writer)?
                     .with_span_events(FmtSpan::CLOSE)
                     .with_timer(UtcTime::rfc_3339())
                     .event_format(FormatEventFlame)
-                    .with_filter(filter),
+                    .with_filter(formatter_filter),
             )
             .init(),
 
-        Output::IceTimed => Registry::default()
+        (Output::IceTimed, sql_timing) => Registry::default()
+            .with(sql_timing)
             .with(
                 standard_layer_unfiltered(writer)?
                     .with_span_events(FmtSpan::CLOSE)
                     .with_timer(UtcTime::rfc_3339())
                     .event_format(FormatEventIce)
-                    .with_filter(filter),
+                    .with_filter(formatter_filter),
             )
             .init(),
 
-        Output::Compact => Registry::default()
+        (Output::Compact, sql_timing) => Registry::default()
+            .with(sql_timing)
             .with(
                 standard_layer_unfiltered(writer)?
                     .compact()
-                    .with_filter(filter),
+                    .with_filter(formatter_filter),
             )
             .init(),
 
-        Output::None => (),
+        (Output::None, Some(sql_timing)) => Registry::default().with(sql_timing).init(),
+        (Output::None, None) => (),
     };
     Ok(())
 }
@@ -345,5 +418,7 @@ pub mod errors {
         TracingFlame,
         #[error(transparent)]
         BadDirective(#[from] tracing_subscriber::filter::ParseError),
+        #[error("SQL timing diagnostics: {0}")]
+        SqlTiming(String),
     }
 }

@@ -20,8 +20,9 @@ use tracing::*;
 // (Cargo.toml) so C-side allocations (SQLCipher codec, OpenSSL, CGo shims) route through jemalloc
 // too — that is THE cure for the conductor's native-heap leak, which lived in glibc's chained
 // 64MB secondary arenas (the prior Go-pprof attempt profiled the wrong runtime). The opt-in
-// debug superset `jemalloc-prof` adds --enable-prof on top; enable profiling at runtime via
-// `_RJEM_MALLOC_CONF=prof:true,prof_active:true,...` (see the canary runbook). Gating on
+// debug superset `jemalloc-prof` adds --enable-prof on top; the isolated canary starts with
+// `_RJEM_MALLOC_CONF=prof:true,prof_active:false,prof_gdump:false,prof_final:false,lg_prof_interval:-1`
+// and admits profiling only through the private startup-gated capture controller. Gating on
 // `jemalloc` means BOTH the prod and prof builds install the allocator.
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -74,6 +75,10 @@ struct Opt {
 }
 
 fn main() {
+    if let Err(failure) = holochain::heap_capture::initialize_from_env() {
+        eprintln!("Heap capture startup refused: {}", failure.message);
+        std::process::exit(ERROR_CODE);
+    }
     if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .is_err()
@@ -125,7 +130,12 @@ async fn async_main() {
         std::env::set_var("CUSTOM_FILTER", t);
     }
 
-    holochain_trace::init_fmt(opt.structured.clone()).expect("Failed to start contextual logging");
+    let _sql_timing = holochain_trace::init_fmt_with_sql_timing(opt.structured.clone())
+        .expect("Failed to start contextual logging");
+    if let Err(outcome) = holochain::core::queue_consumer::initialize_workflow_diagnostics() {
+        eprintln!("Workflow diagnostics startup refused: {outcome:?}");
+        std::process::exit(ERROR_CODE);
+    }
     debug!("holochain_trace initialized");
 
     let data_root_path: DataRootPath = config.data_root_path_or_die();

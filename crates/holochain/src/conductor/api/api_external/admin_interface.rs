@@ -63,6 +63,18 @@ impl AdminInterfaceApi {
     ) -> ConductorApiResult<AdminResponse> {
         use AdminRequest::*;
         match request {
+            CaptureSqlTiming { request } => Ok(AdminResponse::DiagnosticCapture(
+                sql_capture_response(request),
+            )),
+            CaptureWorkflowDiagnostics { request } => Ok(AdminResponse::DiagnosticCapture(
+                crate::core::queue_consumer::capture_workflow_diagnostics(request),
+            )),
+            CaptureHeap { request } => Ok(AdminResponse::HeapCapture(
+                match crate::heap_capture::capture(request).await {
+                    Ok(receipt) => HeapCaptureResponse::Completed(receipt),
+                    Err(failure) => HeapCaptureResponse::Refused(failure),
+                },
+            )),
             AddAdminInterfaces(configs) => {
                 self.conductor_handle
                     .clone()
@@ -317,5 +329,60 @@ impl AdminInterfaceApi {
                     .await?,
             )),
         }
+    }
+}
+
+fn sql_capture_response(request: CaptureDiagnosticRequest) -> CaptureDiagnosticResponse {
+    let admission = holochain_trace::capture_sql_timing(
+        request.schema_version,
+        &request.nonce,
+        request.requested_seconds,
+    );
+    let outcome = match admission.outcome {
+        holochain_trace::SqlCaptureOutcome::Admitted => CaptureAdmissionOutcome::Admitted,
+        holochain_trace::SqlCaptureOutcome::RefusedDisabled => {
+            CaptureAdmissionOutcome::RefusedDisabled
+        }
+        holochain_trace::SqlCaptureOutcome::RefusedBusy => CaptureAdmissionOutcome::RefusedBusy,
+        holochain_trace::SqlCaptureOutcome::RefusedDuplicateNonce => {
+            CaptureAdmissionOutcome::RefusedDuplicateNonce
+        }
+        holochain_trace::SqlCaptureOutcome::RefusedGenerationBudget => {
+            CaptureAdmissionOutcome::RefusedGenerationBudget
+        }
+        holochain_trace::SqlCaptureOutcome::RefusedInvalidRequest => {
+            CaptureAdmissionOutcome::RefusedInvalidRequest
+        }
+        holochain_trace::SqlCaptureOutcome::RefusedIo => CaptureAdmissionOutcome::RefusedIo,
+    };
+    let counters = CaptureAdmissionCounters {
+        admitted: admission.counters.admitted,
+        refused_disabled: admission.counters.refused_disabled,
+        refused_busy: admission.counters.refused_busy,
+        refused_duplicate_nonce: admission.counters.refused_duplicate_nonce,
+        refused_generation_budget: admission.counters.refused_generation_budget,
+        refused_invalid_request: admission.counters.refused_invalid_request,
+        refused_trace_unavailable: 0,
+        refused_io: admission.counters.refused_io,
+    };
+    let window = (outcome == CaptureAdmissionOutcome::Admitted).then_some(DiagnosticWindowStatus {
+        requested_seconds: request.requested_seconds,
+        event_limit: 10_000,
+        state: CaptureWindowState::Active,
+    });
+    CaptureDiagnosticResponse {
+        schema_version: DIAGNOSTIC_CAPTURE_SCHEMA_VERSION,
+        family: DiagnosticCaptureFamily::SqlTiming,
+        nonce: if holochain_trace::private_capture::valid_capture_nonce(&request.nonce) {
+            request.nonce
+        } else {
+            "invalid".to_owned()
+        },
+        outcome,
+        producer_id: admission.producer_id,
+        generation: admission.generation,
+        output_basename: admission.output_basename,
+        window,
+        counters,
     }
 }

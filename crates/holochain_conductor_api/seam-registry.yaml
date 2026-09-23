@@ -1,0 +1,43 @@
+seamRegistryVersion: 1
+crate: holochain_conductor_api
+crateRoot: elohim/holochain-conductor/crates/holochain_conductor_api
+seamLocus: >
+  Private admin wire types for process-local diagnostic admission and native heap completion;
+  no request accepts a filesystem path, process identity claim, or protocol address.
+
+decisionPoints:
+  - name: AdminRequest::CaptureSqlTiming
+    kind: boundary-answer-type
+    sourceLocation:
+      file: src/admin_interface.rs
+      modulePath: admin_interface::AdminRequest
+    summary: >
+      Carries one strictly versioned, bounded nonce and duration to exactly one private diagnostic
+      family and returns typed admission rather than a capture-completion claim.
+    concernIds:
+      - { id: C0, status: answered, justification: "The payload controls ephemeral process evidence only and never protocol truth." }
+      - { id: C1, status: n-a, justification: "No candidate, election, or author set crosses this boundary." }
+      - { id: C2, status: n-a, justification: "No canonical declaration or winning value is selected." }
+      - { id: C3, status: partial, justification: "Native controllers own expiry and shutdown; this immediate wire response owns no work queue." }
+      - { id: C4, status: answered, justification: "Admission and every refusal cause have distinct enum values." }
+      - { id: C5, status: answered, justification: "The response returns the actual producer, generation, and basename rather than caller identity claims." }
+      - { id: C6a, status: answered, justification: "Controllers enforce the 900-second, event, byte, and 16-generation caps represented by this response." }
+      - { id: C6b, status: answered, justification: "The nonce is bounded and retained by each native controller to refuse replay." }
+      - { id: C7, status: answered, justification: "The response state is active only; terminal artifact evidence remains separate." }
+      - { id: C8, status: answered, justification: "Finite saturating counters accompany typed outcomes." }
+      - { id: C9, status: n-a, justification: "No human or protocol-agent lineage is represented." }
+      - { id: C10, status: answered, justification: "Nested requests deny unknown fields and use schema version 1 with bounded native validation." }
+      - { id: C11, status: answered, justification: "The wire has one family per call and no queue, batch, or arbitrary output path." }
+      - { id: C12, status: partial, justification: "The private admin transport and startup authorization gate access; no notarized remote capability is introduced." }
+      - { id: C13, status: partial, justification: "Authority remains process-local and is not projected as remote acting-node control." }
+      - { id: C14, status: answered, justification: "Refusals cannot carry contradictory producer, generation, basename, or active-window evidence." }
+    contractTests:
+      - path: elohim/holochain-conductor/crates/holochain_conductor_api/src/admin_interface.rs
+        testName: diagnostic_capture_request_is_strict_camel_case
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain_conductor_api/src/admin_interface.rs
+        testName: heap_capture_request_is_strict_and_accepts_no_path_or_pid
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain_conductor_api/src/admin_interface.rs
+        testName: heap_capture_receipt_carries_the_absolute_native_deadline
+        kind: unit

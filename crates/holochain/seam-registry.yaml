@@ -1,0 +1,135 @@
+seamRegistryVersion: 1
+crate: holochain
+crateRoot: elohim/holochain-conductor/crates/holochain
+seamLocus: >
+  Process-local diagnostic admission and generation transitions in the conductor runtime;
+  these controls create private ephemeral evidence and never protocol truth.
+
+decisionPoints:
+  - name: WorkflowDiagnosticController::admit
+    kind: verdict-fn
+    sourceLocation:
+      file: src/core/queue_consumer.rs
+      modulePath: core::queue_consumer::WorkflowDiagnosticController::admit
+    summary: >
+      Admits one bounded workflow-detail generation into a dedicated private JSON sink while
+      refusing unavailable TRACE instrumentation, overlap, replay, invalid bounds, and exhaustion.
+    concernIds:
+      - { id: C0, status: answered, justification: "Ephemeral local runtime evidence only; no protocol head or durable truth." }
+      - { id: C1, status: n-a, justification: "No election, candidate set, or author identity exists on this process-local control." }
+      - { id: C2, status: n-a, justification: "No competing protocol declaration or canonical move is selected." }
+      - { id: C3, status: answered, justification: "A cancellable timer closes quiet windows and process shutdown terminates all remaining work." }
+      - { id: C4, status: answered, justification: "Disabled, busy, duplicate, budget, invalid, TRACE, and I/O refusals remain distinct typed outcomes." }
+      - { id: C5, status: partial, justification: "Control records carry kernel process and monotonic witnesses; the offline reader must still revalidate them." }
+      - { id: C6a, status: answered, justification: "900 seconds, 10000 detail events, 2 MiB, and 16 process-lifetime generations are hard caps." }
+      - { id: C6b, status: answered, justification: "Retained nonces and descriptor-relative O_EXCL creation refuse replay and overwrite." }
+      - { id: C7, status: partial, justification: "Admission reports only an active generation; the terminal private record, not the admin response, witnesses closure." }
+      - { id: C8, status: answered, justification: "Typed saturating counters preserve every admission and refusal class; closure reports censored in-flight work." }
+      - { id: C9, status: n-a, justification: "The producer is an OS process, never a human or agent-lineage identity." }
+      - { id: C10, status: answered, justification: "Only schema version 1, a bounded ASCII nonce, 1..=900 seconds, and an enabled diagnostic TRACE target are accepted." }
+      - { id: C11, status: answered, justification: "Busy and exhausted requests refuse synchronously with try_lock and no queued admission work." }
+      - { id: C12, status: partial, justification: "Startup directory authorization plus the private admin channel gates this host scaffold; no notarized remote grant exists." }
+      - { id: C13, status: partial, justification: "This is deliberately host-local authority; remote actuation requires a separate acting-node grant design." }
+      - { id: C14, status: partial, justification: "Write and timer setup failures never become admitted success; post-admission sink failure remains explicit through bounded terminal residuals." }
+    contractTests:
+      - path: elohim/holochain-conductor/crates/holochain/src/core/queue_consumer/tests.rs
+        testName: workflow_controller_rearms_privately_and_old_close_cannot_mutate_new_generation
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain/src/core/queue_consumer/tests.rs
+        testName: workflow_controller_refuses_missing_trace_and_strict_caps_without_artifacts
+        kind: unit
+
+  - name: CaptureMachine::admit
+    kind: verdict-fn
+    sourceLocation:
+      file: src/heap_capture.rs
+      modulePath: heap_capture::CaptureMachine::admit
+    summary: >
+      Admits one bounded before/after heap pair for the startup-authorized disposable process
+      while refusing overlap, expiry, sequence inversion, nonce replacement, and every second pair.
+    concernIds:
+      - id: C0
+        status: answered
+        justification: Ephemeral local runtime evidence only; no protocol head or durable truth.
+      - id: C1
+        status: n-a
+        justification: No election, candidate set, or author identity exists on this process-local control.
+      - id: C2
+        status: n-a
+        justification: No competing protocol declaration or canonical move is selected.
+      - id: C3
+        status: partial
+        justification: >
+          Authorization expires and no work queues; jemalloc traversal has no cancellation API,
+          so a startup-pinned POSIX timer terminates the disposable process at each dump deadline.
+      - id: C4
+        status: answered
+        justification: >
+          Disabled, busy, invalid sequence, deadline, and incomplete remain distinct typed refusals.
+      - id: C5
+        status: answered
+        justification: >
+          Receipts use the kernel-derived process witness and startup-pinned FIFO inode, not caller claims.
+      - id: C6a
+        status: partial
+        justification: >
+          One pair and a 1..=900 second authorization bound native admission; a startup-pinned
+          1..=30 second process-terminal timer bounds each uncancellable mallctl traversal.
+      - id: C6b
+        status: answered
+        justification: >
+          Fixed phase artifacts and one-pair terminal state refuse duplicate/second effects rather than overwrite.
+      - id: C7
+        status: answered
+        justification: >
+          The receipt explicitly scopes success to native mallctl return; collector EOF and parse evidence remain separate.
+      - id: C8
+        status: answered
+        justification: >
+          Typed refusals and nativeCompleted explicitly scope a receipt to mallctl completion, never collector completeness.
+      - id: C9
+        status: n-a
+        justification: The producer is an OS process, never a human or agent-lineage identity.
+      - id: C10
+        status: answered
+        justification: >
+          Only schema version 1, bounded printable ASCII nonce, and Before/After phases are admitted.
+      - id: C11
+        status: partial
+        justification: >
+          A startup-pinned FIFO lets the external collector enforce bytes and the process-terminal
+          timer enforces each dump deadline; native traversal itself has no cancellation API.
+      - id: C12
+        status: partial
+        justification: >
+          Startup env plus private admin channel gates the local scaffold; it is not a remotely
+          notarized acting-node grant.
+      - id: C13
+        status: partial
+        justification: This is deliberately host-local authority; remote actuation requires a separate acting-node grant design.
+      - id: C14
+        status: partial
+        justification: >
+          Native errors become bounded typed failures; EOF, byte cap, and parser residuals remain supervisor evidence.
+    contractTests:
+      - path: elohim/holochain-conductor/crates/holochain/src/heap_capture.rs
+        testName: capture_machine_allows_exactly_one_ordered_pair
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain/src/heap_capture.rs
+        testName: capture_machine_makes_invalid_sequence_and_expiry_terminal
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain/src/heap_capture.rs
+        testName: capture_machine_rejects_unbounded_or_non_ascii_nonce
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain/src/heap_capture.rs
+        testName: procfd_creat_targets_pinned_fifo_after_path_replacement
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain/src/heap_capture.rs
+        testName: sigpipe_mask_is_thread_local_restored_and_drained
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain/src/heap_capture.rs
+        testName: startup_authorization_requires_bounded_complete_timer_configuration
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain/src/heap_capture.rs
+        testName: posix_deadline_kills_without_handler_and_disarm_survives
+        kind: unit

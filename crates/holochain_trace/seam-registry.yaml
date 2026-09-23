@@ -1,0 +1,55 @@
+seamRegistryVersion: 1
+crate: holochain_trace
+crateRoot: elohim/holochain-conductor/crates/holochain_trace
+seamLocus: >
+  Startup-authorized, descriptor-pinned private diagnostic artifacts and the bounded SQL timing
+  admission/generation state machine attached to the tracing subscriber.
+
+decisionPoints:
+  - name: SqlTimingController::admit
+    kind: verdict-fn
+    sourceLocation:
+      file: src/sql_timing.rs
+      modulePath: sql_timing::SqlTimingController::admit
+    summary: >
+      Admits at most one SQL timing generation at a time under fixed duration, event, identity,
+      byte, nonce, and process-lifetime generation bounds.
+    concernIds:
+      - { id: C0, status: answered, justification: "Ephemeral local runtime evidence only; no protocol head or durable truth." }
+      - { id: C1, status: n-a, justification: "No election, candidate set, or author identity exists on this local control." }
+      - { id: C2, status: n-a, justification: "No competing protocol declaration or canonical move is selected." }
+      - { id: C3, status: answered, justification: "A cancellable timer closes quiet windows and shutdown closes an active generation." }
+      - { id: C4, status: answered, justification: "Disabled, busy, duplicate, budget, invalid, and I/O refusals remain distinct outcomes." }
+      - { id: C5, status: partial, justification: "Terminal evidence carries kernel process identity and interval witnesses; the offline reader still must revalidate them." }
+      - { id: C6a, status: answered, justification: "900 seconds, 10000 events, 4096 identities, 2 MiB, and 16 generations are fixed hard caps." }
+      - { id: C6b, status: answered, justification: "Retained nonces and descriptor-relative O_EXCL creation refuse duplicate effects and overwrite." }
+      - { id: C7, status: partial, justification: "Admission reports only an active window; the terminal artifact, not the response, witnesses completion." }
+      - { id: C8, status: answered, justification: "Every admission/refusal has a typed saturating counter and terminal loss counters remain explicit." }
+      - { id: C9, status: n-a, justification: "The producer is an OS process, never a human or agent lineage identity." }
+      - { id: C10, status: answered, justification: "Only schema version 1, bounded ASCII nonce, and 1..=900 seconds are accepted." }
+      - { id: C11, status: answered, justification: "Busy and exhausted requests refuse synchronously without queueing or blocking on terminal I/O." }
+      - { id: C12, status: partial, justification: "Startup directory authorization plus the private admin channel gates the host scaffold; no notarized remote grant exists." }
+      - { id: C13, status: partial, justification: "This is deliberately host-local authority; remote actuation requires a separate acting-node grant design." }
+      - { id: C14, status: partial, justification: "Write and timer failures never become success, but an unwritable terminal witness remains a bounded stderr residual." }
+    contractTests:
+      - path: elohim/holochain-conductor/crates/holochain_trace/src/sql_timing/tests.rs
+        testName: controller_rearms_sequentially_and_old_generation_cannot_close_new
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain_trace/src/sql_timing/tests.rs
+        testName: terminal_serialization_remains_busy_and_request_caps_are_strict
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain_trace/src/sql_timing/tests.rs
+        testName: generation_budget_and_counters_saturate
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain_trace/src/sql_timing/tests.rs
+        testName: global_api_is_default_off_without_controller_initialization
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain_trace/src/private_capture.rs
+        testName: create_is_private_exclusive_and_descriptor_pinned
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain_trace/src/sql_timing/tests.rs
+        testName: aggregates_every_retained_identity_and_never_serializes_sql
+        kind: unit
+      - path: elohim/holochain-conductor/crates/holochain_trace/tests/sql_timing_sqlite_worker.rs
+        testName: sqlite_worker_keeps_innermost_static_site_under_global_dispatch
+        kind: integration
