@@ -49,9 +49,10 @@ pub async fn publish_dht_ops_workflow(
 
     // Commit to the network
     let mut success = Vec::with_capacity(to_publish.len());
-    for (basis, op_hash_list) in to_publish {
+    for (basis, ops) in to_publish {
+        let op_hash_list = ops.iter().map(|op| op.hash.clone()).collect();
         match network
-            .publish(basis, agent.clone(), op_hash_list.clone(), None)
+            .publish(basis, agent.clone(), op_hash_list, None)
             .await
         {
             Err(e) => {
@@ -63,7 +64,7 @@ pub async fn publish_dht_ops_workflow(
                 warn!(failed_to_send_publish = ?e);
             }
             Ok(()) => {
-                success.extend(op_hash_list);
+                success.extend(ops);
             }
         }
     }
@@ -78,7 +79,9 @@ pub async fn publish_dht_ops_workflow(
     }
 
     // Record the publish time for everything that was sent successfully, then
-    // decide whether any ops may still need publishing in the future.
+    // decide whether any ops may still need publishing in the future. Each op
+    // carries its kind, so its publish time lands in the table that holds its
+    // publish state; one unrecordable op does not void the others' records.
     if !success.is_empty() {
         dht_store
             .record_published_op_hashes(success, Timestamp::now())
@@ -105,26 +108,24 @@ pub async fn publish_dht_ops_workflow(
 }
 
 /// Collect the ops authored by `agent` that are ready to publish, grouped by
-/// their DHT basis, from the DHT store.
+/// their DHT basis, from the DHT store. Each op keeps its [`PublishOpKind`] so
+/// its publish time can be recorded in the right table once it is sent.
 pub async fn publish_dht_ops_workflow_inner(
     dht_store: &DhtStore,
     agent: AgentPubKey,
     min_publish_interval: Duration,
-) -> WorkflowResult<HashMap<OpBasis, Vec<DhtOpHash>>> {
+) -> WorkflowResult<HashMap<OpBasis, Vec<PublishableOp>>> {
     // Ops to publish by basis
     let mut to_publish = HashMap::new();
 
-    for (basis, op_hash) in dht_store
+    for (basis, op) in dht_store
         .as_read()
         .get_ops_to_publish(&agent, min_publish_interval)
         .await?
     {
         // For every op publish a request
         // Collect and sort ops by basis
-        to_publish
-            .entry(basis)
-            .or_insert_with(Vec::new)
-            .push(op_hash);
+        to_publish.entry(basis).or_insert_with(Vec::new).push(op);
     }
 
     Ok(to_publish)

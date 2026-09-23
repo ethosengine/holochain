@@ -340,12 +340,20 @@ pub struct WarrantPublishRow {
 /// is the type-stripped 36-byte basis: the publish path routes solely by the
 /// basis location, so the hash-type wrapper is irrelevant and is reconstructed
 /// as an external hash by the caller.
+///
+/// `is_warrant` records which arm of the publish query selected the row, so
+/// the caller records the publish time in the table that actually holds the
+/// op's publish state (`ChainOpPublish` or `WarrantPublish`) instead of
+/// inferring the op's type from whether an update matched a row.
 #[derive(Debug, Clone, sqlx::FromRow, PartialEq, Eq)]
 pub struct OpToPublishRow {
     /// Hash of the op to publish.
     pub dht_hash: Vec<u8>,
     /// Type-stripped 36-byte DHT basis hash.
     pub basis_hash: Vec<u8>,
+    /// `0` for a chain op (selected from `ChainOp`), `1` for a warrant
+    /// (selected from `WarrantOp`).
+    pub is_warrant: i64,
 }
 
 /// Row from the `Link` table (link index).

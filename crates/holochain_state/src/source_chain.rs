@@ -2071,7 +2071,10 @@ mod tests {
             .expect("at least one authored op");
         dht_store
             .record_published_op_hashes(
-                vec![DhtOpHash::from_raw_36(published_op.op_hash)],
+                vec![crate::dht_store::PublishableOp {
+                    hash: DhtOpHash::from_raw_36(published_op.op_hash),
+                    kind: crate::dht_store::PublishOpKind::ChainOp,
+                }],
                 Timestamp::now(),
             )
             .await?;

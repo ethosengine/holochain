@@ -401,24 +401,14 @@ async fn record_incoming_ops_stores_entry_when_hash_matches() {
     store.record_incoming_ops(vec![(op, false)]).await.unwrap();
 
     // The entry is present in the public Entry table under its content hash.
-    let entry = store
-        .db
-        .as_ref()
-        .get_entry(entry_hash, None)
-        .await
-        .unwrap();
+    let entry = store.db.as_ref().get_entry(entry_hash, None).await.unwrap();
     assert!(
         entry.is_some(),
         "entry with a matching hash should be stored"
     );
 
     // The op is tracked in limbo, exactly as before this guard existed.
-    let limbo = store
-        .db
-        .as_ref()
-        .get_limbo_chain_op(op_hash)
-        .await
-        .unwrap();
+    let limbo = store.db.as_ref().get_limbo_chain_op(op_hash).await.unwrap();
     assert!(limbo.is_some(), "matching op should be recorded in limbo");
 }
 
@@ -446,12 +436,7 @@ async fn record_incoming_ops_skips_op_when_entry_hash_mismatches() {
     );
 
     // The op is not stored as a pending limbo op.
-    let limbo = store
-        .db
-        .as_ref()
-        .get_limbo_chain_op(op_hash)
-        .await
-        .unwrap();
+    let limbo = store.db.as_ref().get_limbo_chain_op(op_hash).await.unwrap();
     assert!(
         limbo.is_none(),
         "an op with a hash/content mismatch must not be recorded for integration"
@@ -987,7 +972,13 @@ async fn record_published_op_hashes_updates_publish_time() {
         .unwrap();
 
     store
-        .record_published_op_hashes(vec![op.0.as_hash().clone()], Timestamp::from_micros(42))
+        .record_published_op_hashes(
+            vec![PublishableOp {
+                hash: op.0.as_hash().clone(),
+                kind: PublishOpKind::ChainOp,
+            }],
+            Timestamp::from_micros(42),
+        )
         .await
         .unwrap();
 
@@ -1009,10 +1000,15 @@ async fn record_published_op_hashes_records_warrant_publish_time() {
     let warrant_hash = warrant.as_hash().clone();
     store.test_insert_integrated_warrant(warrant).await.unwrap();
 
-    // Recording the publish should fall through to inserting a WarrantPublish
-    // row, since there is no ChainOpPublish row to update.
+    // Recording the publish of a warrant inserts a WarrantPublish row.
     store
-        .record_published_op_hashes(vec![warrant_hash.clone()], Timestamp::from_micros(77))
+        .record_published_op_hashes(
+            vec![PublishableOp {
+                hash: warrant_hash.clone(),
+                kind: PublishOpKind::Warrant,
+            }],
+            Timestamp::from_micros(77),
+        )
         .await
         .unwrap();
 
@@ -1024,6 +1020,139 @@ async fn record_published_op_hashes_records_warrant_publish_time() {
         .unwrap()
         .expect("WarrantPublish row should exist after recording publish");
     assert_eq!(row.last_publish_time, Some(77));
+}
+
+/// Seed a self-authored chain op (with its empty `ChainOpPublish` row) and
+/// return its hash.
+async fn seed_authored_publishable_op(store: &DhtStore, seed: u8) -> DhtOpHash {
+    let (op, _) = build_test_store_record_op_hashed(seed);
+    let hash = op.as_hash().clone();
+    store
+        .test_insert_authored_chain_op(op, None, None, None)
+        .await
+        .unwrap();
+    hash
+}
+
+fn chain_op_to_publish(hash: &DhtOpHash) -> PublishableOp {
+    PublishableOp {
+        hash: hash.clone(),
+        kind: PublishOpKind::ChainOp,
+    }
+}
+
+/// A chain op with no `ChainOpPublish` row — a cache-path row — has no publish
+/// state to record into. Recording it must neither fail the batch nor invent
+/// warrant state for it (a `WarrantPublish` insert for a chain-op hash is a
+/// FOREIGN KEY violation that used to void every record in the batch).
+#[tokio::test]
+async fn record_published_op_hashes_skips_op_with_no_publish_row() {
+    let store = DhtStore::new_test(dht_id()).await.unwrap();
+    let first = seed_authored_publishable_op(&store, 90).await;
+    let second = seed_authored_publishable_op(&store, 94).await;
+
+    // A cache-path row: `locally_validated = 0`, no `ChainOpPublish` row.
+    let (cached, _) = build_rendered_store_record_for_move(92);
+    let poison = cached.ops[0].op_hash.clone();
+    store.cache_chain_ops(&cached).await.unwrap();
+
+    store
+        .record_published_op_hashes(
+            vec![
+                chain_op_to_publish(&first),
+                chain_op_to_publish(&poison),
+                chain_op_to_publish(&second),
+            ],
+            Timestamp::from_micros(42),
+        )
+        .await
+        .expect("an op with no publish row must not fail the batch");
+
+    for hash in [&first, &second] {
+        assert_eq!(
+            store.test_chain_op_publish_time(hash).await.unwrap(),
+            Some(Timestamp::from_micros(42)),
+            "the other ops in the batch must have their publish time recorded"
+        );
+    }
+    assert!(
+        store
+            .db()
+            .as_ref()
+            .get_chain_op_publish(poison.clone())
+            .await
+            .unwrap()
+            .is_none(),
+        "no publish row is created for the cache-path op"
+    );
+    assert!(
+        store
+            .db()
+            .as_ref()
+            .get_warrant_publish(poison)
+            .await
+            .unwrap()
+            .is_none(),
+        "a chain op is never turned into warrant state"
+    );
+}
+
+/// A hash whose record genuinely fails (here a warrant hash with no `Warrant`
+/// row, which violates `WarrantPublish`'s foreign key) is skipped without
+/// voiding the records of the chain ops and the real warrant beside it.
+#[tokio::test]
+async fn record_published_op_hashes_isolates_a_failing_hash() {
+    let store = DhtStore::new_test(dht_id()).await.unwrap();
+    let first = seed_authored_publishable_op(&store, 90).await;
+    let second = seed_authored_publishable_op(&store, 94).await;
+
+    let (warrant, _) = build_test_warrant_op_hashed(91);
+    let warrant_hash = warrant.as_hash().clone();
+    store.test_insert_integrated_warrant(warrant).await.unwrap();
+
+    let failing = DhtOpHash::from_raw_36(vec![0xF0; 36]);
+
+    store
+        .record_published_op_hashes(
+            vec![
+                chain_op_to_publish(&first),
+                PublishableOp {
+                    hash: failing.clone(),
+                    kind: PublishOpKind::Warrant,
+                },
+                PublishableOp {
+                    hash: warrant_hash.clone(),
+                    kind: PublishOpKind::Warrant,
+                },
+                chain_op_to_publish(&second),
+            ],
+            Timestamp::from_micros(42),
+        )
+        .await
+        .expect("one failing record must not fail the batch");
+
+    for hash in [&first, &second] {
+        assert_eq!(
+            store.test_chain_op_publish_time(hash).await.unwrap(),
+            Some(Timestamp::from_micros(42)),
+            "chain ops beside the failing hash must be recorded"
+        );
+    }
+    let warrant_row = store
+        .db()
+        .as_ref()
+        .get_warrant_publish(warrant_hash)
+        .await
+        .unwrap()
+        .expect("the real warrant beside the failing hash must be recorded");
+    assert_eq!(warrant_row.last_publish_time, Some(42));
+    assert!(store
+        .db()
+        .as_ref()
+        .get_warrant_publish(failing)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -2992,7 +3121,7 @@ mod publish_query {
             .await
             .unwrap()
             .into_iter()
-            .map(|(_, hash)| hash)
+            .map(|(_, op)| op.hash)
             .collect()
     }
 

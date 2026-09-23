@@ -5,7 +5,7 @@
 //! the project's existing domain types. The parent module holds the
 //! corresponding write operations.
 
-use super::DhtStore;
+use super::{DhtStore, PublishOpKind, PublishableOp};
 use crate::prelude::ActionSequenceAndHash;
 use crate::query::{StateQueryError, StateQueryResult};
 use crate::scratch::SyncScratch;
@@ -260,7 +260,8 @@ impl DhtStore<DbRead<Dht>> {
     }
 
     /// Ops authored by `author` that are ready to be published to the network,
-    /// each paired with its DHT basis.
+    /// each paired with its DHT basis and tagged with its [`PublishOpKind`]
+    /// so the publish time is recorded in the right table.
     ///
     /// `min_publish_interval` bounds how recently an op may have been published
     /// and still be skipped: the cutoff is `now - min_publish_interval`, and an
@@ -281,7 +282,7 @@ impl DhtStore<DbRead<Dht>> {
         &self,
         author: &AgentPubKey,
         min_publish_interval: Duration,
-    ) -> StateQueryResult<Vec<(AnyLinkableHash, DhtOpHash)>> {
+    ) -> StateQueryResult<Vec<(AnyLinkableHash, PublishableOp)>> {
         let recency = Timestamp::now()
             .as_micros()
             .saturating_sub(min_publish_interval.as_micros() as i64);
@@ -290,7 +291,18 @@ impl DhtStore<DbRead<Dht>> {
             .into_iter()
             .map(|r| {
                 let basis: AnyLinkableHash = ExternalHash::from_raw_36(r.basis_hash).into();
-                (basis, DhtOpHash::from_raw_36(r.dht_hash))
+                let kind = if r.is_warrant != 0 {
+                    PublishOpKind::Warrant
+                } else {
+                    PublishOpKind::ChainOp
+                };
+                (
+                    basis,
+                    PublishableOp {
+                        hash: DhtOpHash::from_raw_36(r.dht_hash),
+                        kind,
+                    },
+                )
             })
             .collect())
     }

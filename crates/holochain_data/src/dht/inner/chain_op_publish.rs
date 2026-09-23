@@ -95,9 +95,19 @@ where
 /// Ops eligible to be published to the network for `author`.
 ///
 /// Returns integrated, self-authored chain ops together with integrated
-/// warrants authored by `author`, ordered for stable publishing. The filters
-/// mirror the historical authored-database query:
+/// warrants authored by `author`, ordered for stable publishing. Each row
+/// carries `is_warrant` so the caller records its publish time in the right
+/// table. The filters mirror the historical authored-database query, plus
+/// the eligibility guard that the shared per-DNA database requires:
 ///
+/// - **Only ops this conductor authored and validated.** A chain op qualifies
+///   only when it is `locally_validated` and has a `ChainOpPublish` row — the
+///   pair the authoring path always writes together. The per-DNA DHT database
+///   is shared by every cell of the DNA on a conductor, so the cache path
+///   (`locally_validated = 0`, no `ChainOpPublish` row) holds ops whose
+///   `Action.author` is a locally hosted agent. Such an op has no publish
+///   state to record into; selecting it would re-select it on every loop,
+///   forever.
 /// - **Private entries never leave the device.** `CreateEntry` ops (`op_type =
 ///   2`) whose action carries a private entry (`Action.private_entry = 1`) are
 ///   excluded. All other op types are published even for private entries
@@ -121,11 +131,13 @@ where
     E: Executor<'e, Database = Sqlite>,
 {
     sqlx::query_as(
-        "SELECT ChainOp.hash AS dht_hash, ChainOp.basis_hash AS basis_hash, Action.seq AS sort_seq
+        "SELECT ChainOp.hash AS dht_hash, ChainOp.basis_hash AS basis_hash, Action.seq AS sort_seq,
+                0 AS is_warrant
          FROM ChainOp
          JOIN Action ON ChainOp.action_hash = Action.hash
-         LEFT JOIN ChainOpPublish ON ChainOpPublish.op_hash = ChainOp.hash
+         JOIN ChainOpPublish ON ChainOpPublish.op_hash = ChainOp.hash
          WHERE Action.author = ?
+           AND ChainOp.locally_validated = 1
            AND (ChainOp.op_type != 2 OR Action.private_entry = 0)
            AND ChainOpPublish.withhold_publish IS NULL
            AND (ChainOpPublish.last_publish_time IS NULL
@@ -135,7 +147,7 @@ where
          UNION ALL
 
          SELECT WarrantOp.hash AS dht_hash, Warrant.warrantee AS basis_hash,
-                9223372036854775807 AS sort_seq
+                9223372036854775807 AS sort_seq, 1 AS is_warrant
          FROM WarrantOp
          JOIN Warrant ON WarrantOp.hash = Warrant.hash
          LEFT JOIN WarrantPublish ON WarrantPublish.warrant_hash = Warrant.hash
@@ -177,7 +189,9 @@ where
 
 /// Count ops authored by `author` that may still need to be published.
 ///
-/// Like [`get_ops_to_publish`] but ignores the recency window: an op counts as
+/// Like [`get_ops_to_publish`] (with the same `locally_validated` /
+/// `ChainOpPublish` eligibility, so an op that can never be selected can never
+/// keep the loop alive) but ignores the recency window: an op counts as
 /// "still needing publish" while it has not had its receipts completed
 /// (chain ops) or has never been published (warrants), regardless of how
 /// recently it was last published. The publish workflow uses this to decide
@@ -194,8 +208,9 @@ where
            (SELECT COUNT(*)
             FROM ChainOp
             JOIN Action ON ChainOp.action_hash = Action.hash
-            LEFT JOIN ChainOpPublish ON ChainOpPublish.op_hash = ChainOp.hash
+            JOIN ChainOpPublish ON ChainOpPublish.op_hash = ChainOp.hash
             WHERE Action.author = ?
+              AND ChainOp.locally_validated = 1
               AND ChainOpPublish.withhold_publish IS NULL
               AND (ChainOp.op_type != 2 OR Action.private_entry = 0)
               AND ChainOpPublish.receipts_complete IS NULL)
