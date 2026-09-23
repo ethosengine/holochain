@@ -5,6 +5,7 @@ use super::*;
 mod close;
 mod connect_failure;
 mod frame;
+mod recv_throttle;
 mod simultaneous_open;
 mod stream;
 mod support;

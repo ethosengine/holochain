@@ -199,6 +199,7 @@ pub(super) fn spawn_active_reader(
         local_url: Arc::new(RwLock::new(Some(url.clone()))),
         space_relays: Arc::new(RwLock::new(HashMap::new())),
         max_frame_bytes: 64 * 1024,
+        recv_throttle: crate::recv_throttle::RecvThrottleConfig::default(),
     });
 
     // Register as the active connection *before* the reader is released, so

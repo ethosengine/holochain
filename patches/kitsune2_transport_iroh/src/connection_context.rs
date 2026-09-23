@@ -4,6 +4,7 @@ use crate::close_code::CloseCode;
 use crate::connection::DynConnection;
 #[cfg(feature = "metrics")]
 use crate::metrics::connection_counter_metric;
+use crate::recv_throttle::{RecvThrottle, RecvThrottleConfig, peek_module_id};
 use crate::stream::{DynIrohRecvStream, DynIrohSendStream};
 use crate::{
     Connections, FRAME_HEADER_LEN, FrameType, decode_frame_header,
@@ -18,7 +19,7 @@ use std::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{sync::MutexGuard, task::AbortHandle};
 use tracing::{debug, error, info, trace, warn};
@@ -93,6 +94,14 @@ pub(super) struct ConnectionContext {
     send_bytes: AtomicU64,
     recv_message_count: AtomicU64,
     recv_bytes: AtomicU64,
+    /// Frames dropped by [`RecvThrottle`] without reaching a module handler.
+    /// Counted for the lifetime of the connection; the rate-limited summary
+    /// log reports the delta between summaries.
+    recv_dropped_count: AtomicU64,
+    /// ELOHIM PATCH (2026-09-13): per-connection, module-scoped receive
+    /// throttle. See [`crate::recv_throttle`] for why a saturated module
+    /// queue must not cost a full decode per frame.
+    recv_throttle: Mutex<RecvThrottle>,
     opened_at_s: u64,
     max_frame_bytes: usize,
     space_relays: SpaceRelays,
@@ -116,6 +125,9 @@ pub(super) struct ConnectionContextParams {
     pub local_url: Arc<RwLock<Option<Url>>>,
     pub space_relays: SpaceRelays,
     pub max_frame_bytes: usize,
+    /// Receive-throttle policy for this connection. A zero cooldown
+    /// (`recvThrottleCooldownMs: 0`) restores unthrottled behaviour.
+    pub recv_throttle: RecvThrottleConfig,
 }
 
 impl ConnectionContext {
@@ -134,6 +146,8 @@ impl ConnectionContext {
             send_bytes: AtomicU64::new(0),
             recv_message_count: AtomicU64::new(0),
             recv_bytes: AtomicU64::new(0),
+            recv_dropped_count: AtomicU64::new(0),
+            recv_throttle: Mutex::new(RecvThrottle::new(params.recv_throttle)),
             opened_at_s: params.opened_at_s,
             max_frame_bytes: params.max_frame_bytes,
             space_relays: params.space_relays,
@@ -630,16 +644,34 @@ impl ConnectionContext {
             let peer = ctx.remote_url().ok_or_else(|| {
                 K2Error::other("received data before preflight")
             })?;
+
+            // The frame arrived and was read off the wire; count it whether
+            // or not it is handed to a module.
+            ctx.increment_recv_message_count();
+            ctx.increment_recv_bytes(data_len as u64);
+
+            // ── ELOHIM PATCH (2026-09-13, publish-storm cure) ──
+            // A module that has just refused a frame has a saturated inbound
+            // queue. Drop its frames here, before the decode and allocation
+            // the handler would perform, until its short cooldown elapses.
+            // Only allow-listed modules are eligible (default: `Publish`);
+            // gossip, fetch, notify and preflight always reach the handler.
+            // `peek_module_id` skips the payload by length, so this costs a
+            // handful of varint reads and allocates nothing.
+            let module = peek_module_id(&data);
+            if let Some(module) = module
+                && ctx.should_drop_frame(module)
+            {
+                continue;
+            }
+
             if let Err(err) = ctx
                 .handler
                 .recv_data(peer.clone(), Bytes::copy_from_slice(&data))
                 .await
             {
-                error!(?err, remote = ?peer.peer_id(),"error in recv_data");
+                ctx.record_recv_refusal(module, &peer, &err);
             };
-
-            ctx.increment_recv_message_count();
-            ctx.increment_recv_bytes(data_len as u64);
         }
 
         // The stream ended; keep the connection open for the next stream.
@@ -692,6 +724,62 @@ impl ConnectionContext {
 
     fn increment_recv_bytes(&self, len: u64) {
         self.recv_bytes.fetch_add(len, Ordering::SeqCst);
+    }
+
+    /// Whether the receive throttle is currently suppressing frames for
+    /// `module` on this connection. Counts the drop when it is.
+    fn should_drop_frame(&self, module: &str) -> bool {
+        let drop = self
+            .recv_throttle
+            .lock()
+            .expect("poisoned")
+            .should_drop(module, Instant::now());
+        if drop {
+            self.recv_dropped_count.fetch_add(1, Ordering::Relaxed);
+        }
+        drop
+    }
+
+    /// Record that a handler refused a frame, and log at a rate limit.
+    ///
+    /// The connection is deliberately NOT closed. A `recv_module_msg` error
+    /// most often means a module's inbound queue is full, which is advisory
+    /// back-pressure and not a broken peer — closing (what upstream's
+    /// "peer connection will be closed" warning describes) turns a publish
+    /// queue overflow into a whole-peer partition plus a reconnect storm.
+    fn record_recv_refusal(
+        &self,
+        module: Option<&str>,
+        peer: &Url,
+        err: &K2Error,
+    ) {
+        let report = self
+            .recv_throttle
+            .lock()
+            .expect("poisoned")
+            .on_refusal(module, Instant::now());
+        match report {
+            Some(report) => warn!(
+                module = %report.module,
+                refusals = report.refusals,
+                dropped = report.dropped,
+                remote = ?peer.peer_id(),
+                "receive handler refused frames; further frames for this \
+                 module are dropped until it drains: {err}"
+            ),
+            None => debug!(
+                ?err,
+                ?module,
+                remote = ?peer.peer_id(),
+                "error in recv_data"
+            ),
+        }
+    }
+
+    /// Total frames dropped by the receive throttle on this connection.
+    #[cfg(test)]
+    pub(super) fn get_recv_dropped_count(&self) -> u64 {
+        self.recv_dropped_count.load(Ordering::Relaxed)
     }
 }
 

@@ -227,8 +227,10 @@ use url::*;
 mod connection;
 mod connection_context;
 mod endpoint;
+mod recv_throttle;
 mod stream;
 use connection_context::*;
+use recv_throttle::RecvThrottleConfig;
 #[cfg(feature = "metrics")]
 mod metrics;
 
@@ -305,10 +307,57 @@ pub mod config {
         #[serde(default = "default_relay_keepalive_interval_s")]
         #[cfg_attr(feature = "schema", schemars(default))]
         pub relay_keepalive_interval_s: u32,
+
+        // ── ELOHIM PATCH (2026-09-13, publish-storm cure) ──
+        // Receive-throttle policy. See [`crate::recv_throttle`]. All three
+        // fields carry serde defaults so a config rendered before this
+        // patch still deserialises.
+        /// Cooldown in milliseconds applied to a module on this connection
+        /// after its handler refuses a frame (a full inbound queue). While
+        /// the cooldown is live, further frames for that module are dropped
+        /// at the transport instead of being decoded and discarded by the
+        /// handler.
+        ///
+        /// Set to `0` to disable the throttle entirely.
+        ///
+        /// Defaults to 250 ms.
+        #[serde(default = "default_recv_throttle_cooldown_ms")]
+        #[cfg_attr(feature = "schema", schemars(default))]
+        pub recv_throttle_cooldown_ms: u64,
+
+        /// Minimum interval in seconds between receive-throttle summary
+        /// logs, per module per connection. The summary replaces the
+        /// per-frame error log that a saturated queue used to emit.
+        ///
+        /// Defaults to 30 seconds.
+        #[serde(default = "default_recv_throttle_summary_interval_s")]
+        #[cfg_attr(feature = "schema", schemars(default))]
+        pub recv_throttle_summary_interval_s: u32,
+
+        /// Modules eligible for the receive throttle. A module not listed
+        /// here is never throttled, so gossip and fetch traffic is
+        /// unaffected by a flood on another module.
+        ///
+        /// Defaults to `["Publish"]`.
+        #[serde(default = "default_recv_throttle_modules")]
+        #[cfg_attr(feature = "schema", schemars(default))]
+        pub recv_throttle_modules: Vec<String>,
     }
 
     fn default_relay_keepalive_interval_s() -> u32 {
         120
+    }
+
+    fn default_recv_throttle_cooldown_ms() -> u64 {
+        super::recv_throttle::DEFAULT_RECV_THROTTLE_COOLDOWN_MS
+    }
+
+    fn default_recv_throttle_summary_interval_s() -> u32 {
+        super::recv_throttle::DEFAULT_RECV_THROTTLE_SUMMARY_INTERVAL_S
+    }
+
+    fn default_recv_throttle_modules() -> Vec<String> {
+        vec![super::recv_throttle::PUBLISH_MOD_NAME.to_string()]
     }
 
     impl Default for IrohTransportConfig {
@@ -321,6 +370,10 @@ pub mod config {
                 auth_material_relay_base64: None,
                 relay_keepalive_interval_s: default_relay_keepalive_interval_s(
                 ),
+                recv_throttle_cooldown_ms: default_recv_throttle_cooldown_ms(),
+                recv_throttle_summary_interval_s:
+                    default_recv_throttle_summary_interval_s(),
+                recv_throttle_modules: default_recv_throttle_modules(),
             }
         }
     }
@@ -637,6 +690,7 @@ impl IrohTransport {
             local_url.clone(),
             config.max_frame_bytes,
             space_relays.clone(),
+            RecvThrottleConfig::from(&config),
         );
 
         // Keep the endpoint's relay allowlist entry alive.
@@ -782,6 +836,7 @@ impl IrohTransport {
         local_url: Arc<RwLock<Option<Url>>>,
         max_frame_bytes: usize,
         space_relays: SpaceRelays,
+        recv_throttle: RecvThrottleConfig,
     ) -> AbortHandle {
         tokio::spawn(async move {
             loop {
@@ -810,6 +865,7 @@ impl IrohTransport {
                             local_url: local_url.clone(),
                             space_relays: space_relays.clone(),
                             max_frame_bytes,
+                            recv_throttle: recv_throttle.clone(),
                         });
                     }
                     Some(Err(err)) => {
@@ -1001,6 +1057,7 @@ impl IrohTransport {
                 local_url: self.local_url.clone(),
                 space_relays: self.space_relays.clone(),
                 max_frame_bytes: self.config.max_frame_bytes,
+                recv_throttle: RecvThrottleConfig::from(&self.config),
             });
 
             if let Err(e) = ctx
