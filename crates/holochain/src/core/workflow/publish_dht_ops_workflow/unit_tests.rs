@@ -451,3 +451,111 @@ async fn workflow_publishes_warrant_once() {
     .await
     .unwrap();
 }
+
+/// Seed a cache-path row authored by `author`: the shape the cascade writes
+/// when a locally hosted agent fetches a record authored by a sibling agent on
+/// the same conductor (`locally_validated = 0`, no `ChainOpPublish` row).
+async fn cache_op_authored_by(dht_store: &DhtStore, author: AgentPubKey) -> DhtOpHash {
+    let mut create_action = fixt!(Action, CreateAction);
+    create_action.header.author = author;
+    let rendered = holochain_types::wire_ops::RenderedOp::new(
+        create_action,
+        fixt!(Signature),
+        None,
+        ChainOpType::AgentActivity,
+    )
+    .unwrap();
+    let op_hash = rendered.op_hash.clone();
+    dht_store
+        .cache_chain_ops(&holochain_types::wire_ops::RenderedOps {
+            entry: None,
+            ops: vec![rendered],
+            warrant: None,
+        })
+        .await
+        .unwrap();
+    op_hash
+}
+
+/// Regression for the publish livelock: a cache-path op authored by the
+/// publishing agent used to be selected every loop, and recording it (as a
+/// "warrant") failed the whole batch's transaction, so no op in the batch was
+/// ever recorded and the same batch was re-selected forever. The other ops'
+/// publish times must persist, and the next loop must select strictly fewer.
+#[tokio::test(flavor = "multi_thread")]
+async fn poison_op_does_not_void_other_publish_records() {
+    holochain_trace::test_run();
+
+    let dht_store = test_dht_store(fixt!(DnaHash)).await;
+    let agent = fixt!(AgentPubKey);
+
+    let mut authored = Vec::new();
+    for _ in 0..3 {
+        authored.push(create_op(&dht_store, agent.clone()).await.unwrap());
+    }
+    let poison = cache_op_authored_by(&dht_store, agent.clone()).await;
+
+    let selected = |dht_store: DhtStore, agent: AgentPubKey| async move {
+        dht_store
+            .as_read()
+            .get_ops_to_publish(
+                &agent,
+                ConductorTuningParams::default().min_publish_interval(),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, op)| op.hash)
+            .collect::<Vec<_>>()
+    };
+    let first = selected(dht_store.clone(), agent.clone()).await;
+    for hash in &authored {
+        assert!(
+            first.contains(hash),
+            "authored op {hash:?} must be selected"
+        );
+    }
+    assert!(
+        !first.contains(&poison),
+        "a cache-path op is not this conductor's to publish"
+    );
+
+    let mut network = MockHolochainP2pDnaT::new();
+    let never_sent = poison.clone();
+    network
+        .expect_publish()
+        .returning(move |_, _, op_hash_list, _| {
+            assert!(!op_hash_list.contains(&never_sent));
+            Ok(())
+        });
+    let (tx, _rx) =
+        TriggerSender::new_with_loop(Duration::from_secs(5)..Duration::from_secs(30), true);
+
+    let work_complete = publish_dht_ops_workflow(
+        dht_store.clone(),
+        Arc::new(network),
+        tx,
+        agent.clone(),
+        ConductorTuningParams::default().min_publish_interval(),
+    )
+    .await
+    .expect("recording publish times must not fail the workflow");
+    assert_eq!(WorkComplete::Complete, work_complete);
+
+    for hash in &authored {
+        verify_published_recently(&dht_store, hash.clone()).await;
+    }
+    assert!(
+        get_publish_time(&dht_store, poison.clone()).await.is_none(),
+        "no publish state is invented for the cache-path op"
+    );
+
+    let second = selected(dht_store.clone(), agent.clone()).await;
+    assert!(
+        second.len() < first.len(),
+        "the next loop must select strictly fewer ops ({} then {})",
+        first.len(),
+        second.len()
+    );
+    assert!(!second.contains(&poison));
+}

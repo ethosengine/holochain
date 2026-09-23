@@ -50,6 +50,35 @@ pub struct IntegratedOpSummary {
     pub warrantee: Option<holo_hash::AgentPubKey>,
 }
 
+/// Which publish-state table records an op's publish time.
+///
+/// Carried from the publish query (whose chain-op and warrant arms are
+/// distinct) through to [`DhtStore::record_published_op_hashes`], so the
+/// record is routed by the op's actual type rather than inferred from
+/// whether an update happened to match a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PublishOpKind {
+    /// A self-authored chain op; its publish state is a `ChainOpPublish` row.
+    ChainOp,
+    /// A self-authored warrant; it publishes once, recorded in `WarrantPublish`.
+    Warrant,
+}
+
+/// An op selected for publishing: its hash and the kind that decides where
+/// its publish time is recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PublishableOp {
+    /// Hash of the op (a chain op hash or a warrant hash).
+    pub hash: DhtOpHash,
+    /// Whether the op is a chain op or a warrant.
+    pub kind: PublishOpKind,
+}
+
+/// How many publish records [`DhtStore::record_published_op_hashes`] writes in
+/// one transaction before falling back to per-op transactions for a chunk
+/// that fails.
+const PUBLISH_RECORD_CHUNK: usize = 256;
+
 /// Output options for [`DhtStore::get_agent_activity`]. A `holochain_state`-local
 /// mirror of `holochain_p2p`'s `GetActivityOptions` (which is off this crate's
 /// dependency graph); the cascade maps between the two in phases 1b/1c.
@@ -879,34 +908,101 @@ impl DhtStore<DbWrite<Dht>> {
         Ok(())
     }
 
-    /// Record that each given op hash has just been published, updating its
+    /// Record that each given op has just been published, updating its
     /// publish-state timestamp.
     ///
-    /// Chain ops have their `ChainOpPublish.last_publish_time` set to `now`.
-    /// A hash with no matching `ChainOpPublish` row is a warrant: warrants
-    /// publish at most once, so a `WarrantPublish` row recording `now` is
-    /// inserted instead (the `PRIMARY KEY ON CONFLICT IGNORE` keeps the first
-    /// publish time if the same warrant is recorded again). The publish queue
-    /// excludes any warrant that has a `WarrantPublish` row.
+    /// The destination is decided by each op's [`PublishOpKind`], never by a
+    /// row count:
+    ///
+    /// - A chain op has its `ChainOpPublish.last_publish_time` set to `now`.
+    ///   A chain op with no `ChainOpPublish` row has no publish state to
+    ///   record into; it is skipped with a warning and is never turned into
+    ///   warrant state.
+    /// - A warrant publishes at most once, so a `WarrantPublish` row recording
+    ///   `now` is inserted (the `PRIMARY KEY ON CONFLICT IGNORE` keeps the
+    ///   first publish time if the same warrant is recorded again). The
+    ///   publish queue excludes any warrant that has a `WarrantPublish` row.
+    ///
+    /// Records are written in chunked transactions. If a chunk fails, it is
+    /// rolled back and retried one op per transaction, and an op that still
+    /// fails is skipped with a warning: one unrecordable op cannot void the
+    /// records of the other ops in the batch (which would re-select the whole
+    /// batch on every publish loop). Failing to open a transaction at all is
+    /// a database-level failure, not an op-level one, and is returned.
     pub async fn record_published_op_hashes(
         &self,
-        op_hashes: Vec<DhtOpHash>,
+        ops: Vec<PublishableOp>,
         now: Timestamp,
     ) -> StateMutationResult<()> {
-        let mut tx = self.db.begin().await.map_err(StateMutationError::from)?;
-        for hash in op_hashes {
-            let updated = tx
-                .set_chain_op_last_publish_time(&hash, now)
-                .await
-                .map_err(StateMutationError::from)?;
-            if updated == 0 {
-                tx.insert_warrant_publish(&hash, Some(now))
-                    .await
-                    .map_err(StateMutationError::from)?;
+        for chunk in ops.chunks(PUBLISH_RECORD_CHUNK) {
+            let chunk_err = match self.try_record_publish_times(chunk, now).await? {
+                Ok(()) => continue,
+                Err(e) => e,
+            };
+            tracing::warn!(
+                ?chunk_err,
+                chunk_len = chunk.len(),
+                "recording publish times failed for a chunk; retrying one op per transaction"
+            );
+            for op in chunk {
+                if let Err(e) = self
+                    .try_record_publish_times(std::slice::from_ref(op), now)
+                    .await?
+                {
+                    tracing::warn!(
+                        op_hash = ?op.hash,
+                        kind = ?op.kind,
+                        ?e,
+                        "could not record publish time; skipping this op"
+                    );
+                }
             }
         }
-        tx.commit().await.map_err(StateMutationError::from)?;
         Ok(())
+    }
+
+    /// Write the publish records for `ops` in one transaction.
+    ///
+    /// The outer result is the failure to open the transaction (a
+    /// database-level failure); the inner result is the failure of a record
+    /// or of the commit (the transaction is rolled back on drop), which the
+    /// caller isolates by retrying per op.
+    async fn try_record_publish_times(
+        &self,
+        ops: &[PublishableOp],
+        now: Timestamp,
+    ) -> StateMutationResult<StateMutationResult<()>> {
+        let mut tx = self.db.begin().await.map_err(StateMutationError::from)?;
+        let mut unrecordable = Vec::new();
+        for op in ops {
+            let recorded = match op.kind {
+                PublishOpKind::ChainOp => tx
+                    .set_chain_op_last_publish_time(&op.hash, now)
+                    .await
+                    .map(|updated| {
+                        if updated == 0 {
+                            unrecordable.push(op.hash.clone());
+                        }
+                    }),
+                PublishOpKind::Warrant => tx.insert_warrant_publish(&op.hash, Some(now)).await,
+            };
+            if let Err(e) = recorded {
+                return Ok(Err(StateMutationError::from(e)));
+            }
+        }
+        if let Err(e) = tx.commit().await {
+            return Ok(Err(StateMutationError::from(e)));
+        }
+        for op_hash in unrecordable {
+            // Selected as a chain op but has no `ChainOpPublish` row: not an
+            // op this conductor authored (e.g. a cache-path row authored by a
+            // locally hosted agent). There is nothing to record it into.
+            tracing::warn!(
+                ?op_hash,
+                "published chain op has no ChainOpPublish row; not recording a publish time"
+            );
+        }
+        Ok(Ok(()))
     }
 
     /// Clear `withhold_publish` on the `ChainOpPublish` rows for the given

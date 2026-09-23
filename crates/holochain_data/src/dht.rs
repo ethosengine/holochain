@@ -2314,6 +2314,121 @@ mod tests {
         assert_eq!(row.last_publish_time, Some(42));
     }
 
+    /// Insert an integrated chain op for `action` with the given
+    /// `locally_validated` flag, optionally with an empty `ChainOpPublish` row.
+    async fn seed_publishable_chain_op(
+        db: &crate::handles::DbWrite<Dht>,
+        seed: u8,
+        op_byte: u8,
+        locally_validated: bool,
+        with_publish_row: bool,
+    ) -> DhtOpHash {
+        let action = seed_action_for_op(db, seed).await;
+        let op_hash = DhtOpHash::from_raw_36(vec![op_byte; 36]);
+        db.insert_chain_op(InsertChainOp {
+            op_hash: &op_hash,
+            action_hash: &action,
+            op_type: 1,
+            basis_hash: &sample_basis(seed),
+            storage_center_loc: 0,
+            validation_status: RecordValidity::Accepted,
+            locally_validated,
+            require_receipt: false,
+            when_received: Timestamp::from_micros(1),
+            when_integrated: Timestamp::from_micros(2),
+            serialized_size: 0,
+        })
+        .await
+        .unwrap();
+        if with_publish_row {
+            db.insert_chain_op_publish(&op_hash, None, None, None)
+                .await
+                .unwrap();
+        }
+        op_hash
+    }
+
+    /// The cache path writes foreign-fetched ops into the same per-DNA
+    /// database with `locally_validated = 0` and no `ChainOpPublish` row. When
+    /// such an op's author is a locally hosted agent it must not be selected
+    /// for publishing (nor counted as still needing publish): it has no
+    /// publish state to record into, so selecting it re-selects it forever.
+    #[tokio::test]
+    async fn get_ops_to_publish_excludes_cache_rows() {
+        let db = test_open_db(dht_db_id()).await.unwrap();
+        // `sample_action` authors every action with the all-ones key.
+        let author = AgentPubKey::from_raw_36(vec![1u8; 36]);
+
+        // A self-authored op: locally validated, with its publish row.
+        let authored = seed_publishable_chain_op(&db, 1, 0xA1, true, true).await;
+        // A cache-path row authored by the same agent.
+        let cached = seed_publishable_chain_op(&db, 2, 0xC2, false, false).await;
+        // A self-authored warrant.
+        let warrant = DhtOpHash::from_raw_36(vec![0xE3; 36]);
+        db.insert_warrant(InsertWarrant {
+            hash: &warrant,
+            author: &author,
+            timestamp: Timestamp::from_micros(1),
+            warrantee: &AgentPubKey::from_raw_36(vec![2u8; 36]),
+            proof: &[0u8; 32],
+            signature: &[1u8; 64],
+            reason: None,
+            storage_center_loc: 0,
+            when_received: Timestamp::from_micros(3),
+            when_integrated: Timestamp::from_micros(5),
+            validation_status: 1,
+            serialized_size: 64,
+        })
+        .await
+        .unwrap();
+
+        let rows = db.as_ref().get_ops_to_publish(&author, 0).await.unwrap();
+        let selected: Vec<(Vec<u8>, i64)> = rows
+            .into_iter()
+            .map(|r| (r.dht_hash, r.is_warrant))
+            .collect();
+        assert_eq!(
+            selected,
+            vec![
+                (authored.get_raw_36().to_vec(), 0),
+                (warrant.get_raw_36().to_vec(), 1),
+            ],
+            "only the self-authored chain op (is_warrant = 0) and the warrant \
+             (is_warrant = 1) are selected; the cache row {cached:?} is not"
+        );
+        assert_eq!(
+            db.as_ref()
+                .num_still_needing_publish(&author)
+                .await
+                .unwrap(),
+            2,
+            "the cache row must not keep the publish loop alive"
+        );
+    }
+
+    /// A locally validated op that nonetheless has no `ChainOpPublish` row —
+    /// e.g. a cache row later upgraded by limbo integration — has no publish
+    /// state to record into, so it is neither selected nor counted.
+    #[tokio::test]
+    async fn get_ops_to_publish_excludes_ops_without_publish_row() {
+        let db = test_open_db(dht_db_id()).await.unwrap();
+        let author = AgentPubKey::from_raw_36(vec![1u8; 36]);
+
+        let authored = seed_publishable_chain_op(&db, 1, 0xA1, true, true).await;
+        seed_publishable_chain_op(&db, 2, 0xB2, true, false).await;
+
+        let rows = db.as_ref().get_ops_to_publish(&author, 0).await.unwrap();
+        let selected: Vec<Vec<u8>> = rows.into_iter().map(|r| r.dht_hash).collect();
+        assert_eq!(selected, vec![authored.get_raw_36().to_vec()]);
+        assert_eq!(
+            db.as_ref()
+                .num_still_needing_publish(&author)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn clear_chain_op_withhold_publish_round_trip() {
         let db = test_open_db(dht_db_id()).await.unwrap();
