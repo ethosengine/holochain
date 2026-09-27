@@ -2002,6 +2002,76 @@ mod tests {
         Ok(())
     }
 
+    /// The publish selector admits only ops that are `locally_validated = 1`
+    /// with a `ChainOpPublish` row (the FK-787 livelock cure). That must never
+    /// delay an author's OWN fresh ops: the flush writes the `ChainOp` row with
+    /// `locally_validated = 1` and its `ChainOpPublish` row in the same
+    /// transaction, so a just-committed op is selectable on the very next
+    /// publish loop, with no local-validation round-trip in between.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn freshly_authored_ops_are_publishable_immediately() -> SourceChainResult<()> {
+        let TestCase {
+            chain,
+            agent_key,
+            dht_store,
+            ..
+        } = TestCase::new().await;
+
+        let before: HashSet<DhtOpHash> = dht_store
+            .as_read()
+            .get_ops_to_publish(&agent_key, std::time::Duration::ZERO)
+            .await?
+            .into_iter()
+            .map(|(_, op)| op.hash)
+            .collect();
+        let needing_before = dht_store
+            .as_read()
+            .num_still_needing_publish(&agent_key)
+            .await?;
+
+        let entry = Entry::App(fixt!(AppEntryBytes));
+        let entry_hash = EntryHash::with_data_sync(&entry);
+        let create = ActionData::Create(CreateData {
+            entry_type: EntryType::App(AppEntryDef::new(
+                0.into(),
+                0.into(),
+                EntryVisibility::Public,
+            )),
+            entry_hash,
+        });
+        chain
+            .put(create, Some(entry), ChainTopOrdering::default())
+            .await?;
+        chain.flush(vec![DhtArc::Empty]).await?;
+
+        let after = dht_store
+            .as_read()
+            .get_ops_to_publish(&agent_key, std::time::Duration::ZERO)
+            .await?;
+        let fresh: Vec<_> = after
+            .iter()
+            .filter(|(_, op)| !before.contains(&op.hash))
+            .collect();
+        // A public Create yields StoreRecord, StoreEntry and RegisterAgentActivity.
+        assert_eq!(
+            fresh.len(),
+            3,
+            "every op of the freshly authored public Create must be selected at once"
+        );
+        assert!(fresh
+            .iter()
+            .all(|(_, op)| op.kind == crate::dht_store::PublishOpKind::ChainOp));
+        assert_eq!(
+            dht_store
+                .as_read()
+                .num_still_needing_publish(&agent_key)
+                .await?,
+            needing_before + 3,
+            "the fresh ops keep the publish loop alive until their receipts complete"
+        );
+        Ok(())
+    }
+
     /// Verify that `DhtStore::dump_source_chain` returns records in seq order,
     /// resolves private-entry records' entry data from `PrivateEntry`, and
     /// reports the correct published-op count.
