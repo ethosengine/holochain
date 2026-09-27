@@ -92,6 +92,35 @@ where
     Ok(result.rows_affected())
 }
 
+/// The publish selector (see [`get_ops_to_publish`]). A const so the
+/// plan test EXPLAINs exactly what runs; binds: author, recency threshold,
+/// author.
+pub(crate) const GET_OPS_TO_PUBLISH_SQL: &str =
+    "SELECT ChainOp.hash AS dht_hash, ChainOp.basis_hash AS basis_hash, Action.seq AS sort_seq,
+                0 AS is_warrant
+         FROM ChainOp
+         JOIN Action ON ChainOp.action_hash = Action.hash
+         JOIN ChainOpPublish ON ChainOpPublish.op_hash = ChainOp.hash
+         WHERE Action.author = ?
+           AND ChainOp.locally_validated = 1
+           AND (ChainOp.op_type != 2 OR Action.private_entry = 0)
+           AND ChainOpPublish.withhold_publish IS NULL
+           AND (ChainOpPublish.last_publish_time IS NULL
+                OR ChainOpPublish.last_publish_time <= ?)
+           AND ChainOpPublish.receipts_complete IS NULL
+
+         UNION ALL
+
+         SELECT WarrantOp.hash AS dht_hash, Warrant.warrantee AS basis_hash,
+                9223372036854775807 AS sort_seq, 1 AS is_warrant
+         FROM WarrantOp
+         JOIN Warrant ON WarrantOp.hash = Warrant.hash
+         LEFT JOIN WarrantPublish ON WarrantPublish.warrant_hash = Warrant.hash
+         WHERE Warrant.author = ?
+           AND WarrantPublish.last_publish_time IS NULL
+
+         ORDER BY sort_seq, dht_hash";
+
 /// Ops eligible to be published to the network for `author`.
 ///
 /// Returns integrated, self-authored chain ops together with integrated
@@ -130,37 +159,12 @@ pub(crate) async fn get_ops_to_publish<'e, E>(
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    sqlx::query_as(
-        "SELECT ChainOp.hash AS dht_hash, ChainOp.basis_hash AS basis_hash, Action.seq AS sort_seq,
-                0 AS is_warrant
-         FROM ChainOp
-         JOIN Action ON ChainOp.action_hash = Action.hash
-         JOIN ChainOpPublish ON ChainOpPublish.op_hash = ChainOp.hash
-         WHERE Action.author = ?
-           AND ChainOp.locally_validated = 1
-           AND (ChainOp.op_type != 2 OR Action.private_entry = 0)
-           AND ChainOpPublish.withhold_publish IS NULL
-           AND (ChainOpPublish.last_publish_time IS NULL
-                OR ChainOpPublish.last_publish_time <= ?)
-           AND ChainOpPublish.receipts_complete IS NULL
-
-         UNION ALL
-
-         SELECT WarrantOp.hash AS dht_hash, Warrant.warrantee AS basis_hash,
-                9223372036854775807 AS sort_seq, 1 AS is_warrant
-         FROM WarrantOp
-         JOIN Warrant ON WarrantOp.hash = Warrant.hash
-         LEFT JOIN WarrantPublish ON WarrantPublish.warrant_hash = Warrant.hash
-         WHERE Warrant.author = ?
-           AND WarrantPublish.last_publish_time IS NULL
-
-         ORDER BY sort_seq, dht_hash",
-    )
-    .bind(author.get_raw_36())
-    .bind(recency_threshold_micros)
-    .bind(author.get_raw_36())
-    .fetch_all(executor)
-    .await
+    sqlx::query_as(GET_OPS_TO_PUBLISH_SQL)
+        .bind(author.get_raw_36())
+        .bind(recency_threshold_micros)
+        .bind(author.get_raw_36())
+        .fetch_all(executor)
+        .await
 }
 
 /// Count integrated ops authored by `author` that have been published at
@@ -225,4 +229,47 @@ where
     .bind(author.get_raw_36())
     .fetch_one(executor)
     .await
+}
+
+/// Whether any op authored by `author` may still need to be published.
+///
+/// The same eligibility as [`num_still_needing_publish`], asked as `EXISTS`:
+/// the publish workflow only needs "is there at least one?" to decide whether
+/// to keep its loop running, and a count visits every one of the author's
+/// incomplete ops on every loop of every hosted agent. `receipts_complete`
+/// is only set once an op has `required_validations` receipts, which a small
+/// network (fewer authorities than that) never delivers, so on such a network
+/// every authored op stays counted forever and the count is the author's
+/// whole chain. `EXISTS` stops at the first row.
+pub(crate) const ANY_STILL_NEEDING_PUBLISH_SQL: &str = "SELECT
+           EXISTS (SELECT 1
+            FROM ChainOp
+            JOIN Action ON ChainOp.action_hash = Action.hash
+            JOIN ChainOpPublish ON ChainOpPublish.op_hash = ChainOp.hash
+            WHERE Action.author = ?
+              AND ChainOp.locally_validated = 1
+              AND ChainOpPublish.withhold_publish IS NULL
+              AND (ChainOp.op_type != 2 OR Action.private_entry = 0)
+              AND ChainOpPublish.receipts_complete IS NULL)
+         OR EXISTS (SELECT 1
+            FROM WarrantOp
+            JOIN Warrant ON WarrantOp.hash = Warrant.hash
+            LEFT JOIN WarrantPublish ON WarrantPublish.warrant_hash = Warrant.hash
+            WHERE Warrant.author = ?
+              AND WarrantPublish.last_publish_time IS NULL)";
+
+/// See [`ANY_STILL_NEEDING_PUBLISH_SQL`].
+pub(crate) async fn any_still_needing_publish<'e, E>(
+    executor: E,
+    author: &AgentPubKey,
+) -> sqlx::Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let any: i64 = sqlx::query_scalar(ANY_STILL_NEEDING_PUBLISH_SQL)
+        .bind(author.get_raw_36())
+        .bind(author.get_raw_36())
+        .fetch_one(executor)
+        .await?;
+    Ok(any != 0)
 }

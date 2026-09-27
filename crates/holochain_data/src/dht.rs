@@ -2406,6 +2406,79 @@ mod tests {
         );
     }
 
+    /// `any_still_needing_publish` is the `EXISTS` form the publish loop
+    /// uses to decide whether to keep running; it must agree with
+    /// `num_still_needing_publish > 0` in every eligibility case.
+    #[tokio::test]
+    async fn any_still_needing_publish_agrees_with_the_count() {
+        let db = test_open_db(dht_db_id()).await.unwrap();
+        let author = AgentPubKey::from_raw_36(vec![1u8; 36]);
+        let agree = |n: i64, any: bool| assert_eq!(n > 0, any, "count {n} vs exists {any}");
+
+        // Empty store.
+        let n = db
+            .as_ref()
+            .num_still_needing_publish(&author)
+            .await
+            .unwrap();
+        let any = db
+            .as_ref()
+            .any_still_needing_publish(&author)
+            .await
+            .unwrap();
+        agree(n, any);
+        assert!(!any);
+
+        // Only a cache-path row by this author: never selectable, never counted.
+        seed_publishable_chain_op(&db, 2, 0xC2, false, false).await;
+        let n = db
+            .as_ref()
+            .num_still_needing_publish(&author)
+            .await
+            .unwrap();
+        let any = db
+            .as_ref()
+            .any_still_needing_publish(&author)
+            .await
+            .unwrap();
+        agree(n, any);
+        assert!(!any);
+
+        // A self-authored op with its publish row: needs publishing.
+        let authored = seed_publishable_chain_op(&db, 1, 0xA1, true, true).await;
+        let n = db
+            .as_ref()
+            .num_still_needing_publish(&author)
+            .await
+            .unwrap();
+        let any = db
+            .as_ref()
+            .any_still_needing_publish(&author)
+            .await
+            .unwrap();
+        agree(n, any);
+        assert!(any);
+
+        // Its receipts complete: nothing left.
+        db.set_chain_op_receipts_complete(&authored).await.unwrap();
+        let n = db
+            .as_ref()
+            .num_still_needing_publish(&author)
+            .await
+            .unwrap();
+        let any = db
+            .as_ref()
+            .any_still_needing_publish(&author)
+            .await
+            .unwrap();
+        agree(n, any);
+        assert!(!any);
+
+        // Another author's op never counts for this author.
+        let other = AgentPubKey::from_raw_36(vec![9u8; 36]);
+        assert!(!db.as_ref().any_still_needing_publish(&other).await.unwrap());
+    }
+
     /// A locally validated op that nonetheless has no `ChainOpPublish` row —
     /// e.g. a cache row later upgraded by limbo integration — has no publish
     /// state to record into, so it is neither selected nor counted.

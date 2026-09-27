@@ -310,6 +310,19 @@ impl DhtStore<DbRead<Dht>> {
         Ok(self.db().num_still_needing_publish(author).await? as usize)
     }
 
+    /// Whether any op authored by `author` may still need publishing in the
+    /// future (ignoring the recency window) — the `EXISTS` form of
+    /// [`Self::num_still_needing_publish`]. The publish workflow only needs
+    /// this yes/no to decide whether to keep looping, and it stops at the
+    /// first eligible op instead of counting the author's whole chain on
+    /// every loop.
+    pub async fn has_ops_still_needing_publish(
+        &self,
+        author: &AgentPubKey,
+    ) -> StateQueryResult<bool> {
+        Ok(self.db().any_still_needing_publish(author).await?)
+    }
+
     /// Whether `author`'s genesis records are present.
     ///
     /// Genesis writes three chain actions (`Dna`, `AgentValidationPkg`,

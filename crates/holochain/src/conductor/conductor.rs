@@ -2267,6 +2267,13 @@ mod scheduler_impls {
             let scheduler_handle = self.clone();
             self.set_scheduler(tokio::task::spawn(async move {
                 let mut interval = tokio::time::interval(interval_period);
+                // ELOHIM PATCH (fleet CPU storm): a dispatch that overruns the
+                // period (a cell waiting on the write lock) must not be followed
+                // by a burst of back-to-back catch-up dispatches (the default
+                // `Burst`), which re-runs every cell's scheduler reads once per
+                // missed 100 ms tick. `Delay` resumes the cadence from the late
+                // tick instead.
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     interval.tick().await;
                     scheduler_handle

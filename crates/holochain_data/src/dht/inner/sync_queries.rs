@@ -903,6 +903,27 @@ pub(crate) const DHT_SYNC_INDEXES: &[&str] = &[
         basis_hash, serialized_size, when_integrated
     )",
     "CREATE INDEX IF NOT EXISTS elohim_WarrantOp_loc_idx ON WarrantOp (storage_center_loc)",
+    // ELOHIM PATCH (fleet CPU storm): the per-author publish reads. The
+    // publish selector and its still-needing-publish sibling run for every
+    // hosted agent on every publish loop and filter on `Action.author`, but
+    // with no author index and no `ChainOp.action_hash` index the planner
+    // could only SCAN all of `ChainOp` (via the loc index) and probe `Action`
+    // per row: seconds per call on a grown store, whoever the author. With
+    // these two the plan is `Action` by author -> `ChainOp` by action ->
+    // `ChainOpPublish` by primary key, proportional to the author's own ops.
+    // Both are covering for those reads (`Action.private_entry` for the
+    // private-entry guard; `locally_validated`, `op_type`, `basis_hash` on
+    // `ChainOp`): measured on the household stores, a plain
+    // `(action_hash)` index made a single-author store with a 160k-op chain
+    // 3x slower than the scan (a table lookup per op), while the covering
+    // pair holds it at parity and cuts an 18-agent store 36x.
+    "CREATE INDEX IF NOT EXISTS elohim_Action_author_publish_idx
+        ON Action (author, seq, private_entry)",
+    "CREATE INDEX IF NOT EXISTS elohim_ChainOp_action_publish_idx
+        ON ChainOp (action_hash, locally_validated, op_type, basis_hash)",
+    // Sys-validation's chain-fork check (`get_actions_by_prev_hash`) runs per
+    // incoming op and was a full `Action` scan.
+    "CREATE INDEX IF NOT EXISTS elohim_Action_prev_hash_idx ON Action (prev_hash)",
 ];
 
 /// Ensure [`DHT_SYNC_INDEXES`] exist. Idempotent; on a large store that
@@ -1558,6 +1579,58 @@ mod tests {
         }
     }
 
+    /// The per-author publish reads run for every hosted agent on every
+    /// publish loop. They must be driven from the author's own actions
+    /// (`Action` by author, then `ChainOp` by action hash), never by scanning
+    /// `ChainOp` and probing `Action` per row — the seconds-per-call shape the
+    /// fleet CPU storm was made of. Same for sys-validation's per-op
+    /// chain-fork check by `prev_hash`.
+    #[tokio::test]
+    async fn per_author_publish_and_fork_reads_are_index_driven() {
+        let db = test_open_db(dht_id()).await.unwrap();
+        for (name, sql, n_binds) in [
+            (
+                "get_ops_to_publish",
+                super::super::chain_op_publish::GET_OPS_TO_PUBLISH_SQL,
+                3,
+            ),
+            (
+                "any_still_needing_publish",
+                super::super::chain_op_publish::ANY_STILL_NEEDING_PUBLISH_SQL,
+                2,
+            ),
+        ] {
+            let plan = query_plan(db.pool(), sql, n_binds).await;
+            assert!(
+                plan.iter()
+                    .any(|d| d.contains("SEARCH Action USING COVERING INDEX")
+                        && d.contains("elohim_Action_author_publish_idx")),
+                "{name}: must search Action by author, covered, plan: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|d| d.contains("SEARCH ChainOp USING COVERING INDEX")
+                        && d.contains("elohim_ChainOp_action_publish_idx")),
+                "{name}: must reach ChainOp through the covering action-hash index, plan: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.starts_with("SCAN ChainOp")),
+                "{name}: must not scan ChainOp, plan: {plan:?}"
+            );
+        }
+        let plan = query_plan(
+            db.pool(),
+            "SELECT hash FROM Action WHERE prev_hash = ? AND hash != ?",
+            2,
+        )
+        .await;
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("elohim_Action_prev_hash_idx")),
+            "fork check must search Action by prev_hash, plan: {plan:?}"
+        );
+    }
+
     /// The indexes exist after open and re-ensuring them is a no-op, so a
     /// store that predates them gains them on its next open and an older
     /// binary (which knows no such migration) still opens the file.
@@ -1575,7 +1648,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             names.into_iter().map(|(n,)| n).collect::<Vec<_>>(),
-            vec!["elohim_ChainOp_loc_sync_idx", "elohim_WarrantOp_loc_idx"]
+            vec![
+                "elohim_Action_author_publish_idx",
+                "elohim_Action_prev_hash_idx",
+                "elohim_ChainOp_action_publish_idx",
+                "elohim_ChainOp_loc_sync_idx",
+                "elohim_WarrantOp_loc_idx",
+            ]
         );
 
         let migrations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations")

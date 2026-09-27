@@ -237,13 +237,24 @@ impl Cell {
             }
             Ok(live_fns) => {
                 let author_for_new_db = self.id.agent_pubkey().clone();
-                if let Err(e) = self
-                    .space
-                    .dht_store
-                    .delete_live_ephemeral_scheduled_functions(&author_for_new_db, now)
-                    .await
-                {
-                    error!("error deleting live ephemeral scheduled functions: {:?}", e);
+                // ELOHIM PATCH (fleet CPU storm): delete only when a live
+                // ephemeral row exists. The scheduler ticks every 100 ms for
+                // every running cell, and a DELETE takes the database's single
+                // write lock whether or not it matches a row, so the
+                // unconditional delete was ~10 write transactions per second
+                // per hosted cell, each queueing behind every real write (up to
+                // the 15 s busy timeout under load) while holding a pool
+                // connection. Rows that became live after the read above are
+                // no longer deleted undispatched; the next tick dispatches them.
+                if live_fns.iter().any(|(_, _, ephemeral)| *ephemeral) {
+                    if let Err(e) = self
+                        .space
+                        .dht_store
+                        .delete_live_ephemeral_scheduled_functions(&author_for_new_db, now)
+                        .await
+                    {
+                        error!("error deleting live ephemeral scheduled functions: {:?}", e);
+                    }
                 }
 
                 let mut tasks = vec![];

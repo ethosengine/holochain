@@ -89,9 +89,8 @@ pub async fn publish_dht_ops_workflow(
     }
     let continue_publish = dht_store
         .as_read()
-        .num_still_needing_publish(&agent)
-        .await?
-        > 0;
+        .has_ops_still_needing_publish(&agent)
+        .await?;
 
     // If we have more ops that could be published then continue looping.
     if continue_publish {

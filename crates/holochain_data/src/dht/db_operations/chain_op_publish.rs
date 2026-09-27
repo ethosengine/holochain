@@ -78,4 +78,11 @@ impl DbRead<Dht> {
         let mut conn = self.timed_conn().await?;
         chain_op_publish::num_still_needing_publish(&mut *conn, author).await
     }
+
+    /// Whether any op authored by `author` may still need publishing. See
+    /// `chain_op_publish::any_still_needing_publish`.
+    pub async fn any_still_needing_publish(&self, author: &AgentPubKey) -> sqlx::Result<bool> {
+        let mut conn = self.timed_conn().await?;
+        chain_op_publish::any_still_needing_publish(&mut *conn, author).await
+    }
 }
