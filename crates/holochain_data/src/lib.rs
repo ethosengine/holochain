@@ -21,6 +21,7 @@ pub mod dht;
 pub mod kind;
 pub mod models;
 pub mod peer_meta_store;
+pub mod wal;
 pub mod wasm;
 
 /// Embedded migrations for the Wasm database.
@@ -152,6 +153,10 @@ pub struct HolochainDbConn<I: DatabaseIdentifier> {
     pub identifier: I,
 }
 
+/// How long a statement waits on a locked database before failing with
+/// "database is locked" (sqlx's default is 5 s).
+pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Open a database connection at the given directory path.
 ///
 /// The database file name is constructed from the `database_id`.
@@ -232,14 +237,20 @@ fn configure_sqlite_options(
 
     // Tolerate longer writer contention than sqlx's 5s default before a
     // write fails with "database is locked".
-    opts = opts.busy_timeout(std::time::Duration::from_secs(15));
+    opts = opts.busy_timeout(BUSY_TIMEOUT);
 
     // Set other pragmas
     let sync_value = config.sync_level.as_pragma_value().to_string();
     opts = opts
         .pragma("trusted_schema", "false")
         .pragma("foreign_keys", "ON")
-        .pragma("synchronous", sync_value);
+        .pragma("synchronous", sync_value)
+        // ELOHIM PATCH (H3): cut the WAL file back after a checkpoint resets
+        // it, instead of leaving it at its high-water mark. See `wal`.
+        .pragma(
+            "journal_size_limit",
+            wal::JOURNAL_SIZE_LIMIT_BYTES.to_string(),
+        );
 
     Ok(opts)
 }

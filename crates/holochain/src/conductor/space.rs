@@ -439,6 +439,56 @@ impl Spaces {
     }
 }
 
+/// ELOHIM PATCH (fleet CPU storm, H3): how often each DHT database's WAL is
+/// checkpointed explicitly (see `holochain_data::wal`).
+const DHT_WAL_MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run a bounded WAL maintenance pass on a DHT database every
+/// [`DHT_WAL_MAINTENANCE_PERIOD`] until its pool is closed. A pass is a
+/// passive checkpoint plus, only while the log stays above
+/// `WAL_TRUNCATE_ABOVE_FRAMES`, a truncating checkpoint whose wait for
+/// readers is capped at `WAL_TRUNCATE_MAX_WAIT`. A truncation held off by a
+/// reader is logged, so a pinned WAL is visible instead of silent.
+fn spawn_dht_wal_maintenance(db: holochain_state::data::DbWrite<holochain_state::data::Dht>) {
+    use holochain_state::data::wal::{WAL_TRUNCATE_ABOVE_FRAMES, WAL_TRUNCATE_MAX_WAIT};
+    use holochain_state::data::DatabaseIdentifier;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(DHT_WAL_MAINTENANCE_PERIOD);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick completes immediately; the store was just opened.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            if db.pool().is_closed() {
+                break;
+            }
+            match db
+                .wal_maintenance_pass(WAL_TRUNCATE_ABOVE_FRAMES, WAL_TRUNCATE_MAX_WAIT)
+                .await
+            {
+                Ok(outcome) => match outcome.truncate {
+                    Some(t) if t.busy => tracing::info!(
+                        db = db.identifier().database_id(),
+                        log_frames = t.log_frames,
+                        checkpointed_frames = t.checkpointed_frames,
+                        "WAL truncation held off by an active reader; retrying next period"
+                    ),
+                    _ => tracing::debug!(
+                        db = db.identifier().database_id(),
+                        ?outcome,
+                        "WAL maintenance pass"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    db = db.identifier().database_id(),
+                    ?e,
+                    "WAL maintenance pass failed"
+                ),
+            }
+        }
+    });
+}
+
 impl Space {
     fn new(
         dna_hash: Arc<DnaHash>,
@@ -469,6 +519,7 @@ impl Space {
                     space_data_config,
                 ))
                 .map_err(ConductorError::other)?;
+            spawn_dht_wal_maintenance(new_dht_db.clone());
             let dht_store = DhtStore::new(new_dht_db);
 
             Ok(Self {

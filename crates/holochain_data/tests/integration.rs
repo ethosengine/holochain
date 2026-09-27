@@ -379,3 +379,116 @@ async fn test_foreign_key_constraints() {
             .expect("Failed to count zomes after delete");
     assert_eq!(count, 0, "Expected cascading delete to remove zome");
 }
+
+/// ELOHIM PATCH (H3): the WAL is checkpointed into the main file and truncated
+/// by the bounded maintenance pass; a reader pinning an old snapshot makes the
+/// truncating step report `busy` within its bounded wait instead of stalling
+/// writers; once the reader is gone the next pass empties the WAL file.
+#[tokio::test(flavor = "multi_thread")]
+async fn wal_maintenance_checkpoints_and_truncates_within_bound() {
+    use holochain_data::wal::{WalCheckpointMode, JOURNAL_SIZE_LIMIT_BYTES};
+    use std::time::{Duration, Instant};
+
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let db_id = TestDbId("wal_maintenance".to_string());
+    let db = open_db(&tmp_dir, db_id, holochain_data::HolochainDataConfig::new())
+        .await
+        .unwrap();
+    let main_path = tmp_dir.path().join("wal_maintenance");
+    let wal_path = tmp_dir.path().join("wal_maintenance-wal");
+    let len = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+
+    let limit: i64 = sqlx::query_scalar("PRAGMA journal_size_limit")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(limit, JOURNAL_SIZE_LIMIT_BYTES);
+
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB NOT NULL)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let insert = |from: i64| {
+        let db = db.clone();
+        async move {
+            for id in from..from + 200 {
+                sqlx::query("INSERT INTO t (id, b) VALUES (?, ?)")
+                    .bind(id)
+                    .bind(vec![id as u8; 4096])
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    insert(0).await;
+
+    // A reader pins the current snapshot.
+    let mut reader = db.pool().begin().await.unwrap();
+    let seen: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+        .fetch_one(&mut *reader)
+        .await
+        .unwrap();
+    assert_eq!(seen, 200);
+
+    // Writes after the snapshot put frames in the WAL that the reader's
+    // snapshot predates; a truncating checkpoint must wait for that reader.
+    insert(200).await;
+
+    let started = Instant::now();
+    let pinned = db
+        .wal_maintenance_pass(0, Duration::from_millis(200))
+        .await
+        .unwrap();
+    let waited = started.elapsed();
+    let truncate = pinned
+        .truncate
+        .expect("a non-empty log escalates to TRUNCATE");
+    assert!(
+        truncate.busy,
+        "a pinned reader must make TRUNCATE report busy: {pinned:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "the truncating step must give up within its bound, waited {waited:?}"
+    );
+    assert!(len(&wal_path) > 0, "the pinned WAL cannot be truncated yet");
+
+    // The busy timeout of the pool's connections is restored afterwards.
+    let restored: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(restored, holochain_data::BUSY_TIMEOUT.as_millis() as i64);
+
+    reader.rollback().await.unwrap();
+    let main_before = len(&main_path);
+
+    let freed = db
+        .wal_maintenance_pass(0, Duration::from_millis(200))
+        .await
+        .unwrap();
+    let truncate = freed.truncate.expect("still above the threshold");
+    assert!(
+        !truncate.busy,
+        "no reader left, TRUNCATE completes: {freed:?}"
+    );
+    assert_eq!(len(&wal_path), 0, "TRUNCATE empties the WAL file");
+    assert!(
+        len(&main_path) >= main_before,
+        "the frames were copied into the main database file"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 400, "no row is lost by checkpointing");
+
+    // A passive checkpoint never blocks and, on an empty log, reports so.
+    let passive = db
+        .wal_checkpoint(WalCheckpointMode::Passive, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(passive.fully_backfilled(), "{passive:?}");
+}

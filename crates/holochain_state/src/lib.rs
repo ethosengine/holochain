@@ -29,6 +29,9 @@ pub mod data {
         DbSyncLevel, DbWrite, HolochainDataConfig,
     };
 
+    /// Explicit WAL checkpoint cadence (see `holochain_data::wal`).
+    pub use holochain_data::wal;
+
     #[cfg(feature = "test_utils")]
     pub use holochain_data::test_open_db;
 }
