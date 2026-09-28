@@ -492,3 +492,72 @@ async fn wal_maintenance_checkpoints_and_truncates_within_bound() {
         .unwrap();
     assert!(passive.fully_backfilled(), "{passive:?}");
 }
+
+/// ELOHIM PATCH (H3): a truncating checkpoint blocks new writers while it
+/// copies, so it is skipped when more than `WAL_TRUNCATE_MAX_COPY_FRAMES` would
+/// be left for it to copy (a reader pinning an old snapshot); the passive
+/// checkpoint still runs and never blocks.
+#[tokio::test(flavor = "multi_thread")]
+async fn wal_maintenance_skips_truncate_with_a_large_remainder() {
+    use holochain_data::wal::WAL_TRUNCATE_MAX_COPY_FRAMES;
+    use std::time::Duration;
+
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let db = open_db(
+        &tmp_dir,
+        TestDbId("wal_remainder".to_string()),
+        holochain_data::HolochainDataConfig::new(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB NOT NULL)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let mut reader = db.pool().begin().await.unwrap();
+    let _: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+        .fetch_one(&mut *reader)
+        .await
+        .unwrap();
+
+    // More frames than a truncating checkpoint may copy, all newer than the
+    // reader's snapshot.
+    let rows = WAL_TRUNCATE_MAX_COPY_FRAMES + 512;
+    for id in 0..rows {
+        sqlx::query("INSERT INTO t (id, b) VALUES (?, ?)")
+            .bind(id)
+            .bind(vec![1u8; 4096])
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
+    let outcome = db
+        .wal_maintenance_pass(0, Duration::from_millis(200))
+        .await
+        .unwrap();
+    assert!(
+        outcome.passive.log_frames - outcome.passive.checkpointed_frames
+            > WAL_TRUNCATE_MAX_COPY_FRAMES,
+        "the pinned reader leaves a large remainder: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.truncate, None,
+        "no truncating checkpoint with a large remainder: {outcome:?}"
+    );
+
+    reader.rollback().await.unwrap();
+    let freed = db
+        .wal_maintenance_pass(0, Duration::from_millis(200))
+        .await
+        .unwrap();
+    assert!(
+        freed.passive.fully_backfilled(),
+        "with the reader gone the passive checkpoint copies everything: {freed:?}"
+    );
+    assert!(
+        matches!(freed.truncate, Some(t) if !t.busy),
+        "and the (now copy-free) truncation completes: {freed:?}"
+    );
+}

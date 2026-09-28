@@ -15,11 +15,13 @@
 //!   checkpoint has fully backfilled the log the WAL file is cut back to that
 //!   size when it is next reset, instead of staying at its high-water mark.
 //! - [`DbWrite::wal_maintenance_pass`] runs a `PASSIVE` checkpoint and, only
-//!   when the log is still large afterwards, a `TRUNCATE` checkpoint whose
-//!   wait for readers is capped at a short, explicit busy timeout (a
-//!   `TRUNCATE` blocks new writers while it waits, so the cap bounds the
-//!   stall). The caller runs it on a timer; it never waits unboundedly and it
-//!   reports a pinned WAL (`busy`) instead of hiding it.
+//!   when the log is still large afterwards and little of it is left to copy,
+//!   a `TRUNCATE` checkpoint whose wait for readers is capped at a short,
+//!   explicit busy timeout. A `TRUNCATE` blocks new writers while it waits
+//!   and while it copies, so both halves of the stall are bounded: the wait
+//!   by [`WAL_TRUNCATE_MAX_WAIT`], the copy by [`WAL_TRUNCATE_MAX_COPY_FRAMES`].
+//!   The caller runs it on a timer; it never waits unboundedly and it reports
+//!   a pinned WAL (`busy`) instead of hiding it.
 
 use crate::{DatabaseIdentifier, DbWrite, BUSY_TIMEOUT};
 use std::time::Duration;
@@ -35,6 +37,13 @@ pub const WAL_TRUNCATE_ABOVE_FRAMES: i64 = 16 * 1024;
 /// How long a truncating checkpoint may wait for readers (and so hold off new
 /// writers) before giving up.
 pub const WAL_TRUNCATE_MAX_WAIT: Duration = Duration::from_millis(1000);
+
+/// A truncating checkpoint also blocks new writers while it copies whatever
+/// the passive checkpoint could not. It is only attempted when that remainder
+/// is at most this many frames (about 16 MiB at 4 KiB pages), so the copy
+/// half of the writer stall is bounded too; a larger remainder (a reader
+/// pinning an old snapshot) is left to the next passive pass.
+pub const WAL_TRUNCATE_MAX_COPY_FRAMES: i64 = 4 * 1024;
 
 /// Which `PRAGMA wal_checkpoint` mode to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +117,8 @@ impl<I: DatabaseIdentifier> DbWrite<I> {
     }
 
     /// One bounded WAL maintenance step: a passive checkpoint, then — only if
-    /// the log still holds at least `truncate_above_frames` frames — a
+    /// the log still holds at least `truncate_above_frames` frames and at most
+    /// [`WAL_TRUNCATE_MAX_COPY_FRAMES`] of them are left to copy — a
     /// truncating checkpoint that waits at most `truncate_max_wait`.
     pub async fn wal_maintenance_pass(
         &self,
@@ -118,7 +128,11 @@ impl<I: DatabaseIdentifier> DbWrite<I> {
         let passive = self
             .wal_checkpoint(WalCheckpointMode::Passive, Duration::ZERO)
             .await?;
-        let truncate = if passive.log_frames >= truncate_above_frames && passive.log_frames > 0 {
+        let remainder = passive.log_frames - passive.checkpointed_frames;
+        let truncate = if passive.log_frames >= truncate_above_frames
+            && passive.log_frames > 0
+            && remainder <= WAL_TRUNCATE_MAX_COPY_FRAMES
+        {
             Some(
                 self.wal_checkpoint(WalCheckpointMode::Truncate, truncate_max_wait)
                     .await?,
