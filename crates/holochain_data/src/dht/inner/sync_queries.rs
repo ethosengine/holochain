@@ -924,6 +924,24 @@ pub(crate) const DHT_SYNC_INDEXES: &[&str] = &[
     // Sys-validation's chain-fork check (`get_actions_by_prev_hash`) runs per
     // incoming op and was a full `Action` scan.
     "CREATE INDEX IF NOT EXISTS elohim_Action_prev_hash_idx ON Action (prev_hash)",
+    // ELOHIM PATCH (fleet CPU storm, get path): the authority / cascade reads
+    // behind every zome `get`, `get_details` and `get_links`, and the receipt
+    // count behind every received validation receipt, filter on columns the
+    // 0.7 schema never indexed, so each was a full table scan returning 0-1
+    // rows. With the publish scans gone these were the dominant slow
+    // statements on the household mesh under scenario load.
+    "CREATE INDEX IF NOT EXISTS elohim_ChainOp_basis_idx ON ChainOp (basis_hash, op_type)",
+    "CREATE INDEX IF NOT EXISTS elohim_UpdatedRecord_original_action_idx
+        ON UpdatedRecord (original_action_hash)",
+    "CREATE INDEX IF NOT EXISTS elohim_UpdatedRecord_original_entry_idx
+        ON UpdatedRecord (original_entry_hash)",
+    "CREATE INDEX IF NOT EXISTS elohim_DeletedRecord_deletes_action_idx
+        ON DeletedRecord (deletes_action_hash)",
+    "CREATE INDEX IF NOT EXISTS elohim_DeletedRecord_deletes_entry_idx
+        ON DeletedRecord (deletes_entry_hash)",
+    "CREATE INDEX IF NOT EXISTS elohim_Link_base_idx ON Link (base_hash)",
+    "CREATE INDEX IF NOT EXISTS elohim_DeletedLink_create_idx ON DeletedLink (create_link_hash)",
+    "CREATE INDEX IF NOT EXISTS elohim_ValidationReceipt_op_idx ON ValidationReceipt (op_hash)",
 ];
 
 /// Ensure [`DHT_SYNC_INDEXES`] exist. Idempotent; on a large store that
@@ -1631,6 +1649,81 @@ mod tests {
         );
     }
 
+    /// The reads behind zome `get` / `get_details` / `get_links` and the
+    /// per-receipt count search an index, never scan their table.
+    #[tokio::test]
+    async fn get_path_and_receipt_reads_are_index_driven() {
+        let db = test_open_db(dht_id()).await.unwrap();
+        for (name, sql, n_binds, index) in [
+            (
+                "record/entry by basis",
+                "SELECT a.hash FROM ChainOp c JOIN Action a ON c.action_hash = a.hash
+                 WHERE c.basis_hash = ? AND c.op_type = ? AND c.validation_status = ?
+                   AND c.when_integrated IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM DeletedRecord d WHERE d.deletes_action_hash = a.hash)",
+                3,
+                "elohim_ChainOp_basis_idx",
+            ),
+            (
+                "deletes of a record",
+                "SELECT a.hash FROM DeletedRecord d JOIN Action a ON d.action_hash = a.hash
+                 JOIN ChainOp c ON c.action_hash = a.hash AND c.op_type = ?
+                 WHERE d.deletes_action_hash = ? AND c.locally_validated = 1",
+                2,
+                "elohim_DeletedRecord_deletes_action_idx",
+            ),
+            (
+                "updates of a record",
+                "SELECT a.hash FROM UpdatedRecord u JOIN Action a ON u.action_hash = a.hash
+                 JOIN ChainOp c ON c.action_hash = a.hash AND c.op_type = ?
+                 WHERE u.original_action_hash = ? AND c.locally_validated = 1",
+                2,
+                "elohim_UpdatedRecord_original_action_idx",
+            ),
+            (
+                "updates of an entry",
+                "SELECT action_hash FROM UpdatedRecord WHERE original_entry_hash = ?",
+                1,
+                "elohim_UpdatedRecord_original_entry_idx",
+            ),
+            (
+                "deletes of an entry",
+                "SELECT action_hash FROM DeletedRecord WHERE deletes_entry_hash = ?",
+                1,
+                "elohim_DeletedRecord_deletes_entry_idx",
+            ),
+            (
+                "links on a base",
+                "SELECT action_hash FROM Link WHERE base_hash = ?",
+                1,
+                "elohim_Link_base_idx",
+            ),
+            (
+                "deletes of a link",
+                "SELECT action_hash FROM DeletedLink WHERE create_link_hash = ?",
+                1,
+                "elohim_DeletedLink_create_idx",
+            ),
+            (
+                "receipt count",
+                "SELECT COUNT(*) FROM ValidationReceipt WHERE op_hash = ?",
+                1,
+                "elohim_ValidationReceipt_op_idx",
+            ),
+        ] {
+            let plan = query_plan(db.pool(), sql, n_binds).await;
+            assert!(
+                plan.iter()
+                    .any(|d| d.starts_with("SEARCH") && d.contains(index)),
+                "{name}: must search {index}, plan: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.starts_with("SCAN")),
+                "{name}: must not scan a table, plan: {plan:?}"
+            );
+        }
+    }
+
     /// The indexes exist after open and re-ensuring them is a no-op, so a
     /// store that predates them gains them on its next open and an older
     /// binary (which knows no such migration) still opens the file.
@@ -1652,7 +1745,15 @@ mod tests {
                 "elohim_Action_author_publish_idx",
                 "elohim_Action_prev_hash_idx",
                 "elohim_ChainOp_action_publish_idx",
+                "elohim_ChainOp_basis_idx",
                 "elohim_ChainOp_loc_sync_idx",
+                "elohim_DeletedLink_create_idx",
+                "elohim_DeletedRecord_deletes_action_idx",
+                "elohim_DeletedRecord_deletes_entry_idx",
+                "elohim_Link_base_idx",
+                "elohim_UpdatedRecord_original_action_idx",
+                "elohim_UpdatedRecord_original_entry_idx",
+                "elohim_ValidationReceipt_op_idx",
                 "elohim_WarrantOp_loc_idx",
             ]
         );
