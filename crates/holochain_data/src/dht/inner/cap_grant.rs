@@ -102,9 +102,9 @@ where
 ///   `COALESCE(e.blob, pe.blob)` / `get_entries_by_hashes(.., Some(author))`
 ///   union) is therefore incorrect: it can resolve a grant entry hash to a
 ///   public-table row that is not the author's real grant. **Do not reintroduce
-///   a public-first (or public-fallback) read here.** An `INNER JOIN` on
-///   `PrivateEntry` also drops a grant whose private entry is absent, matching
-///   the old `entries.get(&entry_hash)` -> `None` -> `continue`.
+///   a public-first (or public-fallback) read here.** A `LEFT JOIN` preserves
+///   actions whose private entry is absent until after action decoding; only
+///   then may that absence match the old `entries.get(&entry_hash)` skip.
 /// - One output row per surviving `CapGrant` row, so repeated entries stay
 ///   repeated exactly as the old `candidate_hashes` loop kept them.
 ///
@@ -122,7 +122,9 @@ where
 /// were driven from. Trusting the column alone would have been a fail-open
 /// inversion: `entry_hash` is a fixed-width value on the B-tree leaf while the
 /// variable-length `action_data` spills to overflow pages, so one bad block can
-/// corrupt the blob and leave the row perfectly readable.
+/// corrupt the blob and leave the row perfectly readable. The same rule holds
+/// when the private entry is missing or the indexed entry hash is NULL: neither
+/// condition may filter a corrupt action before it is decoded.
 ///
 /// One deliberate difference remains: a corrupt action belonging to an ALREADY
 /// REVOKED grant no longer errors the read, because the anti-joins filter that
@@ -144,21 +146,19 @@ where
                 pe.blob AS blob
          FROM CapGrant cg
          JOIN Action a ON cg.action_hash = a.hash
-         JOIN PrivateEntry pe ON pe.hash = a.entry_hash AND pe.author = ?2
+         LEFT JOIN PrivateEntry pe ON pe.hash = a.entry_hash AND pe.author = ?2
          WHERE cg.cap_access = ?1
            AND a.author = ?2
-           AND a.entry_hash IS NOT NULL
-           AND pe.blob IS NOT NULL
-           AND a.entry_hash NOT IN (
+           AND (a.entry_hash IS NULL OR a.entry_hash NOT IN (
                  SELECT u.original_entry_hash
                  FROM UpdatedRecord u
                  CROSS JOIN Action ua ON u.action_hash = ua.hash
-                 WHERE ua.author = ?2 AND u.original_entry_hash IS NOT NULL)
-           AND a.entry_hash NOT IN (
+                 WHERE ua.author = ?2 AND u.original_entry_hash IS NOT NULL))
+           AND (a.entry_hash IS NULL OR a.entry_hash NOT IN (
                  SELECT d.deletes_entry_hash
                  FROM DeletedRecord d
                  CROSS JOIN Action da ON d.action_hash = da.hash
-                 WHERE da.author = ?2 AND d.deletes_entry_hash IS NOT NULL)
+                 WHERE da.author = ?2 AND d.deletes_entry_hash IS NOT NULL))
          ORDER BY a.seq",
     )
     .bind(cap_access)
@@ -181,7 +181,9 @@ where
                 "cap grant action entry_hash column disagrees with its decoded ActionData",
             ))));
         }
-        entries.push(super::entry::decode_entry_blob(&row.blob)?);
+        if let Some(blob) = row.blob {
+            entries.push(super::entry::decode_entry_blob(&blob)?);
+        }
     }
     Ok(entries)
 }

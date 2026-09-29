@@ -67,9 +67,10 @@ pub(crate) struct LiveCapGrantRow {
     pub action: ActionRow,
     /// Serialized grant `Entry` blob, read from the author's `PrivateEntry`
     /// ONLY (a cap grant is always a private entry; the public `Entry` table is
-    /// deliberately not consulted — see `get_live_cap_grant_entries`). Never
-    /// `NULL`: the query filters absent entries out.
-    pub blob: Vec<u8>,
+    /// deliberately not consulted — see `get_live_cap_grant_entries`). `NULL`
+    /// means the private entry is absent; the action must be decoded before
+    /// that absence is skipped, so corruption still fails closed.
+    pub blob: Option<Vec<u8>>,
 }
 
 /// Row pairing an `Action` (flattened) with the joined `ChainOp.validation_status`.

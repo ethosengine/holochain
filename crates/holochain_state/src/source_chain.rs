@@ -4299,6 +4299,115 @@ mod tests {
         Ok(())
     }
 
+    /// Missing private bytes must not hide a corrupt indexed grant action.
+    /// The reference reader decodes that action before deciding its entry is
+    /// absent, so a later valid grant must not turn corruption into access.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_missing_private_entry_still_decodes_action() -> SourceChainResult<()> {
+        for corruption in ["signature", "action_data", "null_entry_hash"] {
+            let TestCase {
+                chain,
+                agent_key: alice,
+                dht_store,
+                keystore,
+            } = TestCase::new().await;
+
+            let bob = keystore.new_sign_keypair_random().await.unwrap();
+            let secret = secret_from(5_151);
+            let function: GrantedFunction = ("zome_a".into(), "fn_one".into());
+            let first = ZomeCallCapGrant::new(
+                "missing-private-first".into(),
+                CapAccess::Transferable { secret },
+                listed(&[("zome_a", "fn_one")]),
+            );
+            let second = ZomeCallCapGrant::new(
+                "valid-second".into(),
+                CapAccess::Transferable { secret },
+                listed(&[("zome_a", "fn_one")]),
+            );
+            let (first_action, first_entry) = put_cap_grant(&chain, &first).await?;
+            chain.flush(vec![DhtArc::Empty]).await.unwrap();
+            let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+            put_cap_grant(&chain, &second).await?;
+            chain.flush(vec![DhtArc::Empty]).await.unwrap();
+            let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+
+            sqlx::query("DELETE FROM PrivateEntry WHERE hash = ? AND author = ?")
+                .bind(first_entry.get_raw_36())
+                .bind(alice.get_raw_36())
+                .execute(dht_store.db().pool())
+                .await
+                .unwrap();
+
+            // Absence alone is a legitimate skip: the second grant works.
+            let new = dht_store
+                .as_read()
+                .valid_cap_grants(&alice, Some(&secret))
+                .await?;
+            let old = dht_store
+                .as_read()
+                .valid_cap_grants_reference(&alice, Some(&secret))
+                .await?;
+            assert_eq!(new, old, "{corruption}: missing bytes alone must match");
+            assert_eq!(new.len(), 1, "{corruption}: only the second grant remains");
+
+            match corruption {
+                "signature" => {
+                    sqlx::query("UPDATE Action SET signature = ? WHERE hash = ?")
+                        .bind(vec![0_u8; 3])
+                        .bind(first_action.get_raw_36())
+                        .execute(dht_store.db().pool())
+                        .await
+                        .unwrap();
+                }
+                "action_data" => {
+                    sqlx::query("UPDATE Action SET action_data = ? WHERE hash = ?")
+                        .bind(vec![0xFF_u8; 24])
+                        .bind(first_action.get_raw_36())
+                        .execute(dht_store.db().pool())
+                        .await
+                        .unwrap();
+                }
+                "null_entry_hash" => {
+                    sqlx::query(
+                        "UPDATE Action SET entry_hash = NULL, signature = ? WHERE hash = ?",
+                    )
+                    .bind(vec![0_u8; 3])
+                    .bind(first_action.get_raw_36())
+                    .execute(dht_store.db().pool())
+                    .await
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let new = dht_store
+                .as_read()
+                .valid_cap_grants(&alice, Some(&secret))
+                .await;
+            let old = dht_store
+                .as_read()
+                .valid_cap_grants_reference(&alice, Some(&secret))
+                .await;
+            assert!(
+                new.is_err(),
+                "{corruption}: optimized read must deny, got {new:?}"
+            );
+            assert!(
+                old.is_err(),
+                "{corruption}: reference read must deny, got {old:?}"
+            );
+            assert!(
+                chain
+                    .valid_cap_grant(function.clone(), bob.clone(), Some(secret))
+                    .await
+                    .is_err(),
+                "{corruption}: later valid grant must not authorize"
+            );
+        }
+        Ok(())
+    }
+
     /// Structural guard against the regression this change removes: the old
     /// lookup paid `3N + ceil(N/500) + 1` queries (and as many pool
     /// acquisitions) for `N` grants of a class; the new one pays exactly one
