@@ -1846,6 +1846,111 @@ mod tests {
         );
     }
 
+    /// Oversized gossip/fetch requests must retain admission and serving semantics.
+    /// 33,000 unique misses exceed even SQLite's modern 32,766-variable limit;
+    /// matching hashes on both sides of chunk boundaries also check deduplication.
+    #[tokio::test]
+    async fn oversized_fetch_queries_preserve_admission_and_wire_filters() {
+        let (db, public, private, record) = seed_filter_fixture().await;
+        let cached = seed_op(db.pool(), 4, STORE_RECORD, 0, 4000).await;
+        sqlx::query("UPDATE ChainOp SET locally_validated = 0 WHERE hash = ?")
+            .bind(&cached)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let limbo = seed_limbo_chain_op(db.pool(), 5, 5000, false).await;
+        let warrant = seed_warrant_op(db.pool(), 6, 6000, DumpOpState::Integrated).await;
+        let limbo_warrant = seed_warrant_op(db.pool(), 7, 7000, DumpOpState::ValidationLimbo).await;
+        let fixture = vec![
+            public.clone(),
+            private.clone(),
+            record.clone(),
+            cached,
+            limbo.clone(),
+            warrant.clone(),
+            limbo_warrant.clone(),
+        ];
+        let mut requested = fixture.clone();
+        requested.extend((0..33_000_u32).map(|i| {
+            let mut hash = vec![255; 36];
+            hash[..4].copy_from_slice(&i.to_le_bytes());
+            hash
+        }));
+        requested.extend(fixture);
+        let mut present = db
+            .as_ref()
+            .check_op_hashes_present(&requested)
+            .await
+            .unwrap();
+        present.sort_by(|a, b| a.hash.cmp(&b.hash));
+        let mut expected = vec![
+            public.clone(),
+            private,
+            record.clone(),
+            limbo.clone(),
+            warrant.clone(),
+            limbo_warrant.clone(),
+        ];
+        expected.sort();
+        assert_eq!(
+            present.iter().map(|r| r.hash.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        // Basis hashes are carried through unchanged from each source table.
+        assert_eq!(
+            present.iter().find(|r| r.hash == limbo).unwrap().basis_hash,
+            vec![55; 36]
+        );
+        assert_eq!(
+            present
+                .iter()
+                .find(|r| r.hash == warrant)
+                .unwrap()
+                .basis_hash,
+            vec![46; 36]
+        );
+        assert_eq!(
+            present
+                .iter()
+                .find(|r| r.hash == limbo_warrant)
+                .unwrap()
+                .basis_hash,
+            vec![47; 36]
+        );
+
+        let mut wire: Vec<_> = db
+            .as_ref()
+            .get_chain_ops_for_wire(&requested)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op_hash)
+            .collect();
+        wire.sort();
+        assert_eq!(wire, vec![public, record]);
+        let warrants = db.as_ref().get_warrants_for_wire(&requested).await.unwrap();
+        assert_eq!(warrants.len(), 1);
+        assert_eq!(warrants[0].hash, warrant);
+        assert!(db
+            .as_ref()
+            .check_op_hashes_present(&[])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .as_ref()
+            .get_chain_ops_for_wire(&[])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .as_ref()
+            .get_warrants_for_wire(&[])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn earliest_timestamp_ignores_private_store_entry() {
         let (db, _public, _private, _record) = seed_filter_fixture().await;

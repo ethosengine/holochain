@@ -10,6 +10,11 @@ use crate::models::dht::{
 #[cfg(any(test, feature = "inspection"))]
 use holo_hash::AnyLinkableHash;
 use holo_hash::{AgentPubKey, DhtOpHash};
+use std::collections::HashSet;
+
+// Fetch admission binds each hash three times (limbo, validated, warrant).
+// 256 hashes stay below even SQLite builds with the older 999-variable limit.
+const FETCH_HASH_BATCH_SIZE: usize = 256;
 
 impl DbRead<Dht> {
     /// `(hash, basis, size)` for every integrated, locally-validated op
@@ -63,7 +68,18 @@ impl DbRead<Dht> {
         op_hashes: &[Vec<u8>],
     ) -> sqlx::Result<Vec<K2OpPresentRow>> {
         let mut conn = self.timed_conn().await?;
-        sync_queries::check_op_hashes_present(&mut *conn, op_hashes).await
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        for batch in op_hashes.chunks(FETCH_HASH_BATCH_SIZE) {
+            rows.extend(
+                sync_queries::check_op_hashes_present(&mut *conn, batch)
+                    .await?
+                    .into_iter()
+                    // Preserve IN/UNION set semantics across chunk boundaries.
+                    .filter(|row| seen.insert((row.hash.clone(), row.basis_hash.clone()))),
+            );
+        }
+        Ok(rows)
     }
 
     /// Full chain-op rows (joined with `Action` and optional `Entry`) for
@@ -73,7 +89,18 @@ impl DbRead<Dht> {
         op_hashes: &[Vec<u8>],
     ) -> sqlx::Result<Vec<K2ChainOpForWireRow>> {
         let mut conn = self.timed_conn().await?;
-        sync_queries::get_chain_ops_for_wire(&mut *conn, op_hashes).await
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        for batch in op_hashes.chunks(FETCH_HASH_BATCH_SIZE) {
+            rows.extend(
+                sync_queries::get_chain_ops_for_wire(&mut *conn, batch)
+                    .await?
+                    .into_iter()
+                    // Preserve IN/UNION set semantics across chunk boundaries.
+                    .filter(|row| seen.insert(row.op_hash.clone())),
+            );
+        }
+        Ok(rows)
     }
 
     /// Full warrant rows for the given op hashes.
@@ -82,7 +109,18 @@ impl DbRead<Dht> {
         op_hashes: &[Vec<u8>],
     ) -> sqlx::Result<Vec<K2WarrantForWireRow>> {
         let mut conn = self.timed_conn().await?;
-        sync_queries::get_warrants_for_wire(&mut *conn, op_hashes).await
+        let mut rows = Vec::new();
+        let mut seen = HashSet::new();
+        for batch in op_hashes.chunks(FETCH_HASH_BATCH_SIZE) {
+            rows.extend(
+                sync_queries::get_warrants_for_wire(&mut *conn, batch)
+                    .await?
+                    .into_iter()
+                    // Preserve IN/UNION set semantics across chunk boundaries.
+                    .filter(|row| seen.insert(row.hash.clone())),
+            );
+        }
+        Ok(rows)
     }
 
     /// Earliest authored timestamp across both tables within the arc, or
