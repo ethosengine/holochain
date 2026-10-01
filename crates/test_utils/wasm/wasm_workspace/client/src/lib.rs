@@ -15,7 +15,7 @@ fn bar(_: ()) -> ExternResult<TestString> {
 
 #[hdk_extern]
 fn emitter(_: ()) -> ExternResult<TestString> {
-    match emit_signal(&TestString("i am a signal".to_string())) {
+    match emit_signal(TestString("i am a signal".to_string())) {
         Ok(()) => Ok(TestString("bar".to_string())),
         Err(e) => Err(e),
     }

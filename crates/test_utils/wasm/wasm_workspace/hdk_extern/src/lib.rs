@@ -8,7 +8,7 @@ fn foo(_: ()) -> ExternResult<String> {
 #[hdk_extern]
 fn bar(_: ()) -> ExternResult<String> {
     // It should be possible to call our extern functions just like regular functions.
-    #[allow(clippy::blacklisted_name)]
+    #[allow(clippy::disallowed_names)]
     let foo: String = foo(())?;
     Ok(format!("{}{}", foo, "bar"))
 }

@@ -34,13 +34,14 @@ pub fn msg_private() -> EntryTypes {
 
 #[hdk_extern]
 fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
-    match op {
-        Op::CreateEntry(CreateEntry { action, entry }) => match action.hashed.app_entry_def() {
-            Some(AppEntryDef {
-                entry_index: entry_def_index,
-                zome_index,
-                ..
-            }) => match EntryTypes::deserialize_from_type(*zome_index, *entry_def_index, &entry)? {
+    if let Op::CreateEntry(CreateEntry { action, entry }) = op {
+        if let Some(AppEntryDef {
+            entry_index: entry_def_index,
+            zome_index,
+            ..
+        }) = action.hashed.app_entry_def()
+        {
+            match EntryTypes::deserialize_from_type(*zome_index, *entry_def_index, &entry)? {
                 Some(EntryTypes::Post(Post(p))) => {
                     if p != "foo" {
                         return Ok(ValidateCallbackResult::Invalid("because".into()));
@@ -49,10 +50,8 @@ fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
                 Some(EntryTypes::Msg(_)) => (),
                 Some(EntryTypes::MsgPrivate(_)) => (),
                 None => (),
-            },
-            _ => (),
-        },
-        _ => (),
+            }
+        }
     }
     Ok(ValidateCallbackResult::Valid)
 }

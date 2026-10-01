@@ -39,7 +39,7 @@ fn post_commit(shhs: Vec<SignedActionHashed>) {
                 zome_info().unwrap().name,
                 "ping".to_string().into(),
                 None,
-                &agent_info().unwrap().agent_initial_pubkey,
+                agent_info().unwrap().agent_initial_pubkey,
             )
             .unwrap();
         }

@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use hdk::prelude::*;
+use std::collections::HashSet;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct CapFor(CapSecret, AgentPubKey);
@@ -83,7 +83,7 @@ fn try_cap_claim(cap_for: crate::CapFor) -> ExternResult<ZomeCallResponse> {
         zome_info()?.name,
         "needs_cap_claim".to_string().into(),
         Some(cap_for.0),
-        &(),
+        (),
     )
 }
 
@@ -111,7 +111,7 @@ fn send_assigned_cap_claim(agent: AgentPubKey) -> ExternResult<()> {
         this_zome,
         "accept_cap_claim".into(),
         None,
-        &CapClaim::new(tag, agent_info()?.agent_initial_pubkey, secret),
+        CapClaim::new(tag, agent_info()?.agent_initial_pubkey, secret),
     )?;
     Ok(())
 }

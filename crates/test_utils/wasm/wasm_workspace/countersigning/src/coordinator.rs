@@ -22,9 +22,7 @@ fn create_countersigned(
     let entry_def_index = ScopedEntryDefIndex::try_from(&thing)?;
     let visibility = EntryVisibility::from(&thing);
 
-    let thing = match thing {
-        EntryTypes::Thing(t) => t,
-    };
+    let EntryTypes::Thing(thing) = thing;
 
     let entry = Entry::CounterSign(
         Box::new(
@@ -151,7 +149,9 @@ fn must_get_valid_record(action_hash: ActionHash) -> ExternResult<Record> {
 }
 
 #[hdk_extern]
-fn get_agent_activity(input: GetAgentActivityInput) -> ExternResult<holochain_zome_types::prelude::AgentActivityStatus> {
+fn get_agent_activity(
+    input: GetAgentActivityInput,
+) -> ExternResult<holochain_zome_types::prelude::AgentActivityStatus> {
     HDK.with(|h| h.borrow().get_agent_activity(input))
 }
 
@@ -162,6 +162,6 @@ fn schedule_signal() -> ExternResult<()> {
 
 #[hdk_extern(infallible)]
 fn scheduled_fn(_: Option<Schedule>) -> Option<Schedule> {
-    emit_signal("scheduled hello");
+    let _ = emit_signal("scheduled hello");
     Some(Schedule::from("*/1 * * * * *".to_string()))
 }

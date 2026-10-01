@@ -1,9 +1,9 @@
-use std::collections::HashSet;
 use hdk::prelude::*;
 use integrity_zome::EntryTypes;
 use integrity_zome::Msg;
 use integrity_zome::Post;
 use integrity_zome::PrivMsg;
+use std::collections::HashSet;
 use test_wasm_integrity_zome as integrity_zome;
 
 fn post() -> Post {
@@ -84,7 +84,12 @@ fn create_priv_msg(_: ()) -> ExternResult<ActionHash> {
 fn get_activity(
     input: holochain_test_wasm_common::AgentActivitySearch,
 ) -> ExternResult<holochain_zome_types::prelude::AgentActivityStatus> {
-    get_agent_activity(input.agent, input.query, input.request, GetOptions::default())
+    get_agent_activity(
+        input.agent,
+        input.query,
+        input.request,
+        GetOptions::default(),
+    )
 }
 
 #[hdk_extern]
@@ -116,7 +121,7 @@ fn call_create_entry(_: ()) -> ExternResult<ActionHash> {
         zome_info()?.name,
         "create_entry".to_string().into(),
         None,
-        &(),
+        (),
     )?;
 
     match zome_call_response {
@@ -147,7 +152,7 @@ fn call_create_entry_remotely(agent: AgentPubKey) -> ExternResult<ActionHash> {
         zome_info()?.name,
         "create_entry".to_string().into(),
         None,
-        &(),
+        (),
     )?;
 
     match zome_call_response {
@@ -184,7 +189,7 @@ fn call_create_entry_remotely_no_rec(agent: AgentPubKey) -> ExternResult<ActionH
         zome_info()?.name,
         "create_entry".to_string().into(),
         None,
-        &(),
+        (),
     )?;
 
     match zome_call_response {

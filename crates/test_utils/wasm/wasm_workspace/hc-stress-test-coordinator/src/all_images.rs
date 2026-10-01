@@ -9,7 +9,7 @@ pub fn get_all_images(_: ()) -> ExternResult<Vec<ActionHash>> {
     )?;
     let get_input: Vec<GetInput> = links
         .into_iter()
-        .map(|link| {
+        .filter_map(|link| {
             let target_hash = match link.target.into_any_dht_hash() {
                 Some(hash) => hash,
                 None => return None,
@@ -17,12 +17,11 @@ pub fn get_all_images(_: ()) -> ExternResult<Vec<ActionHash>> {
 
             Some(GetInput::new(target_hash, GetOptions::default()))
         })
-        .filter_map(|l| l)
         .collect();
     let records = HDK.with(|hdk| hdk.borrow().get(get_input))?;
     let hashes: Vec<ActionHash> = records
         .into_iter()
-        .filter_map(|r| r)
+        .flatten()
         .map(|r| r.action_address().clone())
         .collect();
     Ok(hashes)

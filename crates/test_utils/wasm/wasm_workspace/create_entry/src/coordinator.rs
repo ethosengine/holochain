@@ -132,7 +132,7 @@ fn call_create_entry(_: ()) -> ExternResult<ActionHash> {
         zome_info()?.name,
         "create_entry".to_string().into(),
         None,
-        &(),
+        (),
     )?;
 
     match zome_call_response {
@@ -163,7 +163,7 @@ fn call_create_entry_remotely(agent: AgentPubKey) -> ExternResult<ActionHash> {
         zome_info()?.name,
         "create_entry".to_string().into(),
         None,
-        &(),
+        (),
     )?;
 
     match zome_call_response {
@@ -200,7 +200,7 @@ fn call_create_entry_remotely_no_rec(agent: AgentPubKey) -> ExternResult<ActionH
         zome_info()?.name,
         "create_entry".to_string().into(),
         None,
-        &(),
+        (),
     )?;
 
     match zome_call_response {

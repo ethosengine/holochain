@@ -1,7 +1,7 @@
-use std::collections::HashSet;
 use crate::integrity::*;
 use hdi::prelude::__hc__dna_info_1;
 use hdk::prelude::*;
+use std::collections::HashSet;
 use yaml_serde::Value;
 
 #[hdk_extern]
@@ -41,7 +41,7 @@ fn remote_call_info(agent: AgentPubKey) -> ExternResult<CallInfo> {
         hdk::prelude::zome_info()?.name,
         "call_info".to_string().into(),
         None,
-        &(),
+        (),
     )? {
         ZomeCallResponse::Ok(extern_io) => Ok(extern_io.decode().map_err(|e| wasm_error!(e))?),
         not_ok => {

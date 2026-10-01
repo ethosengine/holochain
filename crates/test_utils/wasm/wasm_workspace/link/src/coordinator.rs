@@ -297,7 +297,7 @@ fn get_count(link_query: LinkQuery) -> ExternResult<usize> {
 
 #[hdk_extern]
 fn get_links_with_query(link_query: LinkQuery) -> ExternResult<Vec<Link>> {
-    Ok(hdk::prelude::get_links(link_query, GetStrategy::default())?)
+    hdk::prelude::get_links(link_query, GetStrategy::default())
 }
 
 #[hdk_extern]

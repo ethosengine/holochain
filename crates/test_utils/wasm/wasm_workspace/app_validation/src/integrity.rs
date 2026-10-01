@@ -21,25 +21,23 @@ pub enum LinkTypes {
 #[hdk_extern]
 pub fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
     match op.flattened::<EntryTypes, LinkTypes>()? {
-        FlatOp::CreateRecord(store_record) => {
-            match store_record {
-                OpRecord::CreateLink { action, .. } => {
-                    let target_address = action.data.target_address.clone();
-                    let action_hash = target_address.into_action_hash().ok_or(wasm_error!(
-                        WasmErrorInner::Guest("No action hash associated with link".to_string())
-                    ))?;
-                    let record = must_get_valid_record(action_hash)?;
-                    let _post: Post = record
-                        .entry()
-                        .to_app_option()
-                        .map_err(|e| wasm_error!(e))?
-                        .ok_or(wasm_error!(WasmErrorInner::Guest(
-                            "Linked action must reference an entry".to_string()
-                        )))?;
-                    Ok(ValidateCallbackResult::Valid)
-                }
-                _ => Ok(ValidateCallbackResult::Valid),
-            }
+        FlatOp::CreateRecord(OpRecord::CreateLink { action, .. }) => {
+            let target_address = action.data.target_address.clone();
+            let action_hash =
+                target_address
+                    .into_action_hash()
+                    .ok_or(wasm_error!(WasmErrorInner::Guest(
+                        "No action hash associated with link".to_string()
+                    )))?;
+            let record = must_get_valid_record(action_hash)?;
+            let _post: Post = record
+                .entry()
+                .to_app_option()
+                .map_err(|e| wasm_error!(e))?
+                .ok_or(wasm_error!(WasmErrorInner::Guest(
+                    "Linked action must reference an entry".to_string()
+                )))?;
+            Ok(ValidateCallbackResult::Valid)
         }
         _ => Ok(ValidateCallbackResult::Valid),
     }

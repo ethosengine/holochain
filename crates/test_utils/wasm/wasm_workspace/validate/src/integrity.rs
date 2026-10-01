@@ -66,9 +66,9 @@ impl TryFrom<&ThisWasmEntry> for ScopedEntryDefIndex {
 
 #[hdk_extern]
 pub fn entry_defs(_: ()) -> ExternResult<EntryDefsCallbackResult> {
-    Ok(EntryDefsCallbackResult::from(vec![EntryDef::from(
+    Ok(EntryDefsCallbackResult::from(vec![
         ThisWasmEntry::ENTRY_DEFS[0].clone(),
-    )]))
+    ]))
 }
 
 #[no_mangle]

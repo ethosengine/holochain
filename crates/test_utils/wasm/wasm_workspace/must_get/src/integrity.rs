@@ -31,8 +31,8 @@ pub enum EntryTypes {
 
 #[hdk_extern]
 fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
-    match op.flattened::<_, ()>()? {
-        FlatOp::CreateEntry(e) => match e {
+    if let FlatOp::CreateEntry(e) = op.flattened::<_, ()>()? {
+        match e {
             OpEntry::CreateEntry {
                 app_entry: EntryTypes::SelfAgentsChain(_),
                 action,
@@ -94,8 +94,7 @@ fn validate(op: Op) -> ExternResult<ValidateCallbackResult> {
                 }
             }
             _ => (),
-        },
-        _ => (),
+        }
     }
 
     Ok(ValidateCallbackResult::Valid)

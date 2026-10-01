@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use hdk::prelude::*;
+use std::collections::HashSet;
 
 enum Zomes {
     CreateEntry,
@@ -44,7 +44,7 @@ fn whoarethey(agent_pubkey: AgentPubKey) -> ExternResult<AgentInfo> {
         zome_info()?.name,
         "whoami".to_string().into(),
         None,
-        &(),
+        (),
     )?;
     match zome_call_response {
         // The decode() type needs to match the return type of "whoami"
@@ -67,7 +67,7 @@ fn who_are_they_local(cell_id: CellId) -> ExternResult<AgentInfo> {
         zome_info()?.name,
         "whoami".to_string().into(),
         None,
-        &(),
+        (),
     )?;
     match zome_call_response {
         ZomeCallResponse::Ok(v) => Ok(v.decode().map_err(|e| wasm_error!(e))?),
@@ -86,7 +86,7 @@ fn who_are_they_role(role_name: RoleName) -> ExternResult<AgentInfo> {
         zome_info()?.name,
         "whoami".to_string().into(),
         None,
-        &(),
+        (),
     )?;
     match zome_call_response {
         ZomeCallResponse::Ok(v) => Ok(v.decode().map_err(|e| wasm_error!(e))?),
@@ -105,7 +105,7 @@ fn who_are_they_role_secret((role_name, secret): (RoleName, CapSecret)) -> Exter
         zome_info()?.name,
         "whoami".to_string().into(),
         Some(secret),
-        &(),
+        (),
     )?;
     match zome_call_response {
         ZomeCallResponse::Ok(v) => Ok(v.decode().map_err(|e| wasm_error!(e))?),
@@ -127,7 +127,7 @@ fn call_create_entry(cell_id: CellId) -> ExternResult<ActionHash> {
         Zomes::CreateEntry,
         "create_entry".to_string().into(),
         None,
-        &(),
+        (),
     )?;
     match zome_call_response {
         ZomeCallResponse::Ok(v) => Ok(v.decode().map_err(|e| wasm_error!(e))?),
