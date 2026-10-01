@@ -3,8 +3,8 @@
 use crate::models::dht::{ActionRow, AgentActivityItem, AgentActivityRow, ValidatedActionRow};
 use holo_hash::{ActionHash, AgentPubKey, AnyLinkableHash, EntryHash, HoloHashed};
 use holochain_integrity_types::prelude::{
-    Action, ActionData, ActionHeader, Entry, EntryVisibility, RecordValidity, Signature,
-    SignedHashed,
+    Action, ActionData, ActionHeader, ActionType, Entry, EntryVisibility, RecordValidity,
+    Signature, SignedHashed,
 };
 use holochain_zome_types::prelude::{ChainOpType, SignedActionHashed};
 use sqlx::{Executor, QueryBuilder, Sqlite};
@@ -132,6 +132,138 @@ where
     .fetch_all(executor)
     .await?;
     rows.into_iter().map(row_to_signed_action_hashed).collect()
+}
+
+/// Most entry hashes [`AuthorChainPrefilter::entry_hashes`] pushes into SQL.
+///
+/// Each hash is one bound parameter; above this the set is left to the
+/// caller's own filter (the pre-filter is only ever a narrowing, so skipping it
+/// is always correct, just not cheaper).
+pub const MAX_PREFILTER_ENTRY_HASHES: usize = 500;
+
+/// A narrowing pre-filter for an author's accepted source-chain read
+/// ([`get_actions_by_author_filtered`]).
+///
+/// Every field is a per-row predicate that only ever REMOVES rows, and each
+/// mirrors a column written from the action itself at insert time
+/// ([`insert_action`]). A caller that re-applies its complete filter to the
+/// result therefore gets exactly the rows it would have got from filtering the
+/// unfiltered read — the pre-filter moves cost, never meaning.
+///
+/// It must not be used for a filter that is not a per-row predicate (for
+/// example a fork-disambiguating walk along `prev_action`), because removing a
+/// row there can break the walk rather than merely drop the row.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuthorChainPrefilter<'a> {
+    /// Inclusive `(start, end)` bounds on `seq`. `start > end` selects nothing.
+    pub seq_range: Option<(u32, u32)>,
+    /// Keep only actions whose `action_type` is one of these. An empty slice
+    /// selects nothing.
+    pub action_types: Option<&'a [ActionType]>,
+    /// Keep only actions carrying one of these entry hashes (an action with
+    /// no entry never matches). An empty slice selects nothing. Ignored —
+    /// left to the caller — above [`MAX_PREFILTER_ENTRY_HASHES`].
+    pub entry_hashes: Option<&'a [EntryHash]>,
+}
+
+impl AuthorChainPrefilter<'_> {
+    /// Whether the pre-filter provably selects no row, so no query is needed.
+    fn selects_nothing(&self) -> bool {
+        self.seq_range.is_some_and(|(start, end)| start > end)
+            || self.action_types.is_some_and(<[ActionType]>::is_empty)
+            || self.entry_hashes.is_some_and(<[EntryHash]>::is_empty)
+    }
+}
+
+/// Build the author chain read. `prefix` is empty in production; tests pass
+/// `EXPLAIN QUERY PLAN ` to inspect exactly the statement that runs.
+pub(crate) fn author_chain_query(
+    prefix: &str,
+    author: &AgentPubKey,
+    filter: AuthorChainPrefilter<'_>,
+) -> QueryBuilder<Sqlite> {
+    let mut query = QueryBuilder::<Sqlite>::new(prefix);
+    query.push(
+        "SELECT hash, author, seq, prev_hash, timestamp, action_type,
+                action_data, signature, entry_hash, private_entry, record_validity
+         FROM Action WHERE author = ",
+    );
+    query.push_bind(author.get_raw_36().to_vec());
+    query.push(" AND record_validity = ");
+    query.push_bind(i64::from(RecordValidity::Accepted));
+    if let Some((start, end)) = filter.seq_range {
+        query.push(" AND seq >= ");
+        query.push_bind(i64::from(start));
+        query.push(" AND seq <= ");
+        query.push_bind(i64::from(end));
+    }
+    if let Some(action_types) = filter.action_types {
+        query.push(" AND action_type IN (");
+        let mut sep = query.separated(", ");
+        for action_type in action_types {
+            sep.push_bind(i64::from(*action_type));
+        }
+        query.push(")");
+    }
+    if let Some(entry_hashes) = filter
+        .entry_hashes
+        .filter(|hashes| hashes.len() <= MAX_PREFILTER_ENTRY_HASHES)
+    {
+        query.push(" AND entry_hash IN (");
+        let mut sep = query.separated(", ");
+        for entry_hash in entry_hashes {
+            sep.push_bind(entry_hash.get_raw_36().to_vec());
+        }
+        query.push(")");
+    }
+    query.push(" ORDER BY seq ASC");
+    query
+}
+
+/// The author's committed source chain narrowed by `filter`, ordered by
+/// sequence.
+///
+/// Same row set and order as [`get_actions_by_author`] restricted to the rows
+/// `filter` keeps. With a `seq_range` the read is served by
+/// `elohim_Action_author_seq_idx` and costs the size of the range, not the
+/// length of the chain.
+pub(crate) async fn get_actions_by_author_filtered<'e, E>(
+    executor: E,
+    author: &AgentPubKey,
+    filter: AuthorChainPrefilter<'_>,
+) -> sqlx::Result<Vec<SignedActionHashed>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    if filter.selects_nothing() {
+        return Ok(Vec::new());
+    }
+    let rows = author_chain_query("", author, filter)
+        .build_query_as::<ActionRow>()
+        .fetch_all(executor)
+        .await?;
+    rows.into_iter().map(row_to_signed_action_hashed).collect()
+}
+
+// ELOHIM PATCH (range-bounded chain reads): the 0.7 DHT schema has no index on
+// `Action (author, seq)`, so every read of one author's chain — a zome call's
+// `query`, the chain head lookup, genesis checks — scanned the whole `Action`
+// table, which on an authority node holds every author it stores, not just its
+// own agent. Created idempotently at open, not as a sqlx migration, for the
+// same rollback-safety reason as `sync_queries::DHT_SYNC_INDEXES`.
+/// `CREATE INDEX IF NOT EXISTS` statements for per-author chain reads.
+pub(crate) const ACTION_CHAIN_INDEXES: &[&str] =
+    &["CREATE INDEX IF NOT EXISTS elohim_Action_author_seq_idx ON Action (author, seq)"];
+
+/// Ensure [`ACTION_CHAIN_INDEXES`] exist. Idempotent.
+pub(crate) async fn ensure_chain_read_indexes<'e, E>(executor: E) -> sqlx::Result<()>
+where
+    E: Executor<'e, Database = Sqlite> + Copy,
+{
+    for stmt in ACTION_CHAIN_INDEXES {
+        sqlx::query(*stmt).execute(executor).await?;
+    }
+    Ok(())
 }
 
 /// Fetch an exclusive page of accepted actions authored by `author`.

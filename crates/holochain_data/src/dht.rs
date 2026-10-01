@@ -18,6 +18,7 @@ mod inner;
 mod tx_operations;
 
 pub use db_operations::ChainWritePermit;
+pub use inner::action::{AuthorChainPrefilter, MAX_PREFILTER_ENTRY_HASHES};
 pub use inner::chain_op::InsertChainOp;
 pub use inner::deleted_link::InsertDeletedLink;
 pub use inner::deleted_record::InsertDeletedRecord;
@@ -34,6 +35,12 @@ pub use inner::warrant::InsertWarrant;
 /// See `inner::sync_queries::DHT_SYNC_INDEXES`.
 pub(crate) async fn ensure_sync_indexes(pool: &sqlx::Pool<sqlx::Sqlite>) -> sqlx::Result<()> {
     inner::sync_queries::ensure_sync_indexes(pool).await
+}
+
+/// ELOHIM PATCH: create the per-author chain-read index on an opened DHT
+/// database. See `inner::action::ACTION_CHAIN_INDEXES`.
+pub(crate) async fn ensure_chain_read_indexes(pool: &sqlx::Pool<sqlx::Sqlite>) -> sqlx::Result<()> {
+    inner::action::ensure_chain_read_indexes(pool).await
 }
 
 #[cfg(test)]
@@ -176,6 +183,219 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// An accepted chain action for author `[1; 36]` at `seq`: the genesis
+    /// `Dna` at 0, then a `Create` (entry hash `[seq; 36]`) on even sequences
+    /// and an `InitZomesComplete` on odd ones. Hashes are `[0x40 + seq; 36]` so
+    /// they never collide with [`sample_action`].
+    fn prefilter_action(seq: u8) -> SignedActionHashed {
+        use holochain_integrity_types::prelude::{CreateData, EntryType};
+        let data = if seq == 0 {
+            ActionData::Dna(DnaData {
+                dna_hash: DnaHash::from_raw_36(vec![0u8; 36]),
+            })
+        } else if seq.is_multiple_of(2) {
+            ActionData::Create(CreateData {
+                entry_type: EntryType::AgentPubKey,
+                entry_hash: EntryHash::from_raw_36(vec![seq; 36]),
+            })
+        } else {
+            ActionData::InitZomesComplete(InitZomesCompleteData {})
+        };
+        let action = Action {
+            header: ActionHeader {
+                author: AgentPubKey::from_raw_36(vec![1u8; 36]),
+                timestamp: Timestamp::from_micros(1_000_000 + seq as i64),
+                action_seq: seq as u32,
+                prev_action: (seq > 0).then(|| ActionHash::from_raw_36(vec![0x40 + seq - 1; 36])),
+            },
+            data,
+        };
+        let hashed =
+            HoloHashed::with_pre_hashed(action, ActionHash::from_raw_36(vec![0x40 + seq; 36]));
+        SignedHashed::with_presigned(hashed, Signature([seq; 64]))
+    }
+
+    /// The filtered read is the unfiltered read narrowed by exactly the
+    /// per-row predicates of the pre-filter — same rows, same order — for
+    /// every field alone and combined, including the degenerate shapes.
+    #[tokio::test]
+    async fn actions_by_author_filtered_is_the_unfiltered_read_narrowed() {
+        use holochain_integrity_types::prelude::ActionType;
+
+        let db = test_open_db(dht_db_id()).await.unwrap();
+        let author = AgentPubKey::from_raw_36(vec![1u8; 36]);
+        for seq in 0..20u8 {
+            db.insert_action(&prefilter_action(seq), Some(RecordValidity::Accepted))
+                .await
+                .unwrap();
+        }
+        // Never part of the committed chain: a pending row of the same author,
+        // and another author's row in range.
+        db.insert_action(&prefilter_action(20), None).await.unwrap();
+        let other = SignedHashed::with_presigned(
+            HoloHashed::with_pre_hashed(
+                Action {
+                    header: ActionHeader {
+                        author: AgentPubKey::from_raw_36(vec![0x99; 36]),
+                        timestamp: Timestamp::from_micros(2_000_000),
+                        action_seq: 5,
+                        prev_action: Some(ActionHash::from_raw_36(vec![0xED; 36])),
+                    },
+                    data: ActionData::InitZomesComplete(InitZomesCompleteData {}),
+                },
+                ActionHash::from_raw_36(vec![0xEE; 36]),
+            ),
+            Signature([0xEE; 64]),
+        );
+        db.insert_action(&other, Some(RecordValidity::Accepted))
+            .await
+            .unwrap();
+
+        let all = db
+            .as_ref()
+            .get_actions_by_author(author.clone())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 20);
+
+        let present = EntryHash::from_raw_36(vec![6u8; 36]);
+        let also_present = EntryHash::from_raw_36(vec![14u8; 36]);
+        let absent = EntryHash::from_raw_36(vec![7u8; 36]);
+        let creates = [ActionType::Create];
+        let genesis_like = [ActionType::Dna, ActionType::InitZomesComplete];
+        let hashes = [present.clone(), also_present.clone(), absent.clone()];
+        let too_many: Vec<EntryHash> = (0..=MAX_PREFILTER_ENTRY_HASHES)
+            .map(|i| {
+                let mut raw = vec![0u8; 36];
+                raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                raw[35] = 0xF0;
+                EntryHash::from_raw_36(raw)
+            })
+            .chain([present.clone()])
+            .collect();
+
+        let cases: Vec<AuthorChainPrefilter<'_>> = vec![
+            AuthorChainPrefilter::default(),
+            AuthorChainPrefilter {
+                seq_range: Some((3, 9)),
+                ..Default::default()
+            },
+            AuthorChainPrefilter {
+                seq_range: Some((0, 0)),
+                ..Default::default()
+            },
+            AuthorChainPrefilter {
+                seq_range: Some((15, 400)),
+                ..Default::default()
+            },
+            AuthorChainPrefilter {
+                seq_range: Some((9, 3)),
+                ..Default::default()
+            },
+            AuthorChainPrefilter {
+                seq_range: Some((30, 40)),
+                ..Default::default()
+            },
+            AuthorChainPrefilter {
+                action_types: Some(&creates),
+                ..Default::default()
+            },
+            AuthorChainPrefilter {
+                action_types: Some(&genesis_like),
+                seq_range: Some((0, 5)),
+                ..Default::default()
+            },
+            AuthorChainPrefilter {
+                action_types: Some(&[]),
+                ..Default::default()
+            },
+            AuthorChainPrefilter {
+                entry_hashes: Some(&hashes),
+                ..Default::default()
+            },
+            AuthorChainPrefilter {
+                entry_hashes: Some(&hashes),
+                seq_range: Some((0, 10)),
+                action_types: Some(&creates),
+            },
+            AuthorChainPrefilter {
+                entry_hashes: Some(&[]),
+                ..Default::default()
+            },
+            // Above the bind cap the hash predicate is not pushed down, so the
+            // read is wider than the predicate — still a superset the caller
+            // narrows, never a subset.
+            AuthorChainPrefilter {
+                entry_hashes: Some(&too_many),
+                seq_range: Some((4, 8)),
+                ..Default::default()
+            },
+        ];
+
+        for filter in cases {
+            let got = db
+                .as_ref()
+                .get_actions_by_author_filtered(&author, filter)
+                .await
+                .unwrap();
+            let hashes_pushed = filter
+                .entry_hashes
+                .filter(|h| h.len() <= MAX_PREFILTER_ENTRY_HASHES);
+            let expected: Vec<SignedActionHashed> = all
+                .iter()
+                .filter(|sah| {
+                    let action = &sah.hashed.content;
+                    let seq = action.header.action_seq;
+                    filter
+                        .seq_range
+                        .is_none_or(|(start, end)| start <= seq && seq <= end)
+                        && filter
+                            .action_types
+                            .is_none_or(|types| types.contains(&action.data.action_type()))
+                        && hashes_pushed.is_none_or(|hashes| {
+                            action.data.entry_hash().is_some_and(|h| hashes.contains(h))
+                        })
+                })
+                .cloned()
+                .collect();
+            assert_eq!(got, expected, "filter {filter:?}");
+        }
+    }
+
+    /// A per-author chain read — ranged or not — is served by the
+    /// `(author, seq)` index, never by scanning `Action`.
+    #[tokio::test]
+    async fn author_chain_reads_use_author_seq_index() {
+        let db = test_open_db(dht_db_id()).await.unwrap();
+        let author = AgentPubKey::from_raw_36(vec![1u8; 36]);
+        for filter in [
+            AuthorChainPrefilter::default(),
+            AuthorChainPrefilter {
+                seq_range: Some((10, 19)),
+                ..Default::default()
+            },
+        ] {
+            let plan: Vec<String> =
+                inner::action::author_chain_query("EXPLAIN QUERY PLAN ", &author, filter)
+                    .build_query_as::<(i64, i64, i64, String)>()
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|(_, _, _, detail)| detail)
+                    .collect();
+            assert!(
+                plan.iter()
+                    .any(|d| d.contains("elohim_Action_author_seq_idx")),
+                "{filter:?}: must search the (author, seq) index, plan: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.starts_with("SCAN Action")),
+                "{filter:?}: must not scan Action, plan: {plan:?}"
+            );
+        }
     }
 
     fn sample_entry(seed: u8) -> (EntryHash, Entry) {

@@ -2202,18 +2202,10 @@ impl DhtStore<DbRead<Dht>> {
     /// Read the author's committed source-chain records.
     ///
     /// Returns every action authored by `author`, in ascending chain-sequence
-    /// order, as a [`Record`].
-    /// This is the committed-record source behind
-    /// [`SourceChain::query`](crate::source_chain::SourceChain::query): no
-    /// [`ChainQueryFilter`] filtering or fork disambiguation is applied here.
-    /// The caller overlays the scratch and then applies
-    /// [`ChainQueryFilter::filter_records`], which is the authoritative filter.
-    ///
-    /// An entry is attached only when `include_entries` is set and the entry is
-    /// either public or `public_only` is `false`. A private entry is therefore
-    /// redacted (`None`) under `public_only`. The private entry itself is
-    /// resolved via `get_entry(.., Some(author))`, so an author always sees
-    /// their own private entries and never another agent's.
+    /// order, as a [`Record`]. No [`ChainQueryFilter`] filtering or fork
+    /// disambiguation is applied here; see
+    /// [`source_chain_records_for_actions`](Self::source_chain_records_for_actions)
+    /// for how entries are attached.
     pub async fn source_chain_records(
         &self,
         author: &AgentPubKey,
@@ -2221,7 +2213,48 @@ impl DhtStore<DbRead<Dht>> {
         public_only: bool,
     ) -> StateQueryResult<Vec<Record>> {
         let sahs: Vec<SignedActionHashed> = self.db().get_actions_by_author(author.clone()).await?;
+        self.source_chain_records_for_actions(author, sahs, include_entries, public_only)
+            .await
+    }
 
+    /// Read the author's committed source-chain ACTIONS (no entries), narrowed
+    /// in SQL by `prefilter`, in ascending chain-sequence order.
+    ///
+    /// This is the committed-action source behind
+    /// [`SourceChain::query`](crate::source_chain::SourceChain::query). The
+    /// pre-filter only ever removes rows its caller's own
+    /// [`ChainQueryFilter`] would remove anyway (see
+    /// [`AuthorChainPrefilter`](holochain_data::dht::AuthorChainPrefilter)); the
+    /// caller overlays the scratch, applies [`ChainQueryFilter::filter_actions`]
+    /// as the authoritative filter, and only then attaches entries — via
+    /// [`source_chain_records_for_actions`](Self::source_chain_records_for_actions)
+    /// — to the actions that survived.
+    pub async fn source_chain_actions(
+        &self,
+        author: &AgentPubKey,
+        prefilter: holochain_data::dht::AuthorChainPrefilter<'_>,
+    ) -> StateQueryResult<Vec<SignedActionHashed>> {
+        Ok(self
+            .db()
+            .get_actions_by_author_filtered(author, prefilter)
+            .await?)
+    }
+
+    /// Turn the author's committed actions into [`Record`]s, one per action,
+    /// in the order given, loading only the entries those actions need.
+    ///
+    /// An entry is attached only when `include_entries` is set and the entry is
+    /// either public or `public_only` is `false`. A private entry is therefore
+    /// redacted (`None`) under `public_only`. The private entry itself is
+    /// resolved via `get_entry(.., Some(author))`, so an author always sees
+    /// their own private entries and never another agent's.
+    pub async fn source_chain_records_for_actions(
+        &self,
+        author: &AgentPubKey,
+        sahs: Vec<SignedActionHashed>,
+        include_entries: bool,
+        public_only: bool,
+    ) -> StateQueryResult<Vec<Record>> {
         // Decide which entries to attach. Collect the entry hashes that
         // actually need fetching so they can be read in a single batch rather
         // than one-at-a-time (an N+1 over the chain length).
@@ -2246,13 +2279,16 @@ impl DhtStore<DbRead<Dht>> {
 
         // Batch-fetch the needed entries. The author context resolves the
         // author's own private entries, exactly as the per-action
-        // `get_entry(.., Some(author))` did.
-        let entries = self
-            .db()
-            .get_entries_by_hashes(&wanted_entry_hashes, Some(author))
-            .await?;
+        // `get_entry(.., Some(author))` did. Nothing wanted, nothing read.
+        let entries = if wanted_entry_hashes.is_empty() {
+            HashMap::new()
+        } else {
+            self.db()
+                .get_entries_by_hashes(&wanted_entry_hashes, Some(author))
+                .await?
+        };
 
-        // Assemble records in chain order. An absent hash maps to `None`,
+        // Assemble records in the given order. An absent hash maps to `None`,
         // matching the previous `get_entry` miss behaviour.
         let records = sahs
             .into_iter()

@@ -1731,6 +1731,9 @@ mod tests {
     async fn sync_indexes_are_created_idempotently_outside_migrations() {
         let db = test_open_db(dht_id()).await.unwrap();
         super::ensure_sync_indexes(db.pool()).await.unwrap();
+        super::super::action::ensure_chain_read_indexes(db.pool())
+            .await
+            .unwrap();
 
         let names: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'elohim_%'
@@ -1743,6 +1746,7 @@ mod tests {
             names.into_iter().map(|(n,)| n).collect::<Vec<_>>(),
             vec![
                 "elohim_Action_author_publish_idx",
+                "elohim_Action_author_seq_idx",
                 "elohim_Action_prev_hash_idx",
                 "elohim_ChainOp_action_publish_idx",
                 "elohim_ChainOp_basis_idx",
