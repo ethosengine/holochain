@@ -44,6 +44,46 @@ where
     .await
 }
 
+/// The statement behind [`get_live_cap_grant_entries`]; `?1` is the access
+/// class and `?2` the author.
+///
+/// `CROSS JOIN Action` pins `CapGrant` as the outer loop. With a plain `JOIN`
+/// the planner serves `ORDER BY a.seq` from `elohim_Action_author_seq_idx`,
+/// walking every action the author has written and probing `CapGrant` once
+/// per action, so authorising a call costs the length of the chain. Pinned,
+/// it reads the grants of the access class and probes `Action` by hash, then
+/// sorts those few rows. `CROSS JOIN` in SQLite constrains the loop order and
+/// nothing else, so the result set and its order are unchanged.
+///
+/// The revocation checks are correlated `NOT EXISTS` probes, one per candidate
+/// grant, served by `elohim_UpdatedRecord_original_entry_idx` and
+/// `elohim_DeletedRecord_deletes_entry_idx`. As uncorrelated `NOT IN` lists they
+/// were materialised once per execution by walking every update and delete in
+/// the store, for all authors, which was cheap only while the outer loop was the
+/// author's whole chain. Both forms exclude exactly the same grants: the
+/// compared columns are `NOT NULL`, so `NOT IN` has no NULL case to differ on.
+const LIVE_CAP_GRANT_ENTRIES_SQL: &str = "
+         SELECT a.hash, a.author, a.seq, a.prev_hash, a.timestamp, a.action_type,
+                a.action_data, a.signature, a.entry_hash, a.private_entry,
+                a.record_validity,
+                pe.blob AS blob
+         FROM CapGrant cg
+         CROSS JOIN Action a ON cg.action_hash = a.hash
+         LEFT JOIN PrivateEntry pe ON pe.hash = a.entry_hash AND pe.author = ?2
+         WHERE cg.cap_access = ?1
+           AND a.author = ?2
+           AND (a.entry_hash IS NULL OR NOT EXISTS (
+                 SELECT 1
+                 FROM UpdatedRecord u
+                 CROSS JOIN Action ua ON u.action_hash = ua.hash
+                 WHERE u.original_entry_hash = a.entry_hash AND ua.author = ?2))
+           AND (a.entry_hash IS NULL OR NOT EXISTS (
+                 SELECT 1
+                 FROM DeletedRecord d
+                 CROSS JOIN Action da ON d.action_hash = da.hash
+                 WHERE d.deletes_entry_hash = a.entry_hash AND da.author = ?2))
+         ORDER BY a.seq";
+
 /// The author's **live** capability-grant entries of one access class, in
 /// source-chain order, resolved in a single query.
 ///
@@ -75,20 +115,10 @@ where
 ///   ANY agent can author a `Delete`/`Update` naming another agent's grant
 ///   entry hash and have it integrated. Only the author filter stops a foreign
 ///   revocation from taking effect.
-///   Both subqueries are uncorrelated, so SQLite materialises each once for the
-///   whole statement rather than once per candidate row (`EXPLAIN QUERY PLAN`
-///   reports `LIST SUBQUERY`). `CROSS JOIN` (rather than `JOIN`) pins the join
-///   order inside each: SQLite's default plan scans `Action` and probes the
-///   index table, but every `UpdatedRecord`/`DeletedRecord` row has a foreign
-///   key into `Action`, so the index table is never the larger of the two and
-///   scanning it is always the cheaper order. Measured on a 15 768-grant /
-///   60 000-action store: 91 ms with `JOIN`, 42 ms with `CROSS JOIN`. This is a
-///   plan hint only — `CROSS JOIN` in SQLite constrains the loop order and
-///   nothing else, so the result set is identical either way.
-///   The inner `IS NOT NULL` guards are belt-and-braces against `NOT IN`'s NULL
-///   semantics (a NULL in the subquery would make the predicate NULL and
-///   silently deny *every* grant); the columns are declared `NOT NULL` on a
-///   `STRICT` table, so the guard can never change the result.
+///   Each is a correlated `NOT EXISTS` probe per candidate grant (see
+///   [`LIVE_CAP_GRANT_ENTRIES_SQL`]); `CROSS JOIN` inside each pins the index
+///   table as the outer loop so the probe goes through its entry-hash index and
+///   then `Action` by primary key.
 /// - The grant entry is read from `PrivateEntry` scoped to `?2` (this author)
 ///   and NOWHERE ELSE. This is a correctness invariant, not an optimisation,
 ///   and it is load-bearing: **`EntryType::CapGrant` is always
@@ -139,32 +169,11 @@ where
     E: Executor<'e, Database = Sqlite>,
 {
     let author_bytes = author.get_raw_36().to_vec();
-    let rows: Vec<LiveCapGrantRow> = sqlx::query_as(
-        "SELECT a.hash, a.author, a.seq, a.prev_hash, a.timestamp, a.action_type,
-                a.action_data, a.signature, a.entry_hash, a.private_entry,
-                a.record_validity,
-                pe.blob AS blob
-         FROM CapGrant cg
-         JOIN Action a ON cg.action_hash = a.hash
-         LEFT JOIN PrivateEntry pe ON pe.hash = a.entry_hash AND pe.author = ?2
-         WHERE cg.cap_access = ?1
-           AND a.author = ?2
-           AND (a.entry_hash IS NULL OR a.entry_hash NOT IN (
-                 SELECT u.original_entry_hash
-                 FROM UpdatedRecord u
-                 CROSS JOIN Action ua ON u.action_hash = ua.hash
-                 WHERE ua.author = ?2 AND u.original_entry_hash IS NOT NULL))
-           AND (a.entry_hash IS NULL OR a.entry_hash NOT IN (
-                 SELECT d.deletes_entry_hash
-                 FROM DeletedRecord d
-                 CROSS JOIN Action da ON d.action_hash = da.hash
-                 WHERE da.author = ?2 AND d.deletes_entry_hash IS NOT NULL))
-         ORDER BY a.seq",
-    )
-    .bind(cap_access)
-    .bind(author_bytes)
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<LiveCapGrantRow> = sqlx::query_as(LIVE_CAP_GRANT_ENTRIES_SQL)
+        .bind(cap_access)
+        .bind(author_bytes)
+        .fetch_all(executor)
+        .await?;
 
     let mut entries = Vec::with_capacity(rows.len());
     for row in rows {
@@ -207,4 +216,78 @@ where
     .bind(author.get_raw_36())
     .fetch_all(executor)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LIVE_CAP_GRANT_ENTRIES_SQL;
+    use crate::kind::Dht;
+    use crate::test_open_db;
+    use holo_hash::DnaHash;
+    use std::sync::Arc;
+
+    /// Authorising a zome call must cost the author's grants, not the
+    /// author's history.
+    ///
+    /// The lookup runs on every zome call signed by a key other than the
+    /// author's. Left to itself the planner serves `ORDER BY a.seq` from
+    /// `elohim_Action_author_seq_idx`: it walks every action the author ever
+    /// wrote and probes `CapGrant` once per action. Measured on a household
+    /// conductor at 19 081 actions and 9 grants: about 250 ms per access
+    /// class, three classes per call, growing linearly with the chain.
+    #[tokio::test]
+    async fn live_cap_grant_lookup_is_driven_by_the_grant_table() {
+        let db = test_open_db(Dht::new(Arc::new(DnaHash::from_raw_36(vec![0u8; 36]))))
+            .await
+            .unwrap();
+        let explain = format!("EXPLAIN QUERY PLAN {LIVE_CAP_GRANT_ENTRIES_SQL}");
+        let plan: Vec<String> =
+            sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain))
+                .bind(0_i64)
+                .bind(vec![0u8; 36])
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
+        let action_loop = plan
+            .iter()
+            .position(|d| d.starts_with("SEARCH a ") || d.starts_with("SCAN a"))
+            .expect("the plan reads Action");
+        let grant_loop = plan
+            .iter()
+            .position(|d| d.starts_with("SEARCH cg ") || d.starts_with("SCAN cg"))
+            .expect("the plan reads CapGrant");
+        assert!(
+            grant_loop < action_loop,
+            "CapGrant must be the outer loop, plan: {plan:?}"
+        );
+        assert!(
+            plan[action_loop].contains("PRIMARY KEY"),
+            "Action must be probed by hash, not walked by author, plan: {plan:?}"
+        );
+        assert!(
+            plan[grant_loop].contains("elohim_CapGrant_access_idx"),
+            "CapGrant must be read through its access-class index, plan: {plan:?}"
+        );
+        // The revocation checks must probe by entry hash per candidate, never
+        // walk every update or delete in the store.
+        assert!(
+            !plan
+                .iter()
+                .any(|d| d.starts_with("SCAN u") || d.starts_with("SCAN d")),
+            "revocation checks must not scan UpdatedRecord/DeletedRecord, plan: {plan:?}"
+        );
+        for (alias, index) in [
+            ("u", "elohim_UpdatedRecord_original_entry_idx"),
+            ("d", "elohim_DeletedRecord_deletes_entry_idx"),
+        ] {
+            assert!(
+                plan.iter()
+                    .any(|d| d.starts_with(&format!("SEARCH {alias} ")) && d.contains(index)),
+                "{alias} must be probed through {index}, plan: {plan:?}"
+            );
+        }
+    }
 }

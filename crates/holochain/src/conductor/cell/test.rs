@@ -127,3 +127,53 @@ async fn test_cell_handle_publish() {
 
     handle.shutdown().await.unwrap().unwrap();
 }
+
+/// Once a cell has seen its zomes initialised, the init check neither reads
+/// the chain again nor waits on the init mutex.
+#[tokio::test(flavor = "multi_thread")]
+async fn initialised_cell_skips_the_init_check() {
+    use crate::sweettest::{SweetConductor, SweetDnaFile};
+    use holochain_wasm_test_utils::TestWasm;
+    use std::sync::atomic::Ordering;
+
+    let (dna, _, _) = SweetDnaFile::unique_from_test_wasms(vec![TestWasm::InitPass]).await;
+    let mut conductor = SweetConductor::standard().await;
+    let app = conductor.setup_app("app", [&dna]).await.unwrap();
+    let cell_id = app.cells()[0].cell_id().clone();
+    let cell = conductor.raw_handle().cell_by_id(&cell_id).await.unwrap();
+
+    assert!(!cell.zomes_initialized.load(Ordering::Acquire));
+    cell.check_or_run_zome_init().await.unwrap();
+    assert!(cell.zomes_initialized.load(Ordering::Acquire));
+
+    // Hold the init mutex. Without the latch the next check would wait on it
+    // until INIT_MUTEX_TIMEOUT_SECS and fail with InitTimeout.
+    let _held = cell.init_mutex.lock().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        cell.check_or_run_zome_init(),
+    )
+    .await
+    .expect("an initialised cell must not wait on the init mutex")
+    .unwrap();
+}
+
+/// A failed init leaves the latch open, so the next call runs init again
+/// instead of treating the cell as initialised.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_init_leaves_the_latch_open() {
+    use crate::sweettest::{SweetConductor, SweetDnaFile};
+    use holochain_wasm_test_utils::TestWasm;
+    use std::sync::atomic::Ordering;
+
+    let (dna, _, _) = SweetDnaFile::unique_from_test_wasms(vec![TestWasm::InitFail]).await;
+    let mut conductor = SweetConductor::standard().await;
+    let app = conductor.setup_app("app", [&dna]).await.unwrap();
+    let cell_id = app.cells()[0].cell_id().clone();
+    let cell = conductor.raw_handle().cell_by_id(&cell_id).await.unwrap();
+
+    assert!(cell.check_or_run_zome_init().await.is_err());
+    assert!(!cell.zomes_initialized.load(Ordering::Acquire));
+    assert!(cell.check_or_run_zome_init().await.is_err());
+    assert!(!cell.zomes_initialized.load(Ordering::Acquire));
+}

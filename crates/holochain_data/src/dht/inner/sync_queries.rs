@@ -942,6 +942,11 @@ pub(crate) const DHT_SYNC_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS elohim_Link_base_idx ON Link (base_hash)",
     "CREATE INDEX IF NOT EXISTS elohim_DeletedLink_create_idx ON DeletedLink (create_link_hash)",
     "CREATE INDEX IF NOT EXISTS elohim_ValidationReceipt_op_idx ON ValidationReceipt (op_hash)",
+    // ELOHIM PATCH (per-call chain walk): the live capability-grant lookup runs
+    // on every zome call signed by a key other than the author's and is driven
+    // from `CapGrant`. Without this index it scans every grant of every agent in
+    // the DNA's store; stores from the per-connect era hold tens of thousands.
+    "CREATE INDEX IF NOT EXISTS elohim_CapGrant_access_idx ON CapGrant (cap_access)",
 ];
 
 /// Ensure [`DHT_SYNC_INDEXES`] exist. Idempotent; on a large store that
@@ -1748,6 +1753,7 @@ mod tests {
                 "elohim_Action_author_publish_idx",
                 "elohim_Action_author_seq_idx",
                 "elohim_Action_prev_hash_idx",
+                "elohim_CapGrant_access_idx",
                 "elohim_ChainOp_action_publish_idx",
                 "elohim_ChainOp_basis_idx",
                 "elohim_ChainOp_loc_sync_idx",
