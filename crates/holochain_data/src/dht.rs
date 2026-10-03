@@ -17,10 +17,12 @@ mod db_operations;
 mod inner;
 mod tx_operations;
 
-pub use db_operations::CapGrantBackfillReport;
 pub use db_operations::ChainWritePermit;
+pub use db_operations::{CapGrantBackfillConfig, CapGrantBackfillEvent, CapGrantBackfillReport};
 pub use inner::action::{AuthorChainPrefilter, MAX_PREFILTER_ENTRY_HASHES};
-pub use inner::cap_grant::{cap_grant_secret_key, CAP_GRANT_SECRET_KEY_BYTES};
+pub use inner::cap_grant::{
+    cap_grant_secret_key, CAP_GRANT_SECRET_KEY_BYTES, CAP_GRANT_SECRET_KEY_VERSION,
+};
 pub use inner::chain_op::InsertChainOp;
 pub use inner::deleted_link::InsertDeletedLink;
 pub use inner::deleted_record::InsertDeletedRecord;

@@ -561,3 +561,127 @@ async fn wal_maintenance_skips_truncate_with_a_large_remainder() {
         "and the (now copy-free) truncation completes: {freed:?}"
     );
 }
+
+/// The capability-grant backfill publishes how many secret-bearing grants
+/// still have no lookup key as the `hc.db.cap_grant.unkeyed` gauge, one series
+/// per database, through the same exporter the conductor's `/metrics` scrape
+/// reads — so an incomplete backfill, or a grant that can never be keyed, is a
+/// scrape and not a log line.
+#[tokio::test]
+async fn cap_grant_backfill_publishes_the_unkeyed_gauge() {
+    use holo_hash::{ActionHash, AgentPubKey, DnaHash, EntryHash, HoloHashed};
+    use holochain_data::dht::{CapGrantBackfillConfig, CapGrantBackfillEvent};
+    use holochain_data::kind::Dht;
+    use holochain_integrity_types::action::{
+        Action, ActionData, ActionHeader, CreateData, EntryType, RecordValidity,
+    };
+    use holochain_integrity_types::capability::{
+        CapAccess, CapSecret, GrantedFunctions, ZomeCallCapGrant,
+    };
+    use holochain_integrity_types::entry::Entry;
+    use holochain_integrity_types::record::SignedHashed;
+    use holochain_integrity_types::signature::Signature;
+    use holochain_timestamp::Timestamp;
+    use std::time::Duration;
+
+    let (exporter, provider) = holochain_metrics::PrometheusExporter::install();
+    opentelemetry::global::set_meter_provider(provider);
+
+    let dir = tempfile::tempdir().unwrap();
+    let id = Dht::new(Arc::new(DnaHash::from_raw_36(vec![0xD1; 36])));
+    let database_id = id.database_id().to_string();
+    let db = open_db(dir.path(), id, Default::default()).await.unwrap();
+
+    // Two grants written the way a binary that predates the lookup columns
+    // writes them. The first has its private entry; the second does not, so no
+    // key can ever be derived for it.
+    let author = AgentPubKey::from_raw_36(vec![1; 36]);
+    let mut entries = Vec::new();
+    for n in 1..=2u8 {
+        let entry = Entry::CapGrant(ZomeCallCapGrant::new(
+            format!("grant-{n}"),
+            CapAccess::Transferable {
+                secret: CapSecret::from([n; 64]),
+            },
+            GrantedFunctions::All,
+        ));
+        let entry_hash = EntryHash::from_raw_36(vec![0x20 + n; 36]);
+        let action = Action {
+            header: ActionHeader {
+                author: author.clone(),
+                timestamp: Timestamp::from_micros(i64::from(n)),
+                action_seq: u32::from(n),
+                prev_action: Some(ActionHash::from_raw_36(vec![0xEE; 36])),
+            },
+            data: ActionData::Create(CreateData {
+                entry_type: EntryType::CapGrant,
+                entry_hash: entry_hash.clone(),
+            }),
+        };
+        let sah = SignedHashed::with_presigned(
+            HoloHashed::with_pre_hashed(action, ActionHash::from_raw_36(vec![0x10 + n; 36])),
+            Signature([7; 64]),
+        );
+        db.insert_action(&sah, Some(RecordValidity::Accepted))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO CapGrant (action_hash, cap_access, tag) VALUES (?, 1, NULL)")
+            .bind(sah.as_hash().get_raw_36())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        entries.push((entry_hash, entry));
+    }
+    db.insert_private_entry(&entries[0].0, &author, &entries[0].1)
+        .await
+        .unwrap();
+    assert_eq!(db.as_ref().count_cap_grants_unkeyed().await.unwrap(), 2);
+
+    let config = CapGrantBackfillConfig {
+        start_delay: Duration::ZERO,
+        batch: 8,
+        pause: Duration::ZERO,
+        min_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(1),
+    };
+    let gauge = |body: &str| -> Option<String> {
+        body.lines()
+            .find(|line| {
+                line.starts_with("hc_db_cap_grant_unkeyed{")
+                    && line.contains(&format!("id=\"{database_id}\""))
+                    && line.contains("kind=\"dht\"")
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .map(str::to_string)
+    };
+
+    // One row keyed, one left that cannot be: the gauge says 1.
+    let mut converged = None;
+    let report = db
+        .converge_cap_grant_lookup_keys(config, &mut |event| {
+            if let CapGrantBackfillEvent::Converged { unkeyed, .. } = event {
+                converged = Some(unkeyed);
+            }
+        })
+        .await;
+    assert_eq!(
+        (report.secret_keys_filled, report.left_unkeyed),
+        (1, 1),
+        "{report:?}"
+    );
+    assert_eq!(converged, Some(Some(1)));
+    let body = exporter.render().unwrap();
+    assert!(
+        body.contains("# TYPE hc_db_cap_grant_unkeyed gauge\n"),
+        "{body}"
+    );
+    assert_eq!(gauge(&body).as_deref(), Some("1"), "{body}");
+
+    // Its private entry turns up; the next pass keys it and the gauge says 0.
+    db.insert_private_entry(&entries[1].0, &author, &entries[1].1)
+        .await
+        .unwrap();
+    let report = db.converge_cap_grant_lookup_keys(config, &mut |_| {}).await;
+    assert_eq!((report.secret_keys_filled, report.left_unkeyed), (1, 0));
+    assert_eq!(gauge(&exporter.render().unwrap()).as_deref(), Some("0"));
+}

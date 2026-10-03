@@ -3161,6 +3161,7 @@ dependencies = [
  "holochain_conductor_api",
  "holochain_data",
  "holochain_integrity_types",
+ "holochain_metrics",
  "holochain_nonce",
  "holochain_serialized_bytes",
  "holochain_timestamp",

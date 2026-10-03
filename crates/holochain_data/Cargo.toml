@@ -40,6 +40,7 @@ bytes = "1"
 holochain_data = { path = ".", features = ["test-utils", "encryption"] }
 
 tempfile = "3.3"
+holochain_metrics = { version = "^0.7.0", path = "../holochain_metrics" }
 
 [lints]
 workspace = true

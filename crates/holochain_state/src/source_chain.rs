@@ -3653,17 +3653,19 @@ mod tests {
         dht_store: &DhtStore,
         action: &ActionHash,
     ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-        sqlx::query_as("SELECT author, secret_key FROM CapGrant WHERE action_hash = ?")
-            .bind(action.get_raw_36())
-            .fetch_one(dht_store.db().pool())
-            .await
-            .unwrap()
+        sqlx::query_as(
+            "SELECT elohim_author, elohim_secret_key FROM CapGrant WHERE action_hash = ?",
+        )
+        .bind(action.get_raw_36())
+        .fetch_one(dht_store.db().pool())
+        .await
+        .unwrap()
     }
 
     /// Put every `CapGrant` row back into the state a binary that predates the
     /// lookup columns leaves it in: no author, no key.
     async fn forget_lookup_columns(dht_store: &DhtStore) {
-        sqlx::query("UPDATE CapGrant SET author = NULL, secret_key = NULL")
+        sqlx::query("UPDATE CapGrant SET elohim_author = NULL, elohim_secret_key = NULL")
             .execute(dht_store.db().pool())
             .await
             .unwrap();
@@ -5156,10 +5158,16 @@ mod tests {
         let report = dht_store.backfill_cap_grant_lookup_keys().await.unwrap();
         assert!(report.authors_filled > 240 && report.secret_keys_filled > 100);
         assert_eq!(report.left_unkeyed, 0);
+        let again = dht_store.backfill_cap_grant_lookup_keys().await.unwrap();
         assert_eq!(
-            dht_store.backfill_cap_grant_lookup_keys().await.unwrap(),
-            holochain_data::dht::CapGrantBackfillReport::default()
+            (
+                again.authors_filled,
+                again.secret_keys_filled,
+                again.left_unkeyed
+            ),
+            (0, 0, 0)
         );
+        assert_eq!(dht_store.count_cap_grants_unkeyed().await.unwrap(), 0);
         for (i, (function, agent, secret)) in probes.iter().enumerate() {
             assert_eq!(
                 dht_store
@@ -5239,8 +5247,21 @@ mod tests {
     /// The corrupt grant's own secret is still denied, and so is every secret
     /// if the corrupt grant has not been keyed. Strictly more available;
     /// authorises nothing that was not already authorised.
+    ///
+    /// "Corrupt" is any of the three ways one live grant can fail to decode: a
+    /// corrupt action, an undecodable private entry, an `entry_hash` column
+    /// that disagrees with its action. The full matrix, including rows keyed by
+    /// another derivation version, is in `holochain_data`'s
+    /// `corrupt_grant_denies_unless_it_is_keyed_to_another_secret`.
     #[tokio::test(flavor = "multi_thread")]
     async fn cap_grant_corrupt_unrelated_grant_no_longer_denies() -> SourceChainResult<()> {
+        for corruption in ["action_data", "entry_blob", "entry_hash_mismatch"] {
+            cap_grant_corrupt_unrelated_grant_case(corruption).await?;
+        }
+        Ok(())
+    }
+
+    async fn cap_grant_corrupt_unrelated_grant_case(corruption: &str) -> SourceChainResult<()> {
         let TestCase {
             chain,
             agent_key: alice,
@@ -5264,23 +5285,57 @@ mod tests {
             },
             listed(&[("zome_a", "fn_one")]),
         );
-        let (broken_action, _) = put_cap_grant(&chain, &broken).await?;
+        let (broken_action, broken_entry) = put_cap_grant(&chain, &broken).await?;
         put_cap_grant(&chain, &wanted).await?;
         chain.flush(vec![DhtArc::Empty]).await.unwrap();
 
-        sqlx::query("UPDATE Action SET action_data = ? WHERE hash = ?")
-            .bind(vec![0xFF_u8; 24])
-            .bind(broken_action.get_raw_36())
-            .execute(dht_store.db().pool())
-            .await
-            .unwrap();
+        let pool = dht_store.db().pool();
+        match corruption {
+            // (a) the action does not decode
+            "action_data" => {
+                sqlx::query("UPDATE Action SET action_data = ? WHERE hash = ?")
+                    .bind(vec![0xFF_u8; 24])
+                    .bind(broken_action.get_raw_36())
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            // (b) the private entry blob does not decode
+            "entry_blob" => {
+                sqlx::query("UPDATE PrivateEntry SET blob = ? WHERE hash = ? AND author = ?")
+                    .bind(vec![0xC1_u8; 3])
+                    .bind(broken_entry.get_raw_36())
+                    .bind(alice.get_raw_36())
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            // (c) the entry_hash column disagrees with the decoded action
+            "entry_hash_mismatch" => {
+                sqlx::query("UPDATE Action SET entry_hash = ? WHERE hash = ?")
+                    .bind(vec![0xEA_u8; 36])
+                    .bind(broken_action.get_raw_36())
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
 
-        // Before: deny-all. The reference still shows it.
-        assert!(dht_store
-            .as_read()
-            .valid_cap_grants_reference(&alice, Some(&wanted_secret))
-            .await
-            .is_err());
+        // Before: deny-all. The oldest implementation, kept as the reference,
+        // still shows it for (a) and (b). It never looked at the `entry_hash`
+        // column, so (c) only became fail-closed with the single-query read;
+        // the previous statement — `holochain_data`'s reference — denies it.
+        if corruption != "entry_hash_mismatch" {
+            assert!(
+                dht_store
+                    .as_read()
+                    .valid_cap_grants_reference(&alice, Some(&wanted_secret))
+                    .await
+                    .is_err(),
+                "{corruption}: the reference must deny"
+            );
+        }
 
         // Now: the unrelated call is authorised by its own, intact grant…
         assert_eq!(
@@ -5496,6 +5551,295 @@ mod tests {
             chain.valid_cap_grant(function, bob, Some(secret)).await?,
             None
         );
+        Ok(())
+    }
+
+    /// The backfill on a real, busy store.
+    ///
+    /// An on-disk WAL database holding 30 000 grants across five authors, every
+    /// row un-keyed, exactly as a store that predates the lookup columns. While
+    /// the production backfill driver runs to convergence:
+    ///
+    /// - a writer keeps flushing new grants and author-revocations through the
+    ///   source chain, checking after every flush that the grant it just made
+    ///   authorises and the grant it just revoked does not;
+    /// - a reader keeps calling the production `valid_cap_grant` on a fixed set
+    ///   of probes — live secrets, revoked secrets, an unknown secret, for
+    ///   every author — whose decisions were derived from the reference
+    ///   implementation before the backfill started.
+    ///
+    /// No decision may ever differ, the backfill must finish with nothing left
+    /// un-keyed, and the longest it held the writer is recorded.
+    ///
+    /// Slow (it authors and signs 30 000 grants), so it is not part of the
+    /// default run. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test -p holochain_state --lib cap_grant_backfill_under_concurrent_load \
+    ///     -- --ignored --nocapture
+    /// ```
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "slow: authors 30 000 grants; run with -- --ignored --nocapture"]
+    async fn cap_grant_backfill_under_concurrent_load() -> SourceChainResult<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const AUTHORS: u64 = 5;
+        const GRANTS_PER_AUTHOR: u64 = 6_000;
+        const PER_FLUSH: u64 = 1_000;
+        const REVOKED: u64 = 40;
+        const PROBED_LIVE: std::ops::Range<u64> = 100..140;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dna_hash = fixt!(DnaHash);
+        let db = holochain_data::open_db(
+            dir.path(),
+            holochain_data::kind::Dht::new(Arc::new(dna_hash.clone())),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let dht_store = DhtStore::new(db);
+        let keystore = test_keystore();
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let function: GrantedFunction = ("zome_a".into(), "fn_one".into());
+        let secret_of = |author: u64, i: u64| secret_from(author * 10_000_000 + i);
+        let grant_for = |secret: CapSecret| {
+            ZomeCallCapGrant::new(
+                "load".into(),
+                CapAccess::Transferable { secret },
+                listed(&[("zome_a", "fn_one")]),
+            )
+        };
+
+        // Seed: every author's grants through the real flush, then revoke the
+        // first `REVOKED` of each.
+        let seeding = std::time::Instant::now();
+        let mut authors = Vec::new();
+        for a in 0..AUTHORS {
+            let agent = keystore.new_sign_keypair_random().await.unwrap();
+            genesis(
+                dht_store.clone(),
+                keystore.clone(),
+                dna_hash.clone(),
+                agent.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+            let mut to_revoke = Vec::new();
+            let mut next = 0;
+            while next < GRANTS_PER_AUTHOR {
+                let chain = fresh_chain(&dht_store, &keystore, &agent).await?;
+                for i in next..next + PER_FLUSH {
+                    let put = put_cap_grant(&chain, &grant_for(secret_of(a, i))).await?;
+                    if i < REVOKED {
+                        to_revoke.push(put);
+                    }
+                }
+                chain.flush(vec![DhtArc::Empty]).await.unwrap();
+                next += PER_FLUSH;
+            }
+            let chain = fresh_chain(&dht_store, &keystore, &agent).await?;
+            for (action, entry) in to_revoke {
+                delete_cap_grant(&chain, action, entry).await?;
+            }
+            chain.flush(vec![DhtArc::Empty]).await.unwrap();
+            authors.push(agent);
+        }
+        let seeding = seeding.elapsed();
+
+        // The fixed probes, and what the REFERENCE decides for each. The
+        // reference's candidate vector does not depend on the secret presented,
+        // so it is read once per author and the decision — author fast path,
+        // then first `is_valid` — is taken exactly as `oracle_decision` takes
+        // it. The grants these probes name are never touched again, so the
+        // reference's decision for them cannot change while the test runs.
+        let mut probes: Vec<(usize, CapSecret)> = Vec::new();
+        for a in 0..AUTHORS {
+            for i in (0..REVOKED).chain(PROBED_LIVE) {
+                probes.push((a as usize, secret_of(a, i)));
+            }
+            probes.push((a as usize, secret_from(u64::MAX - a)));
+        }
+        async fn reference_decisions(
+            dht_store: &DhtStore,
+            authors: &[AgentPubKey],
+            probes: &[(usize, CapSecret)],
+            function: &GrantedFunction,
+            caller: &AgentPubKey,
+        ) -> SourceChainResult<Vec<Option<CapGrant>>> {
+            let mut candidates = Vec::new();
+            for author in authors {
+                candidates.push(
+                    dht_store
+                        .as_read()
+                        .valid_cap_grants_reference(author, Some(&secret_from(0)))
+                        .await?,
+                );
+            }
+            Ok(probes
+                .iter()
+                .map(|(a, secret)| {
+                    candidates[*a]
+                        .iter()
+                        .find(|g| g.is_valid(function, caller, Some(secret)))
+                        .cloned()
+                })
+                .collect())
+        }
+        let expected = reference_decisions(&dht_store, &authors, &probes, &function, &bob).await?;
+        assert_eq!(
+            expected.iter().filter(|d| d.is_some()).count() as u64,
+            AUTHORS * (PROBED_LIVE.end - PROBED_LIVE.start)
+        );
+        assert_eq!(
+            expected.iter().filter(|d| d.is_none()).count() as u64,
+            AUTHORS * (REVOKED + 1)
+        );
+
+        // Every row back to the state a pre-column binary leaves it in.
+        forget_lookup_columns(&dht_store).await;
+        let engine: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(dht_store.db().pool())
+            .await
+            .unwrap();
+        let unkeyed_at_start = dht_store.count_cap_grants_unkeyed().await.unwrap();
+        assert_eq!(unkeyed_at_start, AUTHORS * GRANTS_PER_AUTHOR);
+
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Reader: the production decision, over and over.
+        let reader = tokio::spawn({
+            let (dht_store, keystore, authors) =
+                (dht_store.clone(), keystore.clone(), authors.clone());
+            let (probes, expected) = (probes.clone(), expected.clone());
+            let (function, bob, done) = (function.clone(), bob.clone(), done.clone());
+            async move {
+                let mut chains = Vec::new();
+                for author in &authors {
+                    chains.push(fresh_chain(&dht_store, &keystore, author).await.unwrap());
+                }
+                let mut checked = 0u64;
+                'outer: loop {
+                    for (i, (a, secret)) in probes.iter().enumerate() {
+                        let got = chains[*a]
+                            .valid_cap_grant(function.clone(), bob.clone(), Some(*secret))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            got, expected[i],
+                            "probe {i} (author {a}) differs from the reference mid-backfill"
+                        );
+                        checked += 1;
+                        if done.load(Ordering::SeqCst) {
+                            break 'outer;
+                        }
+                    }
+                }
+                checked
+            }
+        });
+
+        // Writer: new grants and author-revocations, flushed continuously.
+        let writer = tokio::spawn({
+            let (dht_store, keystore, authors) =
+                (dht_store.clone(), keystore.clone(), authors.clone());
+            let (function, bob, done) = (function.clone(), bob.clone(), done.clone());
+            async move {
+                let mut rounds = 0u64;
+                while !done.load(Ordering::SeqCst) {
+                    let a = (rounds % AUTHORS) as usize;
+                    let secret = secret_from(900_000_000_000 + rounds);
+                    let grant = ZomeCallCapGrant::new(
+                        "written-during-backfill".into(),
+                        CapAccess::Transferable { secret },
+                        listed(&[("zome_a", "fn_one")]),
+                    );
+                    let chain = fresh_chain(&dht_store, &keystore, &authors[a])
+                        .await
+                        .unwrap();
+                    let (action, entry) = put_cap_grant(&chain, &grant).await.unwrap();
+                    chain.flush(vec![DhtArc::Empty]).await.unwrap();
+                    assert_eq!(
+                        chain
+                            .valid_cap_grant(function.clone(), bob.clone(), Some(secret))
+                            .await
+                            .unwrap(),
+                        Some(grant.into()),
+                        "round {rounds}: a grant flushed mid-backfill must authorise"
+                    );
+                    let chain = fresh_chain(&dht_store, &keystore, &authors[a])
+                        .await
+                        .unwrap();
+                    delete_cap_grant(&chain, action, entry).await.unwrap();
+                    chain.flush(vec![DhtArc::Empty]).await.unwrap();
+                    assert_eq!(
+                        chain
+                            .valid_cap_grant(function.clone(), bob.clone(), Some(secret))
+                            .await
+                            .unwrap(),
+                        None,
+                        "round {rounds}: a grant revoked mid-backfill must stop authorising"
+                    );
+                    rounds += 1;
+                }
+                rounds
+            }
+        });
+
+        // The production driver, with the production pacing.
+        let backfilling = std::time::Instant::now();
+        let mut failures = 0u32;
+        let mut converged = false;
+        let report = dht_store
+            .db()
+            .converge_cap_grant_lookup_keys(crate::dht_store::CAP_GRANT_BACKFILL, &mut |event| {
+                match event {
+                    holochain_data::dht::CapGrantBackfillEvent::PassFailed { .. } => failures += 1,
+                    holochain_data::dht::CapGrantBackfillEvent::Converged { .. } => {
+                        converged = true
+                    }
+                }
+            })
+            .await;
+        let backfilling = backfilling.elapsed();
+        done.store(true, Ordering::SeqCst);
+        let checked = reader.await.unwrap();
+        let rounds = writer.await.unwrap();
+
+        eprintln!(
+            "cap-grant backfill under load (SQLite {engine}): seeded {} grants in {seeding:?}; backfill \
+             {backfilling:?}, {failures} failed passes, report {report:?}; reader made {checked} \
+             production decisions, writer made {rounds} grant+revoke rounds",
+            AUTHORS * GRANTS_PER_AUTHOR
+        );
+
+        assert!(converged, "the backfill must finish");
+        assert_eq!(report.left_unkeyed, 0);
+        assert_eq!(report.secret_keys_filled, unkeyed_at_start);
+        assert_eq!(dht_store.count_cap_grants_unkeyed().await.unwrap(), 0);
+        assert!(checked >= probes.len() as u64, "the reader got round");
+        assert!(rounds >= 1, "the writer got a turn");
+        assert!(
+            report.max_write_hold < holochain_data::BUSY_TIMEOUT / 3,
+            "the backfill held the writer for {:?}",
+            report.max_write_hold
+        );
+
+        // After: the reference still decides the same, and so does production.
+        assert_eq!(
+            reference_decisions(&dht_store, &authors, &probes, &function, &bob).await?,
+            expected
+        );
+        for (i, (a, secret)) in probes.iter().enumerate() {
+            let chain = fresh_chain(&dht_store, &keystore, &authors[*a]).await?;
+            assert_eq!(
+                chain
+                    .valid_cap_grant(function.clone(), bob.clone(), Some(*secret))
+                    .await?,
+                expected[i],
+                "probe {i} after the backfill"
+            );
+        }
         Ok(())
     }
 

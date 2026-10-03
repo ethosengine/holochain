@@ -191,22 +191,27 @@ impl<Db> DhtStore<Db> {
     }
 }
 
-/// Rows per write transaction in the capability-grant lookup-key backfill.
+/// How the capability-grant lookup-key backfill paces itself.
 ///
-/// Small on purpose: every agent hosted on the DNA shares this database's one
-/// writer, and a batch is the longest the backfill ever holds it. Measured on
-/// an on-disk store of 30 agents and 30 000 un-keyed grants (unoptimised
-/// build): a 256-row batch held the writer for at most about 150 ms, against a
-/// 15 s busy timeout; this is half that.
-const CAP_GRANT_BACKFILL_BATCH: u32 = 128;
-
-/// Pause between backfill batches, so queued writers get the lock.
-const CAP_GRANT_BACKFILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// How many times a failed backfill pass is retried before it is left for the
-/// next time the store is opened, and how long to wait between tries.
-const CAP_GRANT_BACKFILL_ATTEMPTS: u32 = 5;
-const CAP_GRANT_BACKFILL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+/// - `start_delay`: waited once before the first pass; a store that has just
+///   been opened is at its busiest, and the backfill is never urgent.
+/// - `batch`: rows per write. Small on purpose: every agent hosted on the DNA
+///   shares this database's one writer, and a batch is the longest the backfill
+///   ever holds it. Measured on an on-disk store of 30 agents and 30 000
+///   un-keyed grants (unoptimised build): a 256-row batch held the writer for
+///   at most about 150 ms, against a 15 s busy timeout; this is half that.
+/// - `pause`: slept between batches, so queued writers get the lock.
+/// - `min_backoff` / `max_backoff`: the wait after a failed pass, doubling per
+///   consecutive failure and reset whenever a pass makes progress. There is no
+///   retry budget — see [`DhtStore::spawn_cap_grant_lookup_backfill`].
+pub(crate) const CAP_GRANT_BACKFILL: holochain_data::dht::CapGrantBackfillConfig =
+    holochain_data::dht::CapGrantBackfillConfig {
+        start_delay: std::time::Duration::from_secs(5),
+        batch: 128,
+        pause: std::time::Duration::from_millis(50),
+        min_backoff: std::time::Duration::from_secs(5),
+        max_backoff: std::time::Duration::from_secs(300),
+    };
 
 impl DhtStore<DbWrite<Dht>> {
     /// The DNA hash this store belongs to.
@@ -214,7 +219,7 @@ impl DhtStore<DbWrite<Dht>> {
         self.db.identifier().dna_hash()
     }
 
-    /// Fill in the capability-grant lookup columns on rows that predate them.
+    /// Run one pass of the capability-grant lookup-column backfill.
     ///
     /// See [`DbWrite::backfill_cap_grant_lookup_keys`]. Authorisation is
     /// correct whether or not this has run; it only makes the lookup cheaper.
@@ -222,55 +227,93 @@ impl DhtStore<DbWrite<Dht>> {
         &self,
     ) -> StateMutationResult<holochain_data::dht::CapGrantBackfillReport> {
         self.db
-            .backfill_cap_grant_lookup_keys(CAP_GRANT_BACKFILL_BATCH, CAP_GRANT_BACKFILL_PAUSE)
+            .backfill_cap_grant_lookup_keys(CAP_GRANT_BACKFILL.batch, CAP_GRANT_BACKFILL.pause)
             .await
             .map_err(StateMutationError::from)
     }
 
-    /// Run [`backfill_cap_grant_lookup_keys`](Self::backfill_cap_grant_lookup_keys)
-    /// on a background task.
+    /// Secret-bearing capability grants in this store that have no lookup key
+    /// of the current derivation: rows the backfill has not reached, and rows
+    /// it could not derive a key for. The value of the
+    /// `hc.db.cap_grant.unkeyed` gauge.
+    pub async fn count_cap_grants_unkeyed(&self) -> StateQueryResult<u64> {
+        Ok(self.db.as_ref().count_cap_grants_unkeyed().await?)
+    }
+
+    /// Run the capability-grant lookup-column backfill on a background task
+    /// until it has converged.
     ///
     /// Called once when a DNA's store is opened. It is spawned, never awaited,
     /// so opening the store — and with it conductor readiness — does not wait
     /// for it: until a row is filled in, the authorisation read handles it on
-    /// the path every row took before the columns existed. A pass that fails
-    /// (a write that waited out the busy timeout, say) is retried a few times
-    /// and then left for the next open; every pass resumes from whatever is
-    /// still unfilled.
+    /// the path every row took before the columns existed.
+    ///
+    /// The task keeps going for as long as the store is open. A pass that fails
+    /// (typically a write that waited out the busy timeout behind other
+    /// agents' writes) is retried after a backoff that doubles from 5 s to
+    /// 5 min; the failure streak — and with it the backoff — resets whenever a
+    /// pass makes progress, so a busy multi-agent store is slowed, never
+    /// abandoned. A failure caused by the store closing is not logged.
+    ///
+    /// Progress is observable without reading logs: the number of
+    /// secret-bearing grants still without a current key is published as the
+    /// `hc.db.cap_grant.unkeyed` gauge, one series per DNA. A value that stays
+    /// above zero after the "converged" log line is the number of grants no
+    /// key could be derived for; a corrupt one among them still fails every
+    /// secret-bearing authorisation of its author closed.
     pub fn spawn_cap_grant_lookup_backfill(&self) -> tokio::task::JoinHandle<()> {
+        use holochain_data::dht::CapGrantBackfillEvent;
+        use holochain_data::DatabaseIdentifier;
         let store = self.clone();
         tokio::spawn(async move {
-            use holochain_data::DatabaseIdentifier;
-            for attempt in 1..=CAP_GRANT_BACKFILL_ATTEMPTS {
-                if store.db.pool().is_closed() {
-                    return;
-                }
-                match store.backfill_cap_grant_lookup_keys().await {
-                    Ok(report) => {
-                        if report.authors_filled > 0
-                            || report.secret_keys_filled > 0
-                            || report.left_unkeyed > 0
-                        {
-                            tracing::info!(
-                                db = store.db.identifier().database_id(),
-                                authors_filled = report.authors_filled,
-                                secret_keys_filled = report.secret_keys_filled,
-                                left_unkeyed = report.left_unkeyed,
-                                "capability-grant lookup-key backfill pass complete"
-                            );
-                        }
-                        return;
+            let db_id = store.db.identifier().database_id().to_string();
+            let mut log = |event: CapGrantBackfillEvent<'_>| match event {
+                CapGrantBackfillEvent::PassFailed {
+                    error,
+                    consecutive_failures,
+                    retry_in,
+                    progress,
+                    unkeyed,
+                } => tracing::warn!(
+                    db = %db_id,
+                    ?error,
+                    consecutive_failures,
+                    retry_in_s = retry_in.as_secs(),
+                    authors_filled = progress.authors_filled,
+                    secret_keys_filled = progress.secret_keys_filled,
+                    ?unkeyed,
+                    "capability-grant lookup-key backfill pass failed; it will be retried, and \
+                     un-keyed grants stay on the slower read path until it succeeds"
+                ),
+                CapGrantBackfillEvent::Converged { report, unkeyed } => {
+                    if report.left_unkeyed > 0 {
+                        tracing::warn!(
+                            db = %db_id,
+                            authors_filled = report.authors_filled,
+                            secret_keys_filled = report.secret_keys_filled,
+                            left_unkeyed = report.left_unkeyed,
+                            max_write_hold_ms = report.max_write_hold.as_millis() as u64,
+                            ?unkeyed,
+                            "capability-grant lookup-key backfill converged, but no key could be \
+                             derived for some grants (missing or undecodable private entry, or a \
+                             corrupt action); they stay un-keyed, and a corrupt one still fails \
+                             every secret-bearing zome-call authorisation of its author closed"
+                        );
+                    } else if report.authors_filled > 0 || report.secret_keys_filled > 0 {
+                        tracing::info!(
+                            db = %db_id,
+                            authors_filled = report.authors_filled,
+                            secret_keys_filled = report.secret_keys_filled,
+                            max_write_hold_ms = report.max_write_hold.as_millis() as u64,
+                            "capability-grant lookup-key backfill converged"
+                        );
                     }
-                    Err(e) => tracing::warn!(
-                        db = store.db.identifier().database_id(),
-                        attempt,
-                        ?e,
-                        "capability-grant lookup-key backfill pass failed; un-keyed grants \
-                         stay on the slower read path"
-                    ),
                 }
-                tokio::time::sleep(CAP_GRANT_BACKFILL_RETRY_AFTER).await;
-            }
+            };
+            store
+                .db
+                .converge_cap_grant_lookup_keys(CAP_GRANT_BACKFILL, &mut log)
+                .await;
         })
     }
 
@@ -1301,6 +1344,63 @@ impl DhtStore<DbWrite<Dht>> {
     pub async fn new_test(dht: Dht) -> DhtStoreResult<Self> {
         let db = holochain_data::test_open_db(dht).await?;
         Ok(Self::new(db))
+    }
+
+    /// Test-only: write one secret-bearing capability grant for `author` the
+    /// way a binary that predates the `elohim_` lookup columns wrote it — the
+    /// action, the private entry, and a three-column `CapGrant` row carrying
+    /// neither author nor key.
+    ///
+    /// Lets a test outside this crate put a store into the state the
+    /// capability-grant backfill exists for.
+    pub async fn test_insert_unkeyed_cap_grant(
+        &self,
+        author: &AgentPubKey,
+    ) -> StateMutationResult<()> {
+        use holochain_zome_types::prelude::{
+            ActionHeader, CapAccess, CapSecret, CreateData, Entry, EntryType, GrantedFunctions,
+            RecordValidity, Signature, ZomeCallCapGrant,
+        };
+        let entry = Entry::CapGrant(ZomeCallCapGrant::new(
+            "written-before-the-lookup-columns".into(),
+            CapAccess::Transferable {
+                secret: CapSecret::from([7u8; 64]),
+            },
+            GrantedFunctions::All,
+        ));
+        let entry_hash = EntryHash::from_raw_36(vec![0xC6; 36]);
+        let action = Action {
+            header: ActionHeader {
+                author: author.clone(),
+                timestamp: Timestamp::now(),
+                action_seq: 100,
+                prev_action: Some(ActionHash::from_raw_36(vec![0xEE; 36])),
+            },
+            data: ActionData::Create(CreateData {
+                entry_type: EntryType::CapGrant,
+                entry_hash: entry_hash.clone(),
+            }),
+        };
+        let action_hash = ActionHash::with_data_sync(&action);
+        let sah = SignedActionHashed::with_presigned(
+            holo_hash::HoloHashed::with_pre_hashed(action, action_hash.clone()),
+            Signature([0u8; 64]),
+        );
+        let mut tx = self.db.begin().await.map_err(StateMutationError::from)?;
+        tx.insert_action(&sah, Some(RecordValidity::Accepted))
+            .await
+            .map_err(StateMutationError::from)?;
+        tx.insert_private_entry(&entry_hash, author, &entry)
+            .await
+            .map_err(StateMutationError::from)?;
+        tx.commit().await.map_err(StateMutationError::from)?;
+        // The pre-column binary's statement, verbatim.
+        sqlx::query("INSERT INTO CapGrant (action_hash, cap_access, tag) VALUES (?, 1, NULL)")
+            .bind(action_hash.get_raw_36())
+            .execute(self.db.pool())
+            .await
+            .map_err(StateMutationError::from)?;
+        Ok(())
     }
 
     /// Return the `when_integrated` timestamp for the given op hash if the op

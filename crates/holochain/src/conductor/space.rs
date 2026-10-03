@@ -676,4 +676,54 @@ mod tests {
             custom_max_readers as u32 + 1
         );
     }
+
+    /// Opening a space starts the capability-grant lookup-key backfill on its
+    /// DHT database: a grant left un-keyed in the file — as every grant written
+    /// before the lookup columns existed is — gets its key without anything
+    /// else asking for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opening_a_space_backfills_unkeyed_cap_grants() {
+        let temp_dir = tempfile::Builder::new().tempdir().unwrap();
+        let dna_hash = Arc::new(DnaHash::from_raw_36(vec![3; 36]));
+
+        // The file as an earlier run left it: one grant, not keyed.
+        {
+            let db = holochain_state::data::open_db(
+                temp_dir.path(),
+                holochain_state::data::Dht::new(dna_hash.clone()),
+                holochain_state::data::HolochainDataConfig::default(),
+            )
+            .await
+            .unwrap();
+            let store = DhtStore::new(db.clone());
+            store
+                .test_insert_unkeyed_cap_grant(&AgentPubKey::from_raw_36(vec![9; 36]))
+                .await
+                .unwrap();
+            assert_eq!(store.count_cap_grants_unkeyed().await.unwrap(), 1);
+            db.pool().close().await;
+        }
+
+        let space = Space::new(
+            dna_hash,
+            temp_dir.path().to_path_buf(),
+            Default::default(),
+            ConductorConfig::default().db_max_readers,
+            holochain_state::data::HolochainDataConfig::default(),
+            None,
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if space.dht_store.count_cap_grants_unkeyed().await.unwrap() == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the space was opened but the un-keyed grant was never keyed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 }

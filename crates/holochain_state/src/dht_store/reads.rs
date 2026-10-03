@@ -2397,10 +2397,19 @@ impl DhtStore<DbRead<Dht>> {
     /// preserved and for the two deliberate relaxations, both strictly more
     /// available and neither able to authorise anything: a corrupt action on an
     /// already-revoked grant is filtered out before decode, and — new with the
-    /// keyed read — a corrupt action on a live grant keyed to a DIFFERENT
-    /// secret is never fetched, so it no longer denies an unrelated call. A
-    /// corrupt action on a grant keyed to `check_secret`, or on any grant not
-    /// yet keyed, still denies.
+    /// keyed read — a corrupt live grant keyed to a DIFFERENT secret is never
+    /// fetched, so it no longer denies an unrelated call. "Corrupt" covers all
+    /// three ways a grant can fail to decode: its action, its private entry
+    /// blob, or an `entry_hash` column that disagrees with the action. Any of
+    /// the three on a grant keyed to `check_secret`, or on any grant not keyed
+    /// by the current derivation, still denies.
+    ///
+    /// That relaxation depends on history: the backfill cannot key a grant it
+    /// cannot decode, so one that was already corrupt when the backfill reached
+    /// it stays un-keyed and keeps denying every secret-bearing call of its
+    /// author, exactly as before this change. Such rows are counted by
+    /// [`DhtStore::count_cap_grants_unkeyed`](crate::dht_store::DhtStore::count_cap_grants_unkeyed)
+    /// and the `hc.db.cap_grant.unkeyed` gauge.
     pub async fn valid_cap_grants(
         &self,
         author: &AgentPubKey,

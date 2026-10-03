@@ -7,7 +7,7 @@
 mod action;
 mod cap_claim;
 mod cap_grant;
-pub use cap_grant::CapGrantBackfillReport;
+pub use cap_grant::{CapGrantBackfillConfig, CapGrantBackfillEvent, CapGrantBackfillReport};
 mod chain_lock;
 mod chain_op;
 mod chain_op_publish;
