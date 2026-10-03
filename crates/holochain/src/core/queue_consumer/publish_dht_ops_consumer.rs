@@ -1,7 +1,8 @@
 //! The workflow and queue consumer for sys validation
 
 use super::*;
-use crate::core::workflow::publish_dht_ops_workflow::publish_dht_ops_workflow;
+use crate::core::workflow::publish_dht_ops_workflow::publish_dht_ops_workflow_with_clock;
+use crate::core::workflow::publish_dht_ops_workflow::PublishSweepClock;
 use holochain_state::dht_store::DhtStore;
 
 /// Spawn the QueueConsumer for Publish workflow
@@ -36,6 +37,8 @@ pub fn spawn_publish_dht_ops_consumer(
         }
     };
     let sender = tx.clone();
+    // One sweep clock per cell, shared by every run of this consumer.
+    let clock = PublishSweepClock::default();
     super::queue_consumer_cell_bound(
         "publish_dht_ops_consumer",
         cell_id.clone(),
@@ -47,6 +50,7 @@ pub fn spawn_publish_dht_ops_consumer(
             let dht_store = dht_store.clone();
             let agent = cell_id.agent_pubkey().clone();
             let network = network.clone();
+            let clock = clock.clone();
             let min_publish_interval = conductor
                 .get_config()
                 .conductor_tuning_params()
@@ -57,7 +61,15 @@ pub fn spawn_publish_dht_ops_consumer(
                     return Ok(WorkComplete::Complete);
                 }
 
-                publish_dht_ops_workflow(dht_store, network, tx, agent, min_publish_interval).await
+                publish_dht_ops_workflow_with_clock(
+                    dht_store,
+                    network,
+                    tx,
+                    agent,
+                    min_publish_interval,
+                    &clock,
+                )
+                .await
             }
         },
     );

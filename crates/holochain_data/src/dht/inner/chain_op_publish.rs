@@ -167,6 +167,65 @@ where
         .await
 }
 
+/// The new-ops publish selector (see [`get_new_ops_to_publish`]). A const so
+/// the plan test EXPLAINs exactly what runs; binds: author, sequence floor,
+/// author.
+///
+/// `CROSS JOIN` pins the loop order: the author's actions above the floor,
+/// read by `(author, seq)` range, then each action's ops, then each op's
+/// publish row. The read therefore costs the actions committed since the
+/// floor, not the author's history.
+pub(crate) const GET_NEW_OPS_TO_PUBLISH_SQL: &str =
+    "SELECT ChainOp.hash AS dht_hash, ChainOp.basis_hash AS basis_hash, Action.seq AS sort_seq,
+                0 AS is_warrant
+         FROM Action
+         CROSS JOIN ChainOp ON ChainOp.action_hash = Action.hash
+         CROSS JOIN ChainOpPublish ON ChainOpPublish.op_hash = ChainOp.hash
+         WHERE Action.author = ?
+           AND Action.seq > ?
+           AND ChainOp.locally_validated = 1
+           AND (ChainOp.op_type != 2 OR Action.private_entry = 0)
+           AND ChainOpPublish.withhold_publish IS NULL
+           AND ChainOpPublish.last_publish_time IS NULL
+           AND ChainOpPublish.receipts_complete IS NULL
+
+         UNION ALL
+
+         SELECT WarrantOp.hash AS dht_hash, Warrant.warrantee AS basis_hash,
+                9223372036854775807 AS sort_seq, 1 AS is_warrant
+         FROM WarrantOp
+         JOIN Warrant ON WarrantOp.hash = Warrant.hash
+         LEFT JOIN WarrantPublish ON WarrantPublish.warrant_hash = Warrant.hash
+         WHERE Warrant.author = ?
+           AND WarrantPublish.last_publish_time IS NULL
+
+         ORDER BY sort_seq, dht_hash";
+
+/// Never-published ops of `author` whose action sequence is above
+/// `after_seq`, with the author's unpublished warrants.
+///
+/// The same eligibility as [`get_ops_to_publish`], restricted to ops that
+/// have never been published and that belong to actions after `after_seq`.
+/// The publish workflow passes the chain head it saw at its last full sweep,
+/// so between sweeps it reads only what has been committed since. Ops at or
+/// below the floor, including any whose send failed or that were withheld
+/// at the time, are picked up by the next sweep.
+pub(crate) async fn get_new_ops_to_publish<'e, E>(
+    executor: E,
+    author: &AgentPubKey,
+    after_seq: u32,
+) -> sqlx::Result<Vec<OpToPublishRow>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    sqlx::query_as(GET_NEW_OPS_TO_PUBLISH_SQL)
+        .bind(author.get_raw_36())
+        .bind(after_seq as i64)
+        .bind(author.get_raw_36())
+        .fetch_all(executor)
+        .await
+}
+
 /// Count integrated ops authored by `author` that have been published at
 /// least once (i.e. `ChainOpPublish.last_publish_time IS NOT NULL`).
 ///

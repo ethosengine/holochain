@@ -2932,9 +2932,22 @@ mod publish_query {
     /// Seed a single self-authored chain op into the DHT store with publish
     /// state derived from `facts`, and return its hash.
     async fn seed_chain_op(dht_store: &DhtStore, agent: &AgentPubKey, facts: Facts) -> DhtOpHash {
+        seed_chain_op_at(dht_store, agent, facts, None).await
+    }
+
+    /// [`seed_chain_op`] with the action at chain position `seq` when given.
+    async fn seed_chain_op_at(
+        dht_store: &DhtStore,
+        agent: &AgentPubKey,
+        facts: Facts,
+        seq: Option<u32>,
+    ) -> DhtOpHash {
         let entry = Entry::App(fixt!(AppEntryBytes));
         let mut action = fixt!(Action, CreateAction);
         action.header.author = agent.clone();
+        if let Some(seq) = seq {
+            action.header.action_seq = seq;
+        }
         *action.entry_hash_mut().unwrap() = EntryHash::with_data_sync(&entry);
         *action.entry_type_mut().unwrap() = AppEntryDefFixturator::new(if facts.private {
             EntryVisibility::Private
@@ -3014,6 +3027,138 @@ mod publish_query {
             .into_iter()
             .map(|(_, op)| op.hash)
             .collect()
+    }
+
+    async fn new_ops_to_publish(
+        dht_store: &DhtStore,
+        agent: &AgentPubKey,
+        after_seq: u32,
+    ) -> Vec<DhtOpHash> {
+        dht_store
+            .as_read()
+            .get_new_ops_to_publish(agent, after_seq)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, op)| op.hash)
+            .collect()
+    }
+
+    /// The new-ops read applies the full selector's eligibility rules, and
+    /// differs from it only by leaving out ops that were published before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_ops_read_is_the_never_published_part_of_the_full_read() {
+        let dht_store = test_dht_store(fixt!(DnaHash)).await;
+        let agent = fixt!(AgentPubKey);
+        let mut seq = 0;
+        for bits in 0..32u8 {
+            seq += 1;
+            seed_chain_op_at(
+                &dht_store,
+                &agent,
+                Facts {
+                    private: bits & 1 != 0,
+                    within_min_period: bits & 2 != 0,
+                    has_required_receipts: bits & 4 != 0,
+                    store_entry: bits & 8 != 0,
+                    withhold_publish: bits & 16 != 0,
+                },
+                Some(seq),
+            )
+            .await;
+        }
+        // Published long ago, so due for a republish but not new.
+        seq += 1;
+        let stale = seed_chain_op_at(
+            &dht_store,
+            &agent,
+            Facts {
+                private: false,
+                within_min_period: false,
+                has_required_receipts: false,
+                store_entry: false,
+                withhold_publish: false,
+            },
+            Some(seq),
+        )
+        .await;
+        dht_store
+            .record_published_op_hashes(
+                vec![PublishableOp {
+                    hash: stale.clone(),
+                    kind: PublishOpKind::ChainOp,
+                }],
+                Timestamp::from_micros(0),
+            )
+            .await
+            .unwrap();
+        // Another author's op and this author's warrant.
+        seed_chain_op_at(
+            &dht_store,
+            &fixt!(AgentPubKey),
+            Facts {
+                private: false,
+                within_min_period: false,
+                has_required_receipts: false,
+                store_entry: false,
+                withhold_publish: false,
+            },
+            Some(1),
+        )
+        .await;
+        let warrant = build_warrant_op(&agent);
+        let warrant_hash = warrant.as_hash().clone();
+        dht_store
+            .test_insert_integrated_warrant(warrant)
+            .await
+            .unwrap();
+
+        let mut full = ops_to_publish(&dht_store, &agent).await;
+        let mut new = new_ops_to_publish(&dht_store, &agent, 0).await;
+        assert!(full.contains(&stale), "the stale op is due for a republish");
+        assert!(new.contains(&warrant_hash), "unpublished warrants are new");
+        full.retain(|h| h != &stale);
+        full.sort();
+        new.sort();
+        assert_eq!(new, full);
+    }
+
+    /// Between sweeps the new-ops read returns only actions above the floor,
+    /// and always the author's unpublished warrants.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_ops_read_starts_above_the_floor() {
+        let dht_store = test_dht_store(fixt!(DnaHash)).await;
+        let agent = fixt!(AgentPubKey);
+        let fresh = Facts {
+            private: false,
+            within_min_period: false,
+            has_required_receipts: false,
+            store_entry: false,
+            withhold_publish: false,
+        };
+        let at_3 = seed_chain_op_at(&dht_store, &agent, fresh, Some(3)).await;
+        let at_4 = seed_chain_op_at(&dht_store, &agent, fresh, Some(4)).await;
+        let at_5 = seed_chain_op_at(&dht_store, &agent, fresh, Some(5)).await;
+        let warrant = build_warrant_op(&agent);
+        let warrant_hash = warrant.as_hash().clone();
+        dht_store
+            .test_insert_integrated_warrant(warrant)
+            .await
+            .unwrap();
+
+        let mut above_2 = new_ops_to_publish(&dht_store, &agent, 2).await;
+        above_2.sort();
+        let mut expected = vec![at_3, at_4, at_5.clone(), warrant_hash.clone()];
+        expected.sort();
+        assert_eq!(above_2, expected);
+        assert_eq!(
+            new_ops_to_publish(&dht_store, &agent, 4).await,
+            vec![at_5, warrant_hash.clone()]
+        );
+        assert_eq!(
+            new_ops_to_publish(&dht_store, &agent, 5).await,
+            vec![warrant_hash]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

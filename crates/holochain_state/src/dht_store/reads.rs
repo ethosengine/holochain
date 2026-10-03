@@ -281,24 +281,23 @@ impl DhtStore<DbRead<Dht>> {
             .as_micros()
             .saturating_sub(min_publish_interval.as_micros() as i64);
         let rows = self.db().get_ops_to_publish(author, recency).await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let basis: AnyLinkableHash = ExternalHash::from_raw_36(r.basis_hash).into();
-                let kind = if r.is_warrant != 0 {
-                    PublishOpKind::Warrant
-                } else {
-                    PublishOpKind::ChainOp
-                };
-                (
-                    basis,
-                    PublishableOp {
-                        hash: DhtOpHash::from_raw_36(r.dht_hash),
-                        kind,
-                    },
-                )
-            })
-            .collect())
+        Ok(publishable_from_rows(rows))
+    }
+
+    /// Never-published ops authored by `author` whose action sequence is above
+    /// `after_seq`, with the author's unpublished warrants, keyed by basis.
+    ///
+    /// The cheap read the publish workflow uses between full sweeps: it costs
+    /// the actions committed after `after_seq`, not the author's history. The
+    /// eligibility rules are those of [`Self::get_ops_to_publish`], so private
+    /// `CreateEntry` ops are never returned.
+    pub async fn get_new_ops_to_publish(
+        &self,
+        author: &AgentPubKey,
+        after_seq: u32,
+    ) -> StateQueryResult<Vec<(AnyLinkableHash, PublishableOp)>> {
+        let rows = self.db().get_new_ops_to_publish(author, after_seq).await?;
+        Ok(publishable_from_rows(rows))
     }
 
     /// Count ops authored by `author` that may still need publishing in the
@@ -2524,6 +2523,33 @@ impl DhtStore<DbRead<Dht>> {
             .iter()
             .any(|sah| &sah.hashed.content.header.author == author))
     }
+}
+
+/// Key publish-selector rows by their DHT basis.
+///
+/// The basis is reconstructed as an [`ExternalHash`]: the publish path routes
+/// purely by the basis location, so the hash-type wrapper is irrelevant and the
+/// stored 36-byte basis is sufficient.
+fn publishable_from_rows(
+    rows: Vec<holochain_data::models::dht::OpToPublishRow>,
+) -> Vec<(AnyLinkableHash, PublishableOp)> {
+    rows.into_iter()
+        .map(|r| {
+            let basis: AnyLinkableHash = ExternalHash::from_raw_36(r.basis_hash).into();
+            let kind = if r.is_warrant != 0 {
+                PublishOpKind::Warrant
+            } else {
+                PublishOpKind::ChainOp
+            };
+            (
+                basis,
+                PublishableOp {
+                    hash: DhtOpHash::from_raw_36(r.dht_hash),
+                    kind,
+                },
+            )
+        })
+        .collect()
 }
 
 /// The action's declared entry type, if it creates or updates an entry.

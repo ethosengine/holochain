@@ -1654,6 +1654,58 @@ mod tests {
         );
     }
 
+    /// Between sweeps the publish workflow reads only the never-published ops
+    /// of actions committed since the last sweep. That read must be a range
+    /// over the author's actions above the floor, then each action's ops, then
+    /// each op's publish row: its cost is the actions since the floor, never the
+    /// author's history and never the store's unpublished set.
+    #[tokio::test]
+    async fn new_ops_publish_read_is_bounded_by_the_sequence_floor() {
+        let db = test_open_db(dht_id()).await.unwrap();
+        let plan = query_plan(
+            db.pool(),
+            super::super::chain_op_publish::GET_NEW_OPS_TO_PUBLISH_SQL,
+            3,
+        )
+        .await;
+        let action = plan
+            .iter()
+            .position(|d| d.starts_with("SEARCH Action "))
+            .unwrap_or_else(|| panic!("must search Action, plan: {plan:?}"));
+        assert!(
+            plan[action].contains("author=? AND seq>?"),
+            "must range over the author's actions above the floor, plan: {plan:?}"
+        );
+        let chain_op = plan
+            .iter()
+            .position(|d| {
+                d.starts_with("SEARCH ChainOp ") && !d.starts_with("SEARCH ChainOpPublish")
+            })
+            .unwrap_or_else(|| panic!("must search ChainOp, plan: {plan:?}"));
+        assert!(
+            plan[chain_op].contains("elohim_ChainOp_action_publish_idx"),
+            "must reach ChainOp by action hash, plan: {plan:?}"
+        );
+        let publish = plan
+            .iter()
+            .position(|d| d.starts_with("SEARCH ChainOpPublish "))
+            .unwrap_or_else(|| panic!("must search ChainOpPublish, plan: {plan:?}"));
+        assert!(
+            plan[publish].contains("PRIMARY KEY"),
+            "must probe ChainOpPublish by op hash, plan: {plan:?}"
+        );
+        assert!(
+            action < chain_op && chain_op < publish,
+            "the author's actions must drive the read, plan: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|d| d.starts_with("SCAN Action") || d.starts_with("SCAN ChainOp")),
+            "must not scan Action, ChainOp or ChainOpPublish, plan: {plan:?}"
+        );
+    }
+
     /// The reads behind zome `get` / `get_details` / `get_links` and the
     /// per-receipt count search an index, never scan their table.
     #[tokio::test]

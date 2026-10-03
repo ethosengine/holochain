@@ -72,6 +72,17 @@ impl DbRead<Dht> {
         chain_op_publish::get_ops_to_publish(&mut *conn, author, recency_threshold_micros).await
     }
 
+    /// Never-published ops of `author` after `after_seq`. See
+    /// `chain_op_publish::get_new_ops_to_publish`.
+    pub async fn get_new_ops_to_publish(
+        &self,
+        author: &AgentPubKey,
+        after_seq: u32,
+    ) -> sqlx::Result<Vec<OpToPublishRow>> {
+        let mut conn = self.timed_conn().await?;
+        chain_op_publish::get_new_ops_to_publish(&mut *conn, author, after_seq).await
+    }
+
     /// Count ops authored by `author` that may still need publishing. See
     /// `chain_op_publish::num_still_needing_publish`.
     pub async fn num_still_needing_publish(&self, author: &AgentPubKey) -> sqlx::Result<i64> {

@@ -1,6 +1,8 @@
 use crate::core::queue_consumer::TriggerSender;
 use crate::core::queue_consumer::WorkComplete;
 use crate::core::workflow::publish_dht_ops_workflow::publish_dht_ops_workflow;
+use crate::core::workflow::publish_dht_ops_workflow::publish_dht_ops_workflow_with_clock;
+use crate::core::workflow::publish_dht_ops_workflow::PublishSweepClock;
 use crate::prelude::*;
 use ::fixt::prelude::*;
 use holo_hash::fixt::ActionHashFixturator;
@@ -355,8 +357,20 @@ async fn verify_published_recently(dht_store: &DhtStore, op_hash: DhtOpHash) {
 /// Seed an integrated, self-authored `AgentActivity` op (with an empty
 /// publish row) and return its hash.
 async fn create_op(dht_store: &DhtStore, author: AgentPubKey) -> StateMutationResult<DhtOpHash> {
+    create_op_at(dht_store, author, None).await
+}
+
+/// [`create_op`] with the action at chain position `seq` when given.
+async fn create_op_at(
+    dht_store: &DhtStore,
+    author: AgentPubKey,
+    seq: Option<u32>,
+) -> StateMutationResult<DhtOpHash> {
     let mut create_action = fixt!(Action, CreateAction);
     create_action.header.author = author;
+    if let Some(seq) = seq {
+        create_action.header.action_seq = seq;
+    }
     let signed = SignedAction::new(create_action, fixt!(Signature));
     let op = DhtOpHashed::from_content_sync(DhtOp::from(ChainOp::AgentActivity(signed)));
 
@@ -558,4 +572,138 @@ async fn poison_op_does_not_void_other_publish_records() {
         second.len()
     );
     assert!(!second.contains(&poison));
+}
+
+/// Mark `op_hash` as published long ago, so it is due for a republish but is
+/// not a never-published op.
+async fn backdate_publish(dht_store: &DhtStore, op_hash: &DhtOpHash) {
+    dht_store
+        .record_published_op_hashes(
+            vec![PublishableOp {
+                hash: op_hash.clone(),
+                kind: PublishOpKind::ChainOp,
+            }],
+            Timestamp::from_micros(0),
+        )
+        .await
+        .unwrap();
+}
+
+/// A mock network that accepts every publish and records the op hashes sent.
+fn recording_network() -> (MockHolochainP2pDnaT, Arc<std::sync::Mutex<Vec<DhtOpHash>>>) {
+    let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut network = MockHolochainP2pDnaT::new();
+    let record = sent.clone();
+    network.expect_publish().returning(move |_, _, ops, _| {
+        record.lock().unwrap().extend(ops);
+        Ok(())
+    });
+    (network, sent)
+}
+
+/// Between sweeps a run publishes only ops committed since the last sweep,
+/// leaving a due republish for the next sweep; once the interval has passed
+/// the next run sweeps again.
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_between_sweeps_publish_only_new_ops() {
+    holochain_trace::test_run();
+
+    let dht_store = test_dht_store(fixt!(DnaHash)).await;
+    let agent = fixt!(AgentPubKey);
+    let interval = Duration::from_secs(2);
+    let clock = PublishSweepClock::default();
+    let (network, sent) = recording_network();
+    let network = Arc::new(network);
+    let run = || {
+        let (tx, _rx) =
+            TriggerSender::new_with_loop(Duration::from_secs(5)..Duration::from_secs(30), true);
+        publish_dht_ops_workflow_with_clock(
+            dht_store.clone(),
+            network.clone(),
+            tx,
+            agent.clone(),
+            interval,
+            &clock,
+        )
+    };
+    let take = || std::mem::take(&mut *sent.lock().unwrap());
+
+    // The first run sweeps and records the head, seq 10.
+    let old = create_op_at(&dht_store, agent.clone(), Some(10))
+        .await
+        .unwrap();
+    assert_eq!(WorkComplete::Complete, run().await.unwrap());
+    assert_eq!(take(), vec![old.clone()]);
+
+    // The old op becomes due again; a new op lands above the head.
+    backdate_publish(&dht_store, &old).await;
+    let new = create_op_at(&dht_store, agent.clone(), Some(11))
+        .await
+        .unwrap();
+    run().await.unwrap();
+    assert_eq!(take(), vec![new.clone()], "between sweeps only the new op");
+
+    // Nothing new: a run between sweeps sends nothing, though the old op is due.
+    run().await.unwrap();
+    assert!(take().is_empty(), "a due republish waits for the sweep");
+
+    // After the interval the next run sweeps and republishes what is due.
+    tokio::time::sleep(interval + Duration::from_millis(200)).await;
+    run().await.unwrap();
+    let swept = take();
+    assert!(swept.contains(&old), "the sweep republishes the due op");
+    assert!(swept.contains(&new), "the new op is also due by now");
+}
+
+/// A sweep that hit a routing error is not recorded, so the next run sweeps
+/// again rather than waiting out the interval.
+#[tokio::test(flavor = "multi_thread")]
+async fn sweep_is_not_recorded_when_the_space_has_not_started() {
+    holochain_trace::test_run();
+
+    let dht_store = test_dht_store(fixt!(DnaHash)).await;
+    let agent = fixt!(AgentPubKey);
+    let clock = PublishSweepClock::default();
+    let interval = ConductorTuningParams::default().min_publish_interval();
+
+    // Published long ago: only a sweep selects it.
+    let op = create_op_at(&dht_store, agent.clone(), Some(10))
+        .await
+        .unwrap();
+    backdate_publish(&dht_store, &op).await;
+
+    let mut refusing = MockHolochainP2pDnaT::new();
+    refusing.expect_publish().return_once(|_, _, _, _| {
+        Err(holochain_p2p::HolochainP2pError::RoutingDnaError(fixt!(
+            DnaHash
+        )))
+    });
+    let (tx, _rx) =
+        TriggerSender::new_with_loop(Duration::from_secs(5)..Duration::from_secs(30), true);
+    let first = publish_dht_ops_workflow_with_clock(
+        dht_store.clone(),
+        Arc::new(refusing),
+        tx,
+        agent.clone(),
+        interval,
+        &clock,
+    )
+    .await
+    .unwrap();
+    assert_eq!(WorkComplete::Incomplete(None), first);
+
+    let (network, sent) = recording_network();
+    let (tx, _rx) =
+        TriggerSender::new_with_loop(Duration::from_secs(5)..Duration::from_secs(30), true);
+    publish_dht_ops_workflow_with_clock(
+        dht_store.clone(),
+        Arc::new(network),
+        tx,
+        agent,
+        interval,
+        &clock,
+    )
+    .await
+    .unwrap();
+    assert_eq!(*sent.lock().unwrap(), vec![op], "the retry is a sweep");
 }
