@@ -191,10 +191,87 @@ impl<Db> DhtStore<Db> {
     }
 }
 
+/// Rows per write transaction in the capability-grant lookup-key backfill.
+///
+/// Small on purpose: every agent hosted on the DNA shares this database's one
+/// writer, and a batch is the longest the backfill ever holds it. Measured on
+/// an on-disk store of 30 agents and 30 000 un-keyed grants (unoptimised
+/// build): a 256-row batch held the writer for at most about 150 ms, against a
+/// 15 s busy timeout; this is half that.
+const CAP_GRANT_BACKFILL_BATCH: u32 = 128;
+
+/// Pause between backfill batches, so queued writers get the lock.
+const CAP_GRANT_BACKFILL_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How many times a failed backfill pass is retried before it is left for the
+/// next time the store is opened, and how long to wait between tries.
+const CAP_GRANT_BACKFILL_ATTEMPTS: u32 = 5;
+const CAP_GRANT_BACKFILL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl DhtStore<DbWrite<Dht>> {
     /// The DNA hash this store belongs to.
     pub fn dna_hash(&self) -> &DnaHash {
         self.db.identifier().dna_hash()
+    }
+
+    /// Fill in the capability-grant lookup columns on rows that predate them.
+    ///
+    /// See [`DbWrite::backfill_cap_grant_lookup_keys`]. Authorisation is
+    /// correct whether or not this has run; it only makes the lookup cheaper.
+    pub async fn backfill_cap_grant_lookup_keys(
+        &self,
+    ) -> StateMutationResult<holochain_data::dht::CapGrantBackfillReport> {
+        self.db
+            .backfill_cap_grant_lookup_keys(CAP_GRANT_BACKFILL_BATCH, CAP_GRANT_BACKFILL_PAUSE)
+            .await
+            .map_err(StateMutationError::from)
+    }
+
+    /// Run [`backfill_cap_grant_lookup_keys`](Self::backfill_cap_grant_lookup_keys)
+    /// on a background task.
+    ///
+    /// Called once when a DNA's store is opened. It is spawned, never awaited,
+    /// so opening the store — and with it conductor readiness — does not wait
+    /// for it: until a row is filled in, the authorisation read handles it on
+    /// the path every row took before the columns existed. A pass that fails
+    /// (a write that waited out the busy timeout, say) is retried a few times
+    /// and then left for the next open; every pass resumes from whatever is
+    /// still unfilled.
+    pub fn spawn_cap_grant_lookup_backfill(&self) -> tokio::task::JoinHandle<()> {
+        let store = self.clone();
+        tokio::spawn(async move {
+            use holochain_data::DatabaseIdentifier;
+            for attempt in 1..=CAP_GRANT_BACKFILL_ATTEMPTS {
+                if store.db.pool().is_closed() {
+                    return;
+                }
+                match store.backfill_cap_grant_lookup_keys().await {
+                    Ok(report) => {
+                        if report.authors_filled > 0
+                            || report.secret_keys_filled > 0
+                            || report.left_unkeyed > 0
+                        {
+                            tracing::info!(
+                                db = store.db.identifier().database_id(),
+                                authors_filled = report.authors_filled,
+                                secret_keys_filled = report.secret_keys_filled,
+                                left_unkeyed = report.left_unkeyed,
+                                "capability-grant lookup-key backfill pass complete"
+                            );
+                        }
+                        return;
+                    }
+                    Err(e) => tracing::warn!(
+                        db = store.db.identifier().database_id(),
+                        attempt,
+                        ?e,
+                        "capability-grant lookup-key backfill pass failed; un-keyed grants \
+                         stay on the slower read path"
+                    ),
+                }
+                tokio::time::sleep(CAP_GRANT_BACKFILL_RETRY_AFTER).await;
+            }
+        })
     }
 
     /// Maximum number of connections in this store's underlying pool. Used by

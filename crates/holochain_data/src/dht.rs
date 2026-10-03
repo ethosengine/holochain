@@ -17,8 +17,10 @@ mod db_operations;
 mod inner;
 mod tx_operations;
 
+pub use db_operations::CapGrantBackfillReport;
 pub use db_operations::ChainWritePermit;
 pub use inner::action::{AuthorChainPrefilter, MAX_PREFILTER_ENTRY_HASHES};
+pub use inner::cap_grant::{cap_grant_secret_key, CAP_GRANT_SECRET_KEY_BYTES};
 pub use inner::chain_op::InsertChainOp;
 pub use inner::deleted_link::InsertDeletedLink;
 pub use inner::deleted_record::InsertDeletedRecord;
@@ -41,6 +43,14 @@ pub(crate) async fn ensure_sync_indexes(pool: &sqlx::Pool<sqlx::Sqlite>) -> sqlx
 /// database. See `inner::action::ACTION_CHAIN_INDEXES`.
 pub(crate) async fn ensure_chain_read_indexes(pool: &sqlx::Pool<sqlx::Sqlite>) -> sqlx::Result<()> {
     inner::action::ensure_chain_read_indexes(pool).await
+}
+
+/// ELOHIM PATCH: add the `CapGrant` lookup columns and their index to an
+/// opened DHT database. See `inner::cap_grant::CAP_GRANT_LOOKUP_COLUMNS`.
+pub(crate) async fn ensure_cap_grant_lookup_schema(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+) -> sqlx::Result<()> {
+    inner::cap_grant::ensure_cap_grant_lookup_schema(pool).await
 }
 
 #[cfg(test)]
@@ -588,9 +598,15 @@ mod tests {
 
         let author = action.hashed.content.header.author.clone();
         let action_hash = action.as_hash().clone();
-        db.insert_cap_grant(&action_hash, 1 /* Transferable */, Some("my-tag"))
-            .await
-            .unwrap();
+        db.insert_cap_grant(
+            &action_hash,
+            &author,
+            1, /* Transferable */
+            None,
+            Some("my-tag"),
+        )
+        .await
+        .unwrap();
 
         let by_access = db
             .as_ref()
@@ -616,9 +632,15 @@ mod tests {
         for seed in [3u8, 1, 2] {
             let action = sample_action(seed);
             db.insert_action(&action, None).await.unwrap();
-            db.insert_cap_grant(action.as_hash(), 1, Some("shared-tag"))
-                .await
-                .unwrap();
+            db.insert_cap_grant(
+                action.as_hash(),
+                &action.hashed.content.header.author,
+                1,
+                None,
+                Some("shared-tag"),
+            )
+            .await
+            .unwrap();
         }
 
         let author = AgentPubKey::from_raw_36(vec![1u8; 36]);
@@ -674,7 +696,13 @@ mod tests {
         let db = test_open_db(dht_db_id()).await.unwrap();
         let missing = ActionHash::from_raw_36(vec![42u8; 36]);
         let err = db
-            .insert_cap_grant(&missing, 0, None)
+            .insert_cap_grant(
+                &missing,
+                &AgentPubKey::from_raw_36(vec![1u8; 36]),
+                0,
+                None,
+                None,
+            )
             .await
             .unwrap_err()
             .to_string();

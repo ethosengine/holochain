@@ -521,6 +521,10 @@ impl Space {
                 .map_err(ConductorError::other)?;
             spawn_dht_wal_maintenance(new_dht_db.clone());
             let dht_store = DhtStore::new(new_dht_db);
+            // ELOHIM PATCH (per-call grant walk): key the capability grants
+            // written before the lookup columns existed. Detached: the store is
+            // usable, and authorisation correct, before and while it runs.
+            drop(dht_store.spawn_cap_grant_lookup_backfill());
 
             Ok(Self {
                 dna_hash,

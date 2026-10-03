@@ -54,7 +54,8 @@ async fn post_migrate(db_kind: kind::DbKind, pool: &Pool<Sqlite>) -> sqlx::Resul
     match db_kind {
         kind::DbKind::Dht => {
             dht::ensure_sync_indexes(pool).await?;
-            dht::ensure_chain_read_indexes(pool).await
+            dht::ensure_chain_read_indexes(pool).await?;
+            dht::ensure_cap_grant_lookup_schema(pool).await
         }
         kind::DbKind::Wasm | kind::DbKind::Conductor | kind::DbKind::PeerMetaStore => Ok(()),
     }

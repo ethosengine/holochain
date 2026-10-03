@@ -1791,6 +1791,9 @@ mod tests {
         super::super::action::ensure_chain_read_indexes(db.pool())
             .await
             .unwrap();
+        super::super::cap_grant::ensure_cap_grant_lookup_schema(db.pool())
+            .await
+            .unwrap();
 
         let names: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'elohim_%'
@@ -1806,6 +1809,7 @@ mod tests {
                 "elohim_Action_author_seq_idx",
                 "elohim_Action_prev_hash_idx",
                 "elohim_CapGrant_access_idx",
+                "elohim_CapGrant_author_access_secret_idx",
                 "elohim_ChainOp_action_publish_idx",
                 "elohim_ChainOp_basis_idx",
                 "elohim_ChainOp_loc_sync_idx",

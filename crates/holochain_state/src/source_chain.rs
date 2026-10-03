@@ -438,10 +438,22 @@ impl SourceChain<DbWrite<Dht>> {
                 .map_err(SourceChainError::other)?;
 
                 // For Create/Update of a CapGrant entry type, insert a CapGrant index row.
-                if let Some((cap_access, tag)) = cap_grant_index_params(sah, &entries) {
-                    tx.insert_cap_grant(sah.as_hash(), cap_access, tag.as_deref())
-                        .await
-                        .map_err(SourceChainError::other)?;
+                // The row carries the action's author and, for a grant with a
+                // secret, the lookup key derived from that author and secret,
+                // so authorising a call can seek to the grants that can match
+                // instead of reading every grant in the store. This is the only
+                // place a `CapGrant` row is written: grant entries are private,
+                // so no network, cache or integration path ever holds one.
+                if let Some(params) = cap_grant_index_params(sah, &entries) {
+                    tx.insert_cap_grant(
+                        sah.as_hash(),
+                        sah.action().author(),
+                        params.cap_access,
+                        params.secret.as_ref(),
+                        params.tag.as_deref(),
+                    )
+                    .await
+                    .map_err(SourceChainError::other)?;
                 }
             }
 
@@ -1336,16 +1348,26 @@ pub async fn dump_state_paginated(
 // Private helpers for the new-DB writes in `flush` and `genesis`
 // ---------------------------------------------------------------------------
 
-/// Return the `(cap_access_i64, Option<tag>)` parameters needed for
-/// `TxWrite::insert_cap_grant`, if the given action creates/updates a
-/// `CapGrant` entry. Returns `None` for all other action types.
+/// The parameters `TxWrite::insert_cap_grant` needs for one grant action.
+struct CapGrantIndexParams {
+    /// `CapAccess` class: 0=Unrestricted, 1=Transferable, 2=Assigned.
+    cap_access: i64,
+    /// The grant's secret; `None` for an `Unrestricted` grant.
+    secret: Option<CapSecret>,
+    /// The grant's tag; `None` when empty.
+    tag: Option<String>,
+}
+
+/// Return the parameters needed for `TxWrite::insert_cap_grant`, if the given
+/// action creates/updates a `CapGrant` entry. Returns `None` for all other
+/// action types.
 ///
-/// The entry content is needed to extract the tag; entries are looked up by
-/// the entry hash carried by the action.
+/// The entry content is needed to extract the tag and the secret; entries are
+/// looked up by the entry hash carried by the action.
 fn cap_grant_index_params(
     shh: &SignedActionHashed,
     entries: &[EntryHashed],
-) -> Option<(i64, Option<String>)> {
+) -> Option<CapGrantIndexParams> {
     let (entry_type, entry_hash) = match &shh.action().data {
         ActionData::Create(d) => (&d.entry_type, &d.entry_hash),
         ActionData::Update(d) => (&d.entry_type, &d.entry_hash),
@@ -1367,10 +1389,10 @@ fn cap_grant_index_params(
         _ => return None,
     };
 
-    let cap_access_i64 = match &cap_grant.access {
-        CapAccess::Unrestricted => 0_i64,
-        CapAccess::Transferable { .. } => 1_i64,
-        CapAccess::Assigned { .. } => 2_i64,
+    let (cap_access, secret) = match &cap_grant.access {
+        CapAccess::Unrestricted => (0_i64, None),
+        CapAccess::Transferable { secret } => (1_i64, Some(*secret)),
+        CapAccess::Assigned { secret, .. } => (2_i64, Some(*secret)),
     };
     // Deliberate empty→NULL normalisation: the schema stores an absent tag as
     // NULL rather than an empty string.
@@ -1380,7 +1402,11 @@ fn cap_grant_index_params(
         Some(cap_grant.tag.clone())
     };
 
-    Some((cap_access_i64, tag))
+    Some(CapGrantIndexParams {
+        cap_access,
+        secret,
+        tag,
+    })
 }
 
 /// Serialize `None` as an `Option<Schedule>` blob.
@@ -3588,6 +3614,61 @@ mod tests {
             .find(|g| g.is_valid(function, agent, secret.as_ref())))
     }
 
+    /// The secret a grant carries, if any.
+    fn grant_secret(grant: &CapGrant) -> Option<CapSecret> {
+        match grant {
+            CapGrant::RemoteAgent(g) => match &g.access {
+                CapAccess::Unrestricted => None,
+                CapAccess::Transferable { secret } | CapAccess::Assigned { secret, .. } => {
+                    Some(*secret)
+                }
+            },
+            CapGrant::ChainAuthor(_) => None,
+        }
+    }
+
+    /// The reference's candidates that `secret` can possibly authorise, in the
+    /// reference's order.
+    ///
+    /// The reference returns every live grant of the secret-bearing classes
+    /// whatever secret was presented; the keyed read returns only the grants
+    /// carrying the presented secret (once every row is keyed, which is the
+    /// state a store written by this code is in). `CapGrant::is_valid`
+    /// requires `secret == given` for both secret-bearing classes, so the
+    /// grants dropped here are exactly the ones `is_valid` rejects: the two
+    /// candidate vectors reach the same decision, and compare equal after this
+    /// filter. With no secret the reference is returned unchanged.
+    fn carrying(candidates: Vec<CapGrant>, secret: Option<&CapSecret>) -> Vec<CapGrant> {
+        match secret {
+            None => candidates,
+            Some(s) => candidates
+                .into_iter()
+                .filter(|g| grant_secret(g).as_ref() == Some(s))
+                .collect(),
+        }
+    }
+
+    /// `(author, secret_key)` as stored on the `CapGrant` row of `action`.
+    async fn stored_lookup_columns(
+        dht_store: &DhtStore,
+        action: &ActionHash,
+    ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        sqlx::query_as("SELECT author, secret_key FROM CapGrant WHERE action_hash = ?")
+            .bind(action.get_raw_36())
+            .fetch_one(dht_store.db().pool())
+            .await
+            .unwrap()
+    }
+
+    /// Put every `CapGrant` row back into the state a binary that predates the
+    /// lookup columns leaves it in: no author, no key.
+    async fn forget_lookup_columns(dht_store: &DhtStore) {
+        sqlx::query("UPDATE CapGrant SET author = NULL, secret_key = NULL")
+            .execute(dht_store.db().pool())
+            .await
+            .unwrap();
+    }
+
     /// What a seeded population looks like to the probes.
     struct Population {
         /// `(secret, function, one assignee that should work)` for grants that
@@ -3796,9 +3877,17 @@ mod tests {
         let bob = keystore.new_sign_keypair_random().await.unwrap();
 
         // 1. Candidate-vector equivalence, including order and duplicates.
-        //    The candidate set depends only on whether a secret was supplied,
-        //    so both shapes are covered here.
-        for probe_secret in [None, Some(pop.live_transferable[0].0)] {
+        //    With no secret the candidates are every live unrestricted grant.
+        //    With a secret they are the reference's candidates that carry that
+        //    secret (see `carrying`) — checked for every secret the population
+        //    ever used, live, superseded or deleted, and one it never used.
+        let mut probe_secrets: Vec<Option<CapSecret>> = vec![None, Some(secret_from(u64::MAX))];
+        probe_secrets.extend(pop.live_transferable.iter().map(|(s, _)| Some(*s)));
+        probe_secrets.extend(pop.live_assigned.iter().map(|(s, _, _)| Some(*s)));
+        probe_secrets.extend(pop.updated_secrets.iter().map(|(s, _)| Some(*s)));
+        probe_secrets.extend(pop.dead_secrets.iter().map(|(s, _)| Some(*s)));
+        let mut matched = 0;
+        for probe_secret in probe_secrets {
             let new = dht_store
                 .as_read()
                 .valid_cap_grants(&alice, probe_secret.as_ref())
@@ -3807,14 +3896,19 @@ mod tests {
                 .as_read()
                 .valid_cap_grants_reference(&alice, probe_secret.as_ref())
                 .await?;
+            assert!(!old.is_empty(), "population produced no candidates");
             assert_eq!(
                 new,
-                old,
+                carrying(old, probe_secret.as_ref()),
                 "candidate vectors diverged (seed {SEED}, secret supplied: {})",
                 probe_secret.is_some()
             );
-            assert!(!new.is_empty(), "population produced no candidates");
+            matched += new.len();
         }
+        assert!(
+            matched > 100,
+            "population produced too few matches to mean anything: {matched}"
+        );
 
         // 2. Decision equivalence — the exact grant returned, for every probe
         //    class: live secrets, dead secrets, updated secrets, wrong agent,
@@ -4353,10 +4447,13 @@ mod tests {
         assert_eq!(carol_candidates.len(), 1);
         assert_eq!(
             carol_candidates,
-            dht_store
-                .as_read()
-                .valid_cap_grants_reference(&carol, Some(&secret))
-                .await?
+            carrying(
+                dht_store
+                    .as_read()
+                    .valid_cap_grants_reference(&carol, Some(&secret))
+                    .await?,
+                Some(&secret)
+            )
         );
         Ok(())
     }
@@ -4602,10 +4699,13 @@ mod tests {
                     .as_read()
                     .valid_cap_grants(&alice, sec.as_ref())
                     .await?,
-                dht_store
-                    .as_read()
-                    .valid_cap_grants_reference(&alice, sec.as_ref())
-                    .await?
+                carrying(
+                    dht_store
+                        .as_read()
+                        .valid_cap_grants_reference(&alice, sec.as_ref())
+                        .await?,
+                    sec.as_ref()
+                )
             );
         }
         Ok(())
@@ -4817,15 +4917,13 @@ mod tests {
     /// The real gap is two orders of magnitude; the threshold is 3x so this
     /// can only fail if the per-row reads come back.
     ///
-    /// A direct query-count assertion would be strictly better, and was
-    /// considered. There is no statement counter on `DbRead`/`sqlx::Pool`, and
-    /// the only hook is sqlx's `tracing` event per statement, which needs a
-    /// GLOBAL subscriber — process-wide, so it would count the queries of every
-    /// other test running in parallel and would have to be serialised behind a
-    /// mutex. That machinery was judged not worth it for a property that is
-    /// provable by reading `get_live_cap_grant_entries`: one `fetch_all`, no
-    /// loop. Left as a timing ratio deliberately; if it ever flakes, delete it
-    /// rather than widening the threshold.
+    /// The direct count now exists one layer down, where a single connection
+    /// can be traced: `holochain_data`'s
+    /// `secret_keyed_lookup_cost_is_independent_of_grant_count_and_of_other_authors`
+    /// reads the statement count and the executed-operation count from SQLite
+    /// itself. There is still no statement counter on `DbRead`/`sqlx::Pool`, so
+    /// through `valid_cap_grants` this stays a timing ratio; if it ever flakes,
+    /// delete it rather than widening the threshold.
     #[tokio::test(flavor = "multi_thread")]
     async fn cap_grant_lookup_cost_does_not_scale_with_grant_count() -> SourceChainResult<()> {
         const SEED: u64 = 0x005C_A107;
@@ -4850,11 +4948,11 @@ mod tests {
             .as_read()
             .valid_cap_grants_reference(&alice, Some(&probe))
             .await?;
-        assert_eq!(warm_new, warm_old);
+        assert_eq!(warm_new, carrying(warm_old.clone(), Some(&probe)));
         assert!(
-            warm_new.len() > 200,
-            "expected a large candidate set, got {}",
-            warm_new.len()
+            warm_old.len() > 200,
+            "expected a large live grant set, got {}",
+            warm_old.len()
         );
 
         let t0 = std::time::Instant::now();
@@ -4878,9 +4976,339 @@ mod tests {
         assert!(
             new_elapsed * 3 < old_elapsed,
             "the per-grant query fan-out appears to have returned: \
-             new {new_elapsed:?} vs reference {old_elapsed:?} over {} candidates",
-            warm_new.len()
+             new {new_elapsed:?} vs reference {old_elapsed:?} over {} live grants",
+            warm_old.len()
         );
+        Ok(())
+    }
+
+    /// The candidates a secret-bearing authorisation read hands to `is_valid`
+    /// are the grants carrying that secret and nothing else — however many
+    /// other grants the author holds, and however many grants other agents
+    /// hold in the same database.
+    ///
+    /// This is the property through the real write path (source-chain flush)
+    /// and the real read path (`valid_cap_grants`). The statement-level cost —
+    /// statements issued, SQLite operations executed, rows read — is measured
+    /// at 10 / 5 000 / 5 000 + 5 000 foreign grants next to the query itself,
+    /// in `holochain_data`'s
+    /// `secret_keyed_lookup_cost_is_independent_of_grant_count_and_of_other_authors`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_candidates_do_not_scale_with_own_or_foreign_grants() -> SourceChainResult<()>
+    {
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+        } = TestCase::new().await;
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let carol = keystore.new_sign_keypair_random().await.unwrap();
+        genesis(
+            dht_store.clone(),
+            keystore.clone(),
+            fixt!(DnaHash),
+            carol.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let probe = secret_from(0xC0FFEE);
+        let function: GrantedFunction = ("zome_a".into(), "fn_one".into());
+        let wanted = ZomeCallCapGrant::new(
+            "wanted".into(),
+            CapAccess::Transferable { secret: probe },
+            listed(&[("zome_a", "fn_one")]),
+        );
+        let (wanted_action, _) = put_cap_grant(&chain, &wanted).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        // The single production write site populated both lookup columns.
+        assert_eq!(
+            stored_lookup_columns(&dht_store, &wanted_action).await,
+            (
+                Some(alice.get_raw_36().to_vec()),
+                Some(holochain_data::dht::cap_grant_secret_key(&alice, &probe).to_vec())
+            )
+        );
+
+        let mut live = Vec::new();
+        for (who, seed, count) in [
+            (&alice, 0x0A11_CE01_u64, 10_u64),
+            (&alice, 0x0A11_CE02, 600),
+            (&carol, 0x0CA2_0101, 600),
+        ] {
+            seed_population(&dht_store, &keystore, who, seed, count).await?;
+            let candidates = dht_store
+                .as_read()
+                .valid_cap_grants(&alice, Some(&probe))
+                .await?;
+            assert_eq!(
+                candidates,
+                vec![CapGrant::from(wanted.clone())],
+                "after {count} more grants for {who}"
+            );
+            live.push(
+                dht_store
+                    .as_read()
+                    .valid_cap_grants_reference(&alice, Some(&probe))
+                    .await?
+                    .len(),
+            );
+            let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+            assert_eq!(
+                chain
+                    .valid_cap_grant(function.clone(), bob.clone(), Some(probe))
+                    .await?,
+                Some(wanted.clone().into())
+            );
+        }
+        // The population the single candidate was picked out of did grow.
+        assert!(live[0] < 12 && live[1] > 300, "live grants: {live:?}");
+        Ok(())
+    }
+
+    /// A store whose `CapGrant` rows carry neither lookup column — every store
+    /// that exists before this change is deployed — authorises exactly as
+    /// before: the same candidates as the reference, the same decision for
+    /// every probe. Backfilled, it reads only the grants carrying the presented
+    /// secret and reaches the same decisions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_unbackfilled_store_authorises_exactly_as_before() -> SourceChainResult<()> {
+        const SEED: u64 = 0x01D_5702;
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+        } = TestCase::new().await;
+        drop(chain);
+        let pop = seed_population(&dht_store, &keystore, &alice, SEED, 240).await?;
+        let chain = fresh_chain(&dht_store, &keystore, &alice).await?;
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+
+        let mut probes: Vec<(GrantedFunction, AgentPubKey, Option<CapSecret>)> = Vec::new();
+        for (secret, function) in pop.live_transferable.iter().take(20) {
+            probes.push((function.clone(), bob.clone(), Some(*secret)));
+        }
+        for (secret, function, assignee) in pop.live_assigned.iter().take(20) {
+            probes.push((function.clone(), assignee.clone(), Some(*secret)));
+            probes.push((function.clone(), bob.clone(), Some(*secret)));
+        }
+        for (secret, function) in pop.dead_secrets.iter().take(20) {
+            probes.push((function.clone(), bob.clone(), Some(*secret)));
+        }
+        for (secret, function) in pop.updated_secrets.iter().take(20) {
+            probes.push((function.clone(), bob.clone(), Some(*secret)));
+        }
+        for function in pop.live_unrestricted.iter().take(10) {
+            probes.push((function.clone(), bob.clone(), None));
+        }
+        for function in pop.dead_unrestricted.iter().take(10) {
+            probes.push((function.clone(), bob.clone(), None));
+        }
+        probes.push((
+            ("zome_a".into(), "fn_one".into()),
+            bob.clone(),
+            Some(secret_from(u64::MAX)),
+        ));
+
+        let mut decisions = Vec::new();
+        for (function, agent, secret) in &probes {
+            decisions.push(
+                chain
+                    .valid_cap_grant(function.clone(), agent.clone(), *secret)
+                    .await?,
+            );
+        }
+        assert!(decisions.iter().filter(|d| d.is_some()).count() > 40);
+        assert!(decisions.iter().filter(|d| d.is_none()).count() > 20);
+
+        // The pre-column state: every row un-keyed.
+        forget_lookup_columns(&dht_store).await;
+        for (i, (function, agent, secret)) in probes.iter().enumerate() {
+            // The whole live class is read, exactly as the reference reads it…
+            assert_eq!(
+                dht_store
+                    .as_read()
+                    .valid_cap_grants(&alice, secret.as_ref())
+                    .await?,
+                dht_store
+                    .as_read()
+                    .valid_cap_grants_reference(&alice, secret.as_ref())
+                    .await?,
+                "probe {i}: un-backfilled candidates"
+            );
+            // …and decided exactly as before.
+            let got = chain
+                .valid_cap_grant(function.clone(), agent.clone(), *secret)
+                .await?;
+            assert_eq!(got, decisions[i], "probe {i}: un-backfilled decision");
+            assert_eq!(
+                got,
+                oracle_decision(&dht_store, &alice, function, agent, *secret).await?,
+                "probe {i}: un-backfilled decision vs oracle"
+            );
+        }
+
+        // Backfill, twice.
+        let report = dht_store.backfill_cap_grant_lookup_keys().await.unwrap();
+        assert!(report.authors_filled > 240 && report.secret_keys_filled > 100);
+        assert_eq!(report.left_unkeyed, 0);
+        assert_eq!(
+            dht_store.backfill_cap_grant_lookup_keys().await.unwrap(),
+            holochain_data::dht::CapGrantBackfillReport::default()
+        );
+        for (i, (function, agent, secret)) in probes.iter().enumerate() {
+            assert_eq!(
+                dht_store
+                    .as_read()
+                    .valid_cap_grants(&alice, secret.as_ref())
+                    .await?,
+                carrying(
+                    dht_store
+                        .as_read()
+                        .valid_cap_grants_reference(&alice, secret.as_ref())
+                        .await?,
+                    secret.as_ref()
+                ),
+                "probe {i}: backfilled candidates"
+            );
+            assert_eq!(
+                chain
+                    .valid_cap_grant(function.clone(), agent.clone(), *secret)
+                    .await?,
+                decisions[i],
+                "probe {i}: backfilled decision"
+            );
+        }
+        Ok(())
+    }
+
+    /// The background backfill the conductor spawns when it opens a DNA's
+    /// store keys a pre-column store and finishes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_spawned_backfill_keys_a_legacy_store() -> SourceChainResult<()> {
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            ..
+        } = TestCase::new().await;
+        let secret = secret_from(77);
+        let grant = ZomeCallCapGrant::new(
+            "legacy".into(),
+            CapAccess::Transferable { secret },
+            listed(&[("zome_a", "fn_one")]),
+        );
+        let (action, _) = put_cap_grant(&chain, &grant).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+        let keyed = stored_lookup_columns(&dht_store, &action).await;
+        assert!(keyed.0.is_some() && keyed.1.is_some());
+
+        forget_lookup_columns(&dht_store).await;
+        assert_eq!(
+            stored_lookup_columns(&dht_store, &action).await,
+            (None, None)
+        );
+
+        dht_store.spawn_cap_grant_lookup_backfill().await.unwrap();
+        assert_eq!(
+            stored_lookup_columns(&dht_store, &action).await,
+            keyed,
+            "the backfill derives exactly what the write path stores"
+        );
+        assert_eq!(
+            dht_store
+                .as_read()
+                .valid_cap_grants(&alice, Some(&secret))
+                .await?,
+            vec![CapGrant::from(grant)]
+        );
+        Ok(())
+    }
+
+    /// THE ONE DELIBERATE BEHAVIOUR CHANGE of the keyed lookup, pinned.
+    ///
+    /// The load-every-grant read decoded every live grant of the class, so a
+    /// corrupt action on ANY live secret-bearing grant failed every
+    /// secret-bearing authorisation for the author. The keyed read fetches only
+    /// the grants keyed to the presented secret, so a corrupt grant keyed to a
+    /// different secret is never read and no longer denies an unrelated call.
+    /// The corrupt grant's own secret is still denied, and so is every secret
+    /// if the corrupt grant has not been keyed. Strictly more available;
+    /// authorises nothing that was not already authorised.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_corrupt_unrelated_grant_no_longer_denies() -> SourceChainResult<()> {
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+        } = TestCase::new().await;
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let function: GrantedFunction = ("zome_a".into(), "fn_one".into());
+        let (broken_secret, wanted_secret) = (secret_from(1), secret_from(2));
+        let broken = ZomeCallCapGrant::new(
+            "broken".into(),
+            CapAccess::Transferable {
+                secret: broken_secret,
+            },
+            listed(&[("zome_a", "fn_one")]),
+        );
+        let wanted = ZomeCallCapGrant::new(
+            "wanted".into(),
+            CapAccess::Transferable {
+                secret: wanted_secret,
+            },
+            listed(&[("zome_a", "fn_one")]),
+        );
+        let (broken_action, _) = put_cap_grant(&chain, &broken).await?;
+        put_cap_grant(&chain, &wanted).await?;
+        chain.flush(vec![DhtArc::Empty]).await.unwrap();
+
+        sqlx::query("UPDATE Action SET action_data = ? WHERE hash = ?")
+            .bind(vec![0xFF_u8; 24])
+            .bind(broken_action.get_raw_36())
+            .execute(dht_store.db().pool())
+            .await
+            .unwrap();
+
+        // Before: deny-all. The reference still shows it.
+        assert!(dht_store
+            .as_read()
+            .valid_cap_grants_reference(&alice, Some(&wanted_secret))
+            .await
+            .is_err());
+
+        // Now: the unrelated call is authorised by its own, intact grant…
+        assert_eq!(
+            chain
+                .valid_cap_grant(function.clone(), bob.clone(), Some(wanted_secret))
+                .await?,
+            Some(wanted.clone().into())
+        );
+        // …the corrupt grant's own secret is still denied…
+        assert!(chain
+            .valid_cap_grant(function.clone(), bob.clone(), Some(broken_secret))
+            .await
+            .is_err());
+
+        // …and an un-keyed corrupt grant still denies everything.
+        forget_lookup_columns(&dht_store).await;
+        assert!(chain
+            .valid_cap_grant(function.clone(), bob.clone(), Some(wanted_secret))
+            .await
+            .is_err());
+        // The backfill cannot key a grant whose action does not decode, so it
+        // stays un-keyed and keeps denying: fail-closed is not backfilled away.
+        let report = dht_store.backfill_cap_grant_lookup_keys().await.unwrap();
+        assert_eq!((report.secret_keys_filled, report.left_unkeyed), (1, 1));
+        assert!(chain
+            .valid_cap_grant(function, bob, Some(wanted_secret))
+            .await
+            .is_err());
         Ok(())
     }
 

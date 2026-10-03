@@ -2368,21 +2368,39 @@ impl DhtStore<DbRead<Dht>> {
     /// index join filters on `Action.author`) and dropped when their entry has
     /// been updated or deleted by the author.
     ///
-    /// Cost: one query per access class — two when a secret is supplied, one
-    /// otherwise — regardless of how many grants the author has ever
-    /// committed. It used to be `3N + ceil(N/500) + 1` queries for `N` grants
-    /// of a class, which on a long-lived chain made authorising a single zome
-    /// call take seconds. `valid_cap_grants_reference` below keeps that
-    /// implementation as a differential-test oracle.
+    /// When a secret is supplied the store read is narrowed to the grants that
+    /// can carry it: the `CapGrant` rows keyed to `(author, secret)` plus any
+    /// row not yet keyed (one that predates the lookup columns and has not been
+    /// backfilled). The result is therefore a SUBSET of the author's live
+    /// secret-bearing grants that always contains every grant carrying
+    /// `check_secret` — which is the only set `CapGrant::is_valid` can accept —
+    /// and it may still contain grants with other secrets. The key narrows the
+    /// read; it is never the decision. Callers MUST keep deciding with
+    /// `is_valid`, which compares the grant's real secret.
     ///
-    /// A corrupt action on a live grant still fails this read CLOSED (`Err`,
-    /// hence deny-all), matching the old per-row `get_action`, whose
+    /// Cost: one query per access class — two when a secret is supplied, one
+    /// otherwise. On a store whose lookup columns are filled in, a
+    /// secret-bearing read fetches and decodes only the grants keyed to that
+    /// secret, regardless of how many grants the author, or any other agent in
+    /// the same database, has ever committed. The pre-keyed read fetched and
+    /// decoded every live grant of the class for the author after walking the
+    /// class for every agent, and the one before it issued
+    /// `3N + ceil(N/500) + 1` queries for `N` grants.
+    /// `valid_cap_grants_reference` below keeps that oldest implementation as a
+    /// differential-test oracle.
+    ///
+    /// A corrupt action on a grant this read fetches still fails it CLOSED
+    /// (`Err`, hence deny-all), matching the old per-row `get_action`, whose
     /// `else { continue }` arm covered only a MISSING row while a row that
     /// failed to decode propagated `sqlx::Error::Decode`. See
     /// `holochain_data`'s `get_live_cap_grant_entries` for how that is
-    /// preserved and for the one deliberate relaxation (a corrupt action on an
-    /// already-revoked grant is filtered out before decode, so it no longer
-    /// errors — strictly more available, and it cannot authorise anything).
+    /// preserved and for the two deliberate relaxations, both strictly more
+    /// available and neither able to authorise anything: a corrupt action on an
+    /// already-revoked grant is filtered out before decode, and — new with the
+    /// keyed read — a corrupt action on a live grant keyed to a DIFFERENT
+    /// secret is never fetched, so it no longer denies an unrelated call. A
+    /// corrupt action on a grant keyed to `check_secret`, or on any grant not
+    /// yet keyed, still denies.
     pub async fn valid_cap_grants(
         &self,
         author: &AgentPubKey,
@@ -2411,9 +2429,14 @@ impl DhtStore<DbRead<Dht>> {
             // inherited, not introduced: `Action.seq` is not unique per author
             // (the primary key is `hash`), so a forked or restored chain can
             // tie, and neither implementation is stable under a tie.
+            //
+            // `check_secret` is `Some` exactly for the secret-bearing classes
+            // and `None` exactly for the unrestricted class (see
+            // `access_types` above), so the secret narrows only the reads it
+            // can apply to and the unrestricted class is read whole.
             let entries = self
                 .db()
-                .get_live_cap_grant_entries(author.clone(), access)
+                .get_live_cap_grant_entries(author.clone(), access, check_secret)
                 .await?;
             for entry in entries {
                 if let Some(grant) = entry.as_cap_grant() {

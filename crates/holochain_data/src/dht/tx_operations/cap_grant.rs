@@ -5,15 +5,31 @@ use crate::handles::{TxRead, TxWrite};
 use crate::kind::Dht;
 use crate::models::dht::CapGrantRow;
 use holo_hash::{ActionHash, AgentPubKey};
+use holochain_integrity_types::capability::CapSecret;
 
 impl TxWrite<Dht> {
+    /// Insert the `CapGrant` index row for a grant action of `author`.
+    ///
+    /// `secret` is the grant's secret for a `Transferable` / `Assigned` grant
+    /// and `None` for an `Unrestricted` one. The secret itself is not stored:
+    /// the row carries [`cap_grant_secret_key`](crate::dht::cap_grant_secret_key).
     pub async fn insert_cap_grant(
         &mut self,
         action_hash: &ActionHash,
+        author: &AgentPubKey,
         cap_access: i64,
+        secret: Option<&CapSecret>,
         tag: Option<&str>,
     ) -> sqlx::Result<()> {
-        cap_grant::insert_cap_grant(self.conn_mut(), action_hash, cap_access, tag).await
+        cap_grant::insert_cap_grant(
+            self.conn_mut(),
+            action_hash,
+            author,
+            cap_access,
+            secret,
+            tag,
+        )
+        .await
     }
 }
 
