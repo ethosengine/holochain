@@ -641,6 +641,8 @@ async fn cap_grant_backfill_publishes_the_unkeyed_gauge() {
         start_delay: Duration::ZERO,
         batch: 8,
         pause: Duration::ZERO,
+        yield_above: Duration::MAX,
+        max_pause: Duration::ZERO,
         min_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(1),
     };

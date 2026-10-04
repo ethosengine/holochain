@@ -5798,6 +5798,8 @@ mod tests {
                     holochain_data::dht::CapGrantBackfillEvent::Converged { .. } => {
                         converged = true
                     }
+                    holochain_data::dht::CapGrantBackfillEvent::Started { .. }
+                    | holochain_data::dht::CapGrantBackfillEvent::Yielded { .. } => {}
                 }
             })
             .await;
@@ -5840,6 +5842,158 @@ mod tests {
                 "probe {i} after the backfill"
             );
         }
+        Ok(())
+    }
+
+    /// Un-keyed grants are decided correctly WHILE the backfill is running.
+    ///
+    /// The backfill is paced slowly (8 rows a batch, 20 ms apart) over a store
+    /// of grants that are all un-keyed, and for as long as it runs a reader
+    /// calls the production `valid_cap_grant` on a fixed set of probes — live
+    /// secrets, revoked secrets, an unknown secret, for both authors — whose
+    /// decisions were derived from the reference implementation beforehand.
+    /// Every decision is checked, and the reader records how many grants were
+    /// still un-keyed when it made each one, so the test can show decisions
+    /// were taken throughout: with nothing keyed, part-way, and at the end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cap_grant_decisions_are_correct_while_the_backfill_runs() -> SourceChainResult<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const GRANTS_PER_AUTHOR: u64 = 200;
+        const REVOKED: u64 = 20;
+
+        let TestCase {
+            chain,
+            agent_key: alice,
+            dht_store,
+            keystore,
+        } = TestCase::new().await;
+        drop(chain);
+        let carol = keystore.new_sign_keypair_random().await.unwrap();
+        genesis(
+            dht_store.clone(),
+            keystore.clone(),
+            fixt!(DnaHash),
+            carol.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let bob = keystore.new_sign_keypair_random().await.unwrap();
+        let function: GrantedFunction = ("zome_a".into(), "fn_one".into());
+        let authors = vec![alice, carol];
+        let secret_of = |author: usize, i: u64| secret_from(author as u64 * 1_000_000 + i);
+
+        for (a, agent) in authors.iter().enumerate() {
+            let chain = fresh_chain(&dht_store, &keystore, agent).await?;
+            let mut to_revoke = Vec::new();
+            for i in 0..GRANTS_PER_AUTHOR {
+                let grant = ZomeCallCapGrant::new(
+                    "paced".into(),
+                    CapAccess::Transferable {
+                        secret: secret_of(a, i),
+                    },
+                    listed(&[("zome_a", "fn_one")]),
+                );
+                let put = put_cap_grant(&chain, &grant).await?;
+                if i < REVOKED {
+                    to_revoke.push(put);
+                }
+            }
+            chain.flush(vec![DhtArc::Empty]).await.unwrap();
+            let chain = fresh_chain(&dht_store, &keystore, agent).await?;
+            for (action, entry) in to_revoke {
+                delete_cap_grant(&chain, action, entry).await?;
+            }
+            chain.flush(vec![DhtArc::Empty]).await.unwrap();
+        }
+
+        // Probes, and the reference's decision for each.
+        let mut probes: Vec<(usize, CapSecret)> = Vec::new();
+        for a in 0..authors.len() {
+            for i in (0..REVOKED).chain(100..120) {
+                probes.push((a, secret_of(a, i)));
+            }
+            probes.push((a, secret_from(u64::MAX - a as u64)));
+        }
+        let mut expected = Vec::new();
+        for (a, secret) in &probes {
+            expected.push(
+                oracle_decision(&dht_store, &authors[*a], &function, &bob, Some(*secret)).await?,
+            );
+        }
+        assert_eq!(expected.iter().filter(|d| d.is_some()).count(), 40);
+        assert_eq!(expected.iter().filter(|d| d.is_none()).count(), 42);
+
+        forget_lookup_columns(&dht_store).await;
+        let total = dht_store.count_cap_grants_unkeyed().await.unwrap();
+        assert_eq!(total, 2 * GRANTS_PER_AUTHOR);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = tokio::spawn({
+            let (dht_store, keystore, authors) =
+                (dht_store.clone(), keystore.clone(), authors.clone());
+            let (probes, expected) = (probes.clone(), expected.clone());
+            let (function, bob, done) = (function.clone(), bob.clone(), done.clone());
+            async move {
+                let mut chains = Vec::new();
+                for author in &authors {
+                    chains.push(fresh_chain(&dht_store, &keystore, author).await.unwrap());
+                }
+                // The un-keyed count seen just before each decision.
+                let mut seen_unkeyed = Vec::new();
+                'outer: loop {
+                    for (i, (a, secret)) in probes.iter().enumerate() {
+                        let finished = done.load(Ordering::SeqCst);
+                        seen_unkeyed.push(dht_store.count_cap_grants_unkeyed().await.unwrap());
+                        let got = chains[*a]
+                            .valid_cap_grant(function.clone(), bob.clone(), Some(*secret))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            got, expected[i],
+                            "probe {i} (author {a}) differs from the reference mid-backfill"
+                        );
+                        if finished {
+                            break 'outer;
+                        }
+                    }
+                }
+                seen_unkeyed
+            }
+        });
+
+        let mut config = crate::dht_store::CAP_GRANT_BACKFILL;
+        config.start_delay = std::time::Duration::from_millis(200);
+        config.batch = 8;
+        config.pause = std::time::Duration::from_millis(20);
+        let mut converged = false;
+        let report = dht_store
+            .db()
+            .converge_cap_grant_lookup_keys(config, &mut |event| {
+                if let holochain_data::dht::CapGrantBackfillEvent::Converged { .. } = event {
+                    converged = true;
+                }
+            })
+            .await;
+        done.store(true, Ordering::SeqCst);
+        let seen_unkeyed = reader.await.unwrap();
+
+        assert!(converged);
+        assert_eq!(report.secret_keys_filled, total);
+        assert_eq!(dht_store.count_cap_grants_unkeyed().await.unwrap(), 0);
+        let before = seen_unkeyed.iter().filter(|n| **n == total).count();
+        let during = seen_unkeyed
+            .iter()
+            .filter(|n| **n > 0 && **n < total)
+            .collect::<HashSet<_>>()
+            .len();
+        let after = seen_unkeyed.iter().filter(|n| **n == 0).count();
+        assert!(
+            before >= 1 && during >= 10 && after >= 1,
+            "decisions must span the backfill: {before} with nothing keyed, {during} distinct \
+             part-way states, {after} fully keyed, of {} decisions",
+            seen_unkeyed.len()
+        );
         Ok(())
     }
 

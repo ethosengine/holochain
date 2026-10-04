@@ -23,11 +23,16 @@ pub struct CapGrantBackfillReport {
     /// rather than merely missing its entry — still failing every
     /// secret-bearing authorisation of their author closed.
     pub left_unkeyed: u64,
-    /// The longest any single backfill write took from asking for the write
-    /// lock to releasing it. It bounds how long the backfill ever held the
-    /// database's one writer (the time spent waiting for the lock is included,
-    /// so the true hold is no longer than this).
+    /// The longest any batch waited for the database's write lock.
+    pub max_lock_wait: Duration,
+    /// The longest any batch HELD the write lock: from acquiring it to
+    /// committing. This is the longest the backfill ever stood in the way of
+    /// another writer.
     pub max_write_hold: Duration,
+    /// How many times the backfill lengthened its pause because a batch had
+    /// waited for, or held, the write lock for longer than
+    /// [`CapGrantBackfillConfig::yield_above`].
+    pub yields: u64,
 }
 
 impl CapGrantBackfillReport {
@@ -37,7 +42,9 @@ impl CapGrantBackfillReport {
         self.secret_keys_filled += pass.secret_keys_filled;
         // Not a sum: each pass re-examines the rows the previous one left.
         self.left_unkeyed = pass.left_unkeyed;
+        self.max_lock_wait = self.max_lock_wait.max(pass.max_lock_wait);
         self.max_write_hold = self.max_write_hold.max(pass.max_write_hold);
+        self.yields += pass.yields;
     }
 
     fn made_progress(&self) -> bool {
@@ -46,16 +53,26 @@ impl CapGrantBackfillReport {
 }
 
 /// How [`DbWrite::converge_cap_grant_lookup_keys`] paces itself.
+///
+/// The backfill is strictly background work. Rows it has not reached cost what
+/// they cost before the lookup columns existed, so there is never a reason for
+/// it to compete with anything: it writes little at a time and gets out of the
+/// way as soon as it sees it is in the way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapGrantBackfillConfig {
-    /// Waited once before the first pass. The backfill is never urgent, and a
-    /// store that has just been opened is at its busiest (and, in a process
-    /// that opens a store and exits at once, about to be torn down).
+    /// Waited once before the first pass.
     pub start_delay: Duration,
-    /// Rows per write. A batch is the longest the backfill holds the writer.
+    /// Rows per write. Each batch is ONE statement, so this is what bounds how
+    /// long the database's single writer is ever held.
     pub batch: u32,
-    /// Slept between batches, so queued writers get the lock.
+    /// Slept between batches, with no connection held.
     pub pause: Duration,
+    /// When a batch waited for the write lock, or held it, for longer than
+    /// this, something else wants the database: the pause is doubled.
+    pub yield_above: Duration,
+    /// The pause doubles up to this, and falls back to `pause` as soon as a
+    /// batch goes through without contention.
+    pub max_pause: Duration,
     /// Wait before retrying after the first failed pass of a streak.
     pub min_backoff: Duration,
     /// The wait doubles with each consecutive failure up to this cap.
@@ -64,11 +81,26 @@ pub struct CapGrantBackfillConfig {
 
 /// Something [`DbWrite::converge_cap_grant_lookup_keys`] reports as it runs.
 #[derive(Debug)]
-pub enum CapGrantBackfillEvent<'a> {
+pub enum CapGrantBackfillEvent {
+    /// The start delay is over and the first pass is about to begin.
+    Started {
+        /// Secret-bearing rows without a current key, if it could be counted.
+        unkeyed: Option<u64>,
+    },
+    /// A batch waited for, or held, the write lock for longer than
+    /// [`CapGrantBackfillConfig::yield_above`]; the pause was lengthened.
+    Yielded {
+        /// How long the batch waited for the write lock.
+        lock_wait: Duration,
+        /// How long the batch held the write lock.
+        write_hold: Duration,
+        /// The pause now in force.
+        pause: Duration,
+    },
     /// A pass failed and will be retried after `retry_in`.
     PassFailed {
         /// Why the pass stopped.
-        error: &'a sqlx::Error,
+        error: String,
         /// Failed passes since the last one that made progress, this included.
         consecutive_failures: u32,
         /// How long until the next pass.
@@ -89,18 +121,25 @@ pub enum CapGrantBackfillEvent<'a> {
     },
 }
 
-/// One batch of the `elohim_secret_key` backfill.
+/// One batch of the backfill walk.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct CapGrantKeyBatch {
-    /// Rows examined.
-    pub scanned: u64,
-    /// Rows keyed.
+pub(crate) struct CapGrantFillBatch {
+    /// Rows whose author was filled in.
+    pub authors: u64,
+    /// Rows whose key was filled in.
     pub keyed: u64,
-    /// Where the next batch starts; `None` when the scan reached the end.
+    /// Rows that needed a key and for which none could be derived.
+    pub left_unkeyed: u64,
+    /// Where the next batch starts; `None` when the walk reached the end.
     pub next_cursor: Option<Vec<u8>>,
-    /// How long the batch's write transaction was open.
+    /// How long the batch waited for the write lock.
+    pub lock_wait: Duration,
+    /// How long the batch held the write lock.
     pub write_hold: Duration,
 }
+
+/// What reports events to the caller of the convergence driver.
+pub(crate) type BackfillObserver<'a> = &'a mut (dyn FnMut(CapGrantBackfillEvent) + Send);
 
 /// Called before every backfill write; an `Err` is returned in place of the
 /// write. Production passes [`no_fault`]; tests inject busy errors.
@@ -127,104 +166,115 @@ impl DbWrite<Dht> {
         cap_grant::insert_cap_grant(self.pool(), action_hash, author, cap_access, secret, tag).await
     }
 
-    /// Fill `CapGrant.elohim_author` on up to `limit` rows that lack it;
-    /// returns the number filled. One bounded statement.
-    pub(crate) async fn backfill_cap_grant_authors_batch(&self, limit: u32) -> sqlx::Result<u64> {
-        cap_grant::backfill_cap_grant_authors(self.pool(), limit).await
-    }
-
-    /// Key up to `limit` secret-bearing rows that have no key of the current
-    /// derivation, starting after `cursor`.
-    ///
-    /// The rows are read and their keys derived WITHOUT the write lock; only
-    /// the `limit`-bounded run of single-row updates holds it.
+    /// One batch of the backfill walk: fill the author and the key on up to
+    /// `limit` rows after `cursor` that lack either.
     #[cfg(test)]
-    pub(crate) async fn backfill_cap_grant_secret_keys_batch(
+    pub(crate) async fn backfill_cap_grant_batch(
         &self,
         cursor: Option<&[u8]>,
         limit: u32,
-    ) -> sqlx::Result<CapGrantKeyBatch> {
-        self.backfill_cap_grant_secret_keys_batch_with(cursor, limit, &mut no_fault)
+    ) -> sqlx::Result<CapGrantFillBatch> {
+        self.backfill_cap_grant_batch_with(cursor.map(<[u8]>::to_vec), limit, &mut no_fault)
             .await
     }
 
-    async fn backfill_cap_grant_secret_keys_batch_with(
+    /// See [`backfill_cap_grant_batch`](Self::backfill_cap_grant_batch).
+    ///
+    /// The rows are read, and their keys derived, on a read connection that is
+    /// returned to the pool before anything is written. The write is a single
+    /// statement inside `BEGIN IMMEDIATE … COMMIT`, on a connection that is
+    /// returned to the pool before this function returns: no connection, and
+    /// no lock, outlives the batch.
+    async fn backfill_cap_grant_batch_with(
         &self,
-        cursor: Option<&[u8]>,
+        cursor: Option<Vec<u8>>,
         limit: u32,
         fault: BackfillFault<'_>,
-    ) -> sqlx::Result<CapGrantKeyBatch> {
+    ) -> sqlx::Result<CapGrantFillBatch> {
         let rows = {
             let mut conn = self.as_ref().timed_conn().await?;
-            cap_grant::get_cap_grants_missing_secret_key(&mut *conn, cursor, limit).await?
+            cap_grant::get_cap_grants_to_backfill(&mut *conn, cursor, limit).await?
         };
-        let scanned = rows.len() as u64;
         // The largest hash read, whatever order the rows came back in.
-        let next_cursor = rows.iter().map(|row| &row.action.hash).max().cloned();
-        let keys: Vec<_> = rows
+        let next_cursor = rows.iter().map(|row| &row.live.action.hash).max().cloned();
+        let fills: Vec<_> = rows
             .into_iter()
-            .filter_map(|row| {
-                let action_hash = row.action.hash.clone();
-                cap_grant::derive_cap_grant_secret_key(row).map(|key| (action_hash, key))
-            })
+            .map(cap_grant::plan_cap_grant_fill)
             .collect();
 
-        let mut keyed = 0;
-        let mut write_hold = Duration::ZERO;
-        if !keys.is_empty() {
-            fault()?;
-            let started = Instant::now();
-            let mut tx = self.begin().await?;
-            for (action_hash, key) in &keys {
-                keyed +=
-                    cap_grant::set_cap_grant_secret_key(tx.conn_mut(), action_hash, key).await?;
-            }
-            tx.commit().await?;
-            write_hold = started.elapsed();
-        }
-        Ok(CapGrantKeyBatch {
-            scanned,
-            keyed,
+        let mut batch = CapGrantFillBatch {
+            authors: fills.iter().filter(|f| f.author.is_some()).count() as u64,
+            keyed: fills.iter().filter(|f| f.secret_key.is_some()).count() as u64,
+            left_unkeyed: fills
+                .iter()
+                .filter(|f| f.wanted_key && f.secret_key.is_none())
+                .count() as u64,
             next_cursor,
-            write_hold,
-        })
+            ..Default::default()
+        };
+        if batch.authors == 0 && batch.keyed == 0 {
+            return Ok(batch);
+        }
+
+        fault()?;
+        // `BEGIN IMMEDIATE` takes the write lock up front, so the wait for it
+        // and the time it is held are measured apart. The transaction guard
+        // rolls back if this future is dropped part-way.
+        let asked = Instant::now();
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let acquired = Instant::now();
+        cap_grant::apply_cap_grant_fills(&mut tx, &fills).await?;
+        tx.commit().await?;
+        batch.lock_wait = acquired.duration_since(asked);
+        batch.write_hold = acquired.elapsed();
+        Ok(batch)
     }
 
     /// One pass of the backfill, recording into `report` as it goes so that
     /// what was done before a failure is not lost.
     async fn backfill_cap_grant_pass(
         &self,
-        batch: u32,
-        pause: Duration,
+        config: CapGrantBackfillConfig,
         report: &mut CapGrantBackfillReport,
+        on_event: BackfillObserver<'_>,
         fault: BackfillFault<'_>,
     ) -> sqlx::Result<()> {
-        let batch = batch.max(1);
-
-        while !self.pool().is_closed() {
-            fault()?;
-            let started = Instant::now();
-            let filled = self.backfill_cap_grant_authors_batch(batch).await?;
-            report.max_write_hold = report.max_write_hold.max(started.elapsed());
-            if filled == 0 {
-                break;
-            }
-            report.authors_filled += filled;
-            tokio::time::sleep(pause).await;
-        }
-
+        let limit = config.batch.max(1);
+        let mut pause = config.pause;
         let mut cursor: Option<Vec<u8>> = None;
         while !self.pool().is_closed() {
             let step = self
-                .backfill_cap_grant_secret_keys_batch_with(cursor.as_deref(), batch, &mut *fault)
+                .backfill_cap_grant_batch_with(cursor.clone(), limit, &mut *fault)
                 .await?;
+            report.authors_filled += step.authors;
             report.secret_keys_filled += step.keyed;
-            report.left_unkeyed += step.scanned - step.keyed;
+            report.left_unkeyed += step.left_unkeyed;
+            report.max_lock_wait = report.max_lock_wait.max(step.lock_wait);
             report.max_write_hold = report.max_write_hold.max(step.write_hold);
             match step.next_cursor {
                 Some(next) => cursor = Some(next),
                 None => break,
             }
+
+            // Yield. A batch that had to wait for the lock, or was slow to
+            // write, means something else is using the database: back off, and
+            // come back to the base pace only once a batch goes through clean.
+            if step.lock_wait > config.yield_above || step.write_hold > config.yield_above {
+                pause = pause
+                    .max(config.yield_above)
+                    .saturating_mul(2)
+                    .min(config.max_pause.max(config.pause));
+                report.yields += 1;
+                on_event(CapGrantBackfillEvent::Yielded {
+                    lock_wait: step.lock_wait,
+                    write_hold: step.write_hold,
+                    pause,
+                });
+            } else {
+                pause = config.pause;
+            }
+            // Nothing is held here: the read connection and the write
+            // transaction were both returned to the pool inside the batch.
             tokio::time::sleep(pause).await;
         }
         Ok(())
@@ -242,24 +292,36 @@ impl DbWrite<Dht> {
     ///   a later pass picks up whatever is left, including rows written by an
     ///   older binary after a rollback. A second pass over a finished store
     ///   only re-examines the rows that cannot be keyed.
-    /// - **Bounded writes.** `elohim_author` is filled by one `UPDATE` per
-    ///   `batch` rows; `elohim_secret_key` is derived outside the write lock
-    ///   and written `batch` rows per transaction. `pause` is slept between
-    ///   batches so other writers on the database get the lock.
+    /// - **One walk.** The table is walked once per pass in primary-key order;
+    ///   a batch fills the author and the key of its rows together and the
+    ///   cursor never revisits a row, filled or unfillable.
+    /// - **Bounded writes.** A batch is one statement over `batch` rows, taken
+    ///   and released within the batch. `pause` is slept between batches with
+    ///   nothing held.
     /// - **Fail-safe.** A row whose key cannot be derived with certainty is
     ///   skipped and stays un-keyed.
     ///
     /// Stops early, returning what it did, if the pool is closed. An error
     /// loses nothing that was already written; use
     /// [`converge_cap_grant_lookup_keys`](Self::converge_cap_grant_lookup_keys)
-    /// to keep going until the job is done.
+    /// to keep going until the job is done, and to yield under contention.
     pub async fn backfill_cap_grant_lookup_keys(
         &self,
         batch: u32,
         pause: Duration,
     ) -> sqlx::Result<CapGrantBackfillReport> {
+        let config = CapGrantBackfillConfig {
+            start_delay: Duration::ZERO,
+            batch,
+            pause,
+            // No adaptive yielding: the caller chose the pace.
+            yield_above: Duration::MAX,
+            max_pause: pause,
+            min_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        };
         let mut report = CapGrantBackfillReport::default();
-        self.backfill_cap_grant_pass(batch, pause, &mut report, &mut no_fault)
+        self.backfill_cap_grant_pass(config, &mut report, &mut |_| {}, &mut no_fault)
             .await?;
         Ok(report)
     }
@@ -267,35 +329,46 @@ impl DbWrite<Dht> {
     /// Run the lookup-column backfill until it has converged or the pool is
     /// closed, whichever comes first.
     ///
-    /// A pass that fails — typically a write that waited out the busy timeout
-    /// behind other agents' writes on a busy store — is retried after a
-    /// backoff that doubles from `min_backoff` to `max_backoff`. There is no
-    /// retry budget: a store that is too busy for one uninterrupted pass still
-    /// converges, because every pass keeps what it wrote and the streak of
+    /// **It yields.** Each batch is one small statement; between batches the
+    /// task sleeps holding nothing. When a batch had to wait for the write
+    /// lock, or held it, for longer than `yield_above`, the pause doubles (up
+    /// to `max_pause`) and stays long until a batch goes through clean.
+    ///
+    /// **It does not give up.** A pass that fails — typically a write that
+    /// waited out the busy timeout behind other agents' writes — is retried
+    /// after a backoff that doubles from `min_backoff` to `max_backoff`. There
+    /// is no retry budget: every pass keeps what it wrote and the streak of
     /// failures (and with it the backoff) is reset whenever a pass makes
     /// progress. A failure caused by the pool closing is not reported.
     ///
-    /// The number of secret-bearing rows still without a current key is
-    /// published as the `hc.db.cap_grant.unkeyed` gauge (labelled with the
-    /// database's `kind` and `id`, one series per DNA) before the first pass
-    /// and after every pass, so an incomplete backfill is a scrape rather than
-    /// a log line. `on_event` receives each failure and the final outcome.
+    /// **It is observable.** The number of secret-bearing rows still without a
+    /// current key is published as the `hc.db.cap_grant.unkeyed` gauge
+    /// (labelled with the database's `kind` and `id`, one series per DNA) when
+    /// it starts and after every pass. `on_event` receives the start, each
+    /// yield, each failure, and the final outcome.
     ///
     /// Returns everything filled in. If the pool closed first, that is what
     /// had been filled in by then.
-    pub async fn converge_cap_grant_lookup_keys(
-        &self,
+    pub fn converge_cap_grant_lookup_keys<'a>(
+        &'a self,
         config: CapGrantBackfillConfig,
-        on_event: &mut (dyn FnMut(CapGrantBackfillEvent<'_>) + Send),
-    ) -> CapGrantBackfillReport {
-        self.converge_cap_grant_lookup_keys_with(config, on_event, &mut no_fault)
-            .await
+        on_event: &'a mut (dyn FnMut(CapGrantBackfillEvent) + Send),
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CapGrantBackfillReport> + Send + 'a>>
+    {
+        // Boxed with an explicit `Send` bound so that the bound is proved
+        // here, over concrete lifetimes, and not re-derived by every caller
+        // that spawns it.
+        Box::pin(async move {
+            let mut no_fault = no_fault;
+            self.converge_cap_grant_lookup_keys_with(config, on_event, &mut no_fault)
+                .await
+        })
     }
 
     pub(crate) async fn converge_cap_grant_lookup_keys_with(
         &self,
         config: CapGrantBackfillConfig,
-        on_event: &mut (dyn FnMut(CapGrantBackfillEvent<'_>) + Send),
+        on_event: BackfillObserver<'_>,
         fault: BackfillFault<'_>,
     ) -> CapGrantBackfillReport {
         let gauge = crate::metrics::create_cap_grant_unkeyed_metric(self.identifier());
@@ -309,9 +382,11 @@ impl DbWrite<Dht> {
             }
         }
 
-        if let Ok(unkeyed) = self.as_ref().count_cap_grants_unkeyed().await {
+        let unkeyed = self.as_ref().count_cap_grants_unkeyed().await.ok();
+        if let Some(unkeyed) = unkeyed {
             gauge.record(unkeyed);
         }
+        on_event(CapGrantBackfillEvent::Started { unkeyed });
 
         loop {
             if self.pool().is_closed() {
@@ -319,7 +394,7 @@ impl DbWrite<Dht> {
             }
             let mut pass = CapGrantBackfillReport::default();
             let outcome = self
-                .backfill_cap_grant_pass(config.batch, config.pause, &mut pass, &mut *fault)
+                .backfill_cap_grant_pass(config, &mut pass, &mut *on_event, &mut *fault)
                 .await;
             total.absorb(&pass);
 
@@ -349,7 +424,7 @@ impl DbWrite<Dht> {
             consecutive_failures = consecutive_failures.saturating_add(1);
             let retry_in = backoff(config, consecutive_failures);
             on_event(CapGrantBackfillEvent::PassFailed {
-                error: &error,
+                error: error.to_string(),
                 consecutive_failures,
                 retry_in,
                 progress: pass,
@@ -444,6 +519,8 @@ mod tests {
             start_delay: Duration::ZERO,
             batch: 1,
             pause: Duration::ZERO,
+            yield_above: Duration::MAX,
+            max_pause: Duration::ZERO,
             min_backoff: Duration::from_secs(5),
             max_backoff: Duration::from_secs(300),
         };

@@ -48,7 +48,36 @@ pub struct Spaces {
     pub(crate) entry_def_store: holochain_state::entry_def::EntryDefStore,
     pub(crate) space_data_config: holochain_state::data::HolochainDataConfig,
     data_db_key: holochain_state::data::DbKey,
+    /// ELOHIM PATCH (per-call grant walk): when the capability-grant
+    /// lookup-key backfill may run, and where it already does.
+    cap_grant_backfill: Arc<CapGrantBackfillGate>,
 }
+
+/// Holds the capability-grant lookup-key backfill back until the conductor's
+/// cells are running.
+///
+/// The backfill is strictly background work: a grant it has not reached is
+/// authorised at the cost it had before the lookup columns existed. Starting
+/// the conductor is not background work — creating cells, joining the network
+/// and the workflows those cells trigger all read and write the same per-DNA
+/// database, through the same single writer and the same connection pool. So
+/// a DNA's store is not backfilled when it is opened; it is backfilled once
+/// the conductor has finished enabling its apps, and, for a store opened
+/// later, once the cells created with it are running.
+#[derive(Default)]
+struct CapGrantBackfillGate {
+    /// Set when conductor startup has enabled every app.
+    cells_running: std::sync::atomic::AtomicBool,
+    /// The DNAs whose store already has a backfill task.
+    started: parking_lot::Mutex<std::collections::HashSet<DnaHash>>,
+}
+
+/// Test-only override of when the capability-grant backfill starts, for
+/// measuring what it costs: `0` normal, `1` never, `2` as soon as a store is
+/// opened and without the start delay.
+#[cfg(test)]
+pub(crate) static CAP_GRANT_BACKFILL_TEST_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
 
 /// This is the set of data required at the
 /// [`DnaHash`] space level.
@@ -195,7 +224,55 @@ impl Spaces {
             entry_def_store,
             space_data_config,
             data_db_key,
+            cap_grant_backfill: Default::default(),
         })
+    }
+
+    /// Conductor startup has enabled every app: the cells are running, and the
+    /// capability-grant lookup-key backfill may start on every store that is
+    /// open, and on any opened from now on once its cells are running.
+    pub(crate) fn conductor_cells_running(&self) {
+        self.cap_grant_backfill
+            .cells_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.start_pending_cap_grant_backfills();
+    }
+
+    /// Start the capability-grant lookup-key backfill on every open store that
+    /// does not have one yet — if, and only if, the conductor's cells are
+    /// running. Called when startup completes and whenever cells are created
+    /// afterwards. Starts each store's backfill at most once.
+    pub(crate) fn start_pending_cap_grant_backfills(&self) {
+        let gate = &self.cap_grant_backfill;
+        if !gate.cells_running.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        #[cfg(test)]
+        if CAP_GRANT_BACKFILL_TEST_MODE.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return;
+        }
+        let stores: Vec<(DnaHash, DhtStore)> = self.map.share_ref(|spaces| {
+            spaces
+                .iter()
+                .map(|(dna_hash, space)| (dna_hash.clone(), space.dht_store.clone()))
+                .collect()
+        });
+        for (dna_hash, dht_store) in stores {
+            if gate.started.lock().insert(dna_hash.clone()) {
+                tracing::info!(
+                    %dna_hash,
+                    "capability-grant lookup-key backfill: cells are running, starting"
+                );
+                drop(dht_store.spawn_cap_grant_lookup_backfill());
+            }
+        }
+    }
+
+    /// Whether the capability-grant backfill has been started for a DNA's
+    /// store.
+    #[cfg(test)]
+    pub(crate) fn cap_grant_backfill_started(&self, dna_hash: &DnaHash) -> bool {
+        self.cap_grant_backfill.started.lock().contains(dna_hash)
     }
 
     /// Block some target.
@@ -336,6 +413,8 @@ impl Spaces {
         self.map.share_mut(|spaces| {
             spaces.remove(dna_hash);
         });
+        // A store opened afresh for this DNA gets its own backfill.
+        self.cap_grant_backfill.started.lock().remove(dna_hash);
         self.queue_consumer_map.remove_all_for_dna(dna_hash);
     }
 
@@ -358,6 +437,30 @@ impl Spaces {
                             self.space_data_config.clone(),
                             Some(self.data_db_key.clone()),
                         )?;
+
+                        if !self
+                            .cap_grant_backfill
+                            .cells_running
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            tracing::info!(
+                                %dna_hash,
+                                "capability-grant lookup-key backfill deferred until the \
+                                 conductor's cells are running"
+                            );
+                        }
+                        #[cfg(test)]
+                        if CAP_GRANT_BACKFILL_TEST_MODE.load(std::sync::atomic::Ordering::SeqCst)
+                            == 2
+                        {
+                            let mut config = DhtStore::test_cap_grant_backfill_config();
+                            config.start_delay = std::time::Duration::ZERO;
+                            drop(
+                                space
+                                    .dht_store
+                                    .test_spawn_cap_grant_lookup_backfill_with(config),
+                            );
+                        }
 
                         let r = f(&space);
                         entry.insert(space);
@@ -520,11 +623,10 @@ impl Space {
                 ))
                 .map_err(ConductorError::other)?;
             spawn_dht_wal_maintenance(new_dht_db.clone());
+            // ELOHIM PATCH (per-call grant walk): the capability-grant
+            // lookup-key backfill is NOT started here. Opening a store is part
+            // of starting its cells; see `CapGrantBackfillGate`.
             let dht_store = DhtStore::new(new_dht_db);
-            // ELOHIM PATCH (per-call grant walk): key the capability grants
-            // written before the lookup columns existed. Detached: the store is
-            // usable, and authorisation correct, before and while it runs.
-            drop(dht_store.spawn_cap_grant_lookup_backfill());
 
             Ok(Self {
                 dna_hash,
@@ -677,53 +779,73 @@ mod tests {
         );
     }
 
-    /// Opening a space starts the capability-grant lookup-key backfill on its
-    /// DHT database: a grant left un-keyed in the file — as every grant written
-    /// before the lookup columns existed is — gets its key without anything
-    /// else asking for it.
+    /// The capability-grant lookup-key backfill is held back until the
+    /// conductor's cells are running.
+    ///
+    /// Opening a store does not start it, and neither does creating cells
+    /// while the conductor is still starting: an un-keyed grant in the file
+    /// stays un-keyed for well past the backfill's own start delay. The
+    /// "cells are running" signal starts it, once per store. A store opened
+    /// after that waits for its own cells.
     #[tokio::test(flavor = "multi_thread")]
-    async fn opening_a_space_backfills_unkeyed_cap_grants() {
+    async fn cap_grant_backfill_waits_for_the_cells_running_signal() {
         let temp_dir = tempfile::Builder::new().tempdir().unwrap();
-        let dna_hash = Arc::new(DnaHash::from_raw_36(vec![3; 36]));
-
-        // The file as an earlier run left it: one grant, not keyed.
-        {
-            let db = holochain_state::data::open_db(
-                temp_dir.path(),
-                holochain_state::data::Dht::new(dna_hash.clone()),
-                holochain_state::data::HolochainDataConfig::default(),
-            )
-            .await
-            .unwrap();
-            let store = DhtStore::new(db.clone());
-            store
-                .test_insert_unkeyed_cap_grant(&AgentPubKey::from_raw_36(vec![9; 36]))
-                .await
-                .unwrap();
-            assert_eq!(store.count_cap_grants_unkeyed().await.unwrap(), 1);
-            db.pool().close().await;
-        }
-
-        let space = Space::new(
-            dna_hash,
-            temp_dir.path().to_path_buf(),
-            Default::default(),
-            ConductorConfig::default().db_max_readers,
-            holochain_state::data::HolochainDataConfig::default(),
-            None,
+        let spaces = Spaces::new(
+            Arc::new(ConductorConfig {
+                data_root_path: Some(temp_dir.path().to_path_buf().into()),
+                ..Default::default()
+            }),
+            Arc::new(std::sync::Mutex::new(sodoken::LockedArray::from(
+                b"passphrase".to_vec(),
+            ))),
         )
+        .await
         .unwrap();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if space.dht_store.count_cap_grants_unkeyed().await.unwrap() == 0 {
-                break;
-            }
+        // A store opened during startup, holding grants no one has keyed.
+        let dna_hash = DnaHash::from_raw_36(vec![3; 36]);
+        let space = spaces.get_or_create_space(&dna_hash).unwrap();
+        space
+            .dht_store
+            .test_insert_unkeyed_cap_grants(&AgentPubKey::from_raw_36(vec![9; 36]), 2)
+            .await
+            .unwrap();
+        assert_eq!(space.dht_store.count_cap_grants_unkeyed().await.unwrap(), 2);
+
+        // Deferred: opening it did not start the backfill, and cells created
+        // while the conductor is starting do not either.
+        assert!(!spaces.cap_grant_backfill_started(&dna_hash));
+        spaces.start_pending_cap_grant_backfills();
+        assert!(!spaces.cap_grant_backfill_started(&dna_hash));
+        let start_delay = DhtStore::test_cap_grant_backfill_config().start_delay;
+        tokio::time::sleep(start_delay + std::time::Duration::from_millis(1500)).await;
+        assert_eq!(
+            space.dht_store.count_cap_grants_unkeyed().await.unwrap(),
+            2,
+            "the backfill ran before the conductor's cells were running"
+        );
+
+        // The signal starts it.
+        spaces.conductor_cells_running();
+        assert!(spaces.cap_grant_backfill_started(&dna_hash));
+        let deadline = std::time::Instant::now() + start_delay + std::time::Duration::from_secs(30);
+        while space.dht_store.count_cap_grants_unkeyed().await.unwrap() != 0 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the space was opened but the un-keyed grant was never keyed"
+                "the cells were running but the un-keyed grants were never keyed"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+
+        // A store opened after startup waits for its own cells to be created.
+        let later = DnaHash::from_raw_36(vec![4; 36]);
+        spaces.get_or_create_space(&later).unwrap();
+        assert!(!spaces.cap_grant_backfill_started(&later));
+        spaces.start_pending_cap_grant_backfills();
+        assert!(spaces.cap_grant_backfill_started(&later));
+
+        // A store that is dropped and reopened gets a backfill of its own.
+        spaces.remove_space(&later);
+        assert!(!spaces.cap_grant_backfill_started(&later));
     }
 }

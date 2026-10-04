@@ -377,6 +377,12 @@ mod startup_shutdown_impls {
 
             info!("Conductor startup: apps enabled.");
 
+            // ELOHIM PATCH (per-call grant walk): every enabled app's cells are
+            // created, joined and running. Only now may the capability-grant
+            // lookup-key backfill start; until this point it would have been
+            // competing with startup for each DNA's database.
+            self.spaces.conductor_cells_running();
+
             // Start recording conductor uptime
             register_uptime_metric(std::time::Instant::now());
 
@@ -1980,6 +1986,11 @@ mod app_status_impls {
             for trigger in triggers {
                 trigger.initialize_workflows();
             }
+
+            // ELOHIM PATCH (per-call grant walk): cells created after startup
+            // (an app installed or enabled at runtime) may have opened a store
+            // for a new DNA. A no-op until conductor startup has completed.
+            self.spaces.start_pending_cap_grant_backfills();
 
             Ok(())
         }

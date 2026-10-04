@@ -111,6 +111,14 @@ macro_rules! cap_grant_unkeyed_sql {
             $after
         )
     };
+    // The predicate twice: between the first and second fragments, and
+    // between the second and third.
+    ($before:literal, $between:literal, $after:literal) => {
+        concat!(
+            cap_grant_unkeyed_sql!($before, $between),
+            cap_grant_unkeyed_sql!("", $after)
+        )
+    };
 }
 
 /// Ensure the `CapGrant` lookup columns and their index exist.
@@ -555,35 +563,6 @@ where
 // Backfill of the lookup columns on rows that predate them.
 // ---------------------------------------------------------------------------
 
-/// Fill `CapGrant.elohim_author` from `Action` for up to `limit` rows that lack
-/// it.
-///
-/// One statement, bounded by `limit` so the write lock is held briefly. Returns
-/// the number of rows filled; `0` means nothing fillable is left. The `EXISTS`
-/// guard keeps a row that cannot be filled — its action is absent, or its
-/// author is not the 36 bytes of an agent key — from being re-selected forever;
-/// such a row keeps a NULL author and stays on the read-everything path.
-pub(crate) async fn backfill_cap_grant_authors<'e, E>(executor: E, limit: u32) -> sqlx::Result<u64>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    let done = sqlx::query(
-        "UPDATE CapGrant
-            SET elohim_author =
-                (SELECT a.author FROM Action a WHERE a.hash = CapGrant.action_hash)
-          WHERE action_hash IN (
-                SELECT cg.action_hash FROM CapGrant cg
-                 WHERE cg.elohim_author IS NULL
-                   AND EXISTS (SELECT 1 FROM Action a
-                                WHERE a.hash = cg.action_hash AND length(a.author) = 36)
-                 LIMIT ?)",
-    )
-    .bind(i64::from(limit))
-    .execute(executor)
-    .await?;
-    Ok(done.rows_affected())
-}
-
 /// Secret-bearing `CapGrant` rows that have no key of the current derivation.
 ///
 /// This is what the `hc.db.cap_grant.unkeyed` gauge reports. After a completed
@@ -604,59 +583,114 @@ where
     Ok(count.max(0) as u64)
 }
 
-/// The statement behind [`get_cap_grants_missing_secret_key`]: `?1` / `?2` the
+/// A `CapGrant` row the backfill has work to do on, with everything needed to
+/// do it: the grant action, the grant entry blob from the ROW'S OWN author's
+/// `PrivateEntry`, and which columns are missing.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct CapGrantBackfillRow {
+    /// The action columns and the private entry blob.
+    #[sqlx(flatten)]
+    pub live: LiveCapGrantRow,
+    /// `1` when `elohim_author` is NULL.
+    pub needs_author: i64,
+    /// `1` when the row is secret-bearing and has no key of the current
+    /// derivation.
+    pub needs_key: i64,
+}
+
+/// The statement behind [`get_cap_grants_to_backfill`]: `?1` / `?2` the
 /// key-version floors (see `cap_grant_unkeyed_sql`), `?3` the cursor (an
 /// `action_hash`, or the empty blob for "from the start"), `?4` the limit.
 ///
-/// The unary `+` on `cap_access` takes that term away from the planner, which
-/// leaves the cursor as the only indexable constraint: a batch is then a
-/// primary-key range seek to the cursor followed by a walk that stops at the
-/// limit. Left to choose, the planner reads the two secret-bearing classes
-/// through `elohim_CapGrant_access_idx` and sorts every remaining row to honour
-/// `ORDER BY action_hash` — the rest of the table, every batch. (`NOT INDEXED`
-/// does not prevent that on this `WITHOUT ROWID` table.)
-const CAP_GRANTS_MISSING_SECRET_KEY_SQL: &str = cap_grant_unkeyed_sql!(
+/// ONE WALK, in primary-key order, fills both columns: a batch is a range seek
+/// to the cursor followed by a walk that stops at the limit, and the cursor
+/// only ever moves forward. Nothing is visited twice in a pass — not the rows
+/// already filled, and not the rows that cannot be filled, which a
+/// "pick any rows still NULL" batch would meet again every time.
+///
+/// The unary `+` on `cap_access` and `elohim_author` takes those terms away
+/// from the planner, which leaves the cursor as the only indexable constraint.
+/// Left to choose, the planner reads through an index and sorts every
+/// remaining row to honour `ORDER BY action_hash` — the rest of the table,
+/// every batch. (`NOT INDEXED` does not prevent that on this `WITHOUT ROWID`
+/// table.)
+const CAP_GRANTS_TO_BACKFILL_SQL: &str = cap_grant_unkeyed_sql!(
     "
          SELECT a.hash, a.author, a.seq, a.prev_hash, a.timestamp, a.action_type,
                 a.action_data, a.signature, a.entry_hash, a.private_entry,
                 a.record_validity,
-                pe.blob AS blob
-           FROM (SELECT action_hash FROM CapGrant
-                  WHERE +cap_access IN (1, 2)
-                    AND action_hash > ?3
-                    AND ",
-    "
+                pe.blob AS blob,
+                cg.needs_author, cg.needs_key
+           FROM (SELECT action_hash,
+                        +elohim_author IS NULL AS needs_author,
+                        (+cap_access IN (1, 2) AND ",
+    ") AS needs_key
+                   FROM CapGrant
+                  WHERE action_hash > ?3
+                    AND (+elohim_author IS NULL OR (+cap_access IN (1, 2) AND ",
+    "))
                   ORDER BY action_hash
                   LIMIT ?4) cg
            CROSS JOIN Action a ON a.hash = cg.action_hash
            LEFT JOIN PrivateEntry pe ON pe.hash = a.entry_hash AND pe.author = a.author"
 );
 
-/// Up to `limit` secret-bearing grant rows that have no key of the current
-/// derivation, after `cursor` in `action_hash` order, each with its action
-/// columns and the grant entry blob read from the ROW'S OWN author's
-/// `PrivateEntry`.
-pub(crate) async fn get_cap_grants_missing_secret_key<'e, E>(
+/// Up to `limit` `CapGrant` rows that lack an author or a current key, after
+/// `cursor` in `action_hash` order.
+pub(crate) async fn get_cap_grants_to_backfill<'e, E>(
     executor: E,
-    cursor: Option<&[u8]>,
+    cursor: Option<Vec<u8>>,
     limit: u32,
-) -> sqlx::Result<Vec<LiveCapGrantRow>>
+) -> sqlx::Result<Vec<CapGrantBackfillRow>>
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    sqlx::query_as(CAP_GRANTS_MISSING_SECRET_KEY_SQL)
+    sqlx::query_as(CAP_GRANTS_TO_BACKFILL_SQL)
         .bind(current_version_floor())
         .bind(newer_version_floor())
         // Every action hash sorts after the empty blob, so no cursor means "from
         // the start" and the predicate stays a primary-key range seek.
-        .bind(cursor.unwrap_or(&[]))
+        .bind(cursor.unwrap_or_default())
         .bind(i64::from(limit))
         .fetch_all(executor)
         .await
 }
 
-/// The key to store for a row returned by
-/// [`get_cap_grants_missing_secret_key`], or `None` to leave the row un-keyed.
+/// What the backfill will write to one `CapGrant` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapGrantFill {
+    /// The row.
+    pub action_hash: Vec<u8>,
+    /// The author to store, when the row has none and its action's author is
+    /// well-formed.
+    pub author: Option<Vec<u8>>,
+    /// The key to store, when the row needs one and one could be derived.
+    pub secret_key: Option<[u8; CAP_GRANT_SECRET_KEY_BYTES]>,
+    /// The row needs a key, whether or not one could be derived.
+    pub wanted_key: bool,
+}
+
+/// Work out what to write to a row returned by [`get_cap_grants_to_backfill`].
+pub(crate) fn plan_cap_grant_fill(row: CapGrantBackfillRow) -> CapGrantFill {
+    let action_hash = row.live.action.hash.clone();
+    let author = (row.needs_author != 0 && row.live.action.author.len() == 36)
+        .then(|| row.live.action.author.clone());
+    let wanted_key = row.needs_key != 0;
+    let secret_key = if wanted_key {
+        derive_cap_grant_secret_key(row.live)
+    } else {
+        None
+    };
+    CapGrantFill {
+        action_hash,
+        author,
+        secret_key,
+        wanted_key,
+    }
+}
+
+/// The key to store for a row returned by [`get_cap_grants_to_backfill`], or
+/// `None` to leave the row un-keyed.
 ///
 /// A row is left un-keyed — and therefore on the read-every-un-keyed-row path,
 /// which is slow but correct — whenever its key cannot be derived with
@@ -693,27 +727,72 @@ pub(crate) fn derive_cap_grant_secret_key(
     Some(cap_grant_secret_key(&author, &secret))
 }
 
-/// Store `secret_key` on a row that still has no key of the current derivation.
-/// A row keyed in the meantime is left untouched.
-pub(crate) async fn set_cap_grant_secret_key<'e, E>(
-    executor: E,
-    action_hash: &[u8],
-    secret_key: &[u8; CAP_GRANT_SECRET_KEY_BYTES],
-) -> sqlx::Result<u64>
-where
-    E: Executor<'e, Database = Sqlite>,
-{
-    let done = sqlx::query(cap_grant_unkeyed_sql!(
-        "UPDATE CapGrant SET elohim_secret_key = ?3 WHERE action_hash = ?4 AND ",
-        ""
-    ))
-    .bind(current_version_floor())
-    .bind(newer_version_floor())
-    .bind(secret_key.as_slice())
-    .bind(action_hash)
-    .execute(executor)
-    .await?;
-    Ok(done.rows_affected())
+/// Write a batch of fills in ONE statement.
+///
+/// A fill only ever adds what is missing: an author where there is none, a key
+/// where there is no key of the current derivation. A row filled in the
+/// meantime is left untouched. Fills with nothing to write are ignored.
+/// Returns the number of rows the statement touched.
+///
+/// One statement, so the time the database's single writer is held is the time
+/// SQLite takes to update `fills.len()` rows by primary key — bounded by the
+/// batch size and by nothing else: no round trip to the caller happens while
+/// the lock is held.
+pub(crate) async fn apply_cap_grant_fills(
+    conn: &mut sqlx::SqliteConnection,
+    fills: &[CapGrantFill],
+) -> sqlx::Result<u64> {
+    match cap_grant_fill_statement(fills) {
+        Some(mut statement) => Ok(statement.build().execute(conn).await?.rows_affected()),
+        None => Ok(0),
+    }
+}
+
+/// The single statement that writes `fills`, or `None` when none of them has
+/// anything to write.
+fn cap_grant_fill_statement(fills: &[CapGrantFill]) -> Option<sqlx::QueryBuilder<Sqlite>> {
+    let writes: Vec<&CapGrantFill> = fills
+        .iter()
+        .filter(|f| f.author.is_some() || f.secret_key.is_some())
+        .collect();
+    if writes.is_empty() {
+        return None;
+    }
+    let mut q = sqlx::QueryBuilder::<Sqlite>::new("WITH fill(h, au, k) AS (VALUES ");
+    let mut first = true;
+    for fill in writes {
+        if !first {
+            q.push(", ");
+        }
+        first = false;
+        q.push("(");
+        q.push_bind(fill.action_hash.clone());
+        q.push(", ");
+        q.push_bind(fill.author.clone());
+        q.push(", ");
+        q.push_bind(fill.secret_key.map(|k| k.to_vec()));
+        q.push(")");
+    }
+    q.push(
+        ") UPDATE CapGrant
+              SET elohim_author = COALESCE(
+                      elohim_author,
+                      (SELECT au FROM fill WHERE h = CapGrant.action_hash)),
+                  elohim_secret_key = CASE
+                      WHEN (SELECT k FROM fill WHERE h = CapGrant.action_hash) IS NOT NULL
+                       AND (elohim_secret_key IS NULL
+                            OR elohim_secret_key < ",
+    );
+    q.push_bind(current_version_floor());
+    q.push(" OR elohim_secret_key >= ");
+    q.push_bind(newer_version_floor());
+    q.push(
+        " OR length(elohim_secret_key) <> 33)
+                      THEN (SELECT k FROM fill WHERE h = CapGrant.action_hash)
+                      ELSE elohim_secret_key END
+            WHERE action_hash IN (SELECT h FROM fill)",
+    );
+    Some(q)
 }
 
 pub(crate) async fn get_cap_grants_by_tag<'e, E>(
@@ -1794,27 +1873,27 @@ mod tests {
                 "seed {seed:#x}: vacuous population ({matched})"
             );
 
-            // Authors only.
-            while db.backfill_cap_grant_authors_batch(17).await.unwrap() > 0 {}
-            assert_eq!(unkeyed_counts(db).await.0, 0);
-            assert!(unkeyed_counts(db).await.1 > 0);
-            assert_eq!(
-                assert_matches_reference(db, false, "authors filled").await,
-                matched
-            );
-
-            // One small batch of keys: partially backfilled.
-            let before = unkeyed_counts(db).await.1;
-            let batch = db
-                .backfill_cap_grant_secret_keys_batch(None, 7)
+            // Two batches of the walk, then stop: partially backfilled. (Rows
+            // with an author and no key, and the reverse, are already in the
+            // population as written.)
+            let (no_author, no_key) = unkeyed_counts(db).await;
+            let first = db.backfill_cap_grant_batch(None, 23).await.unwrap();
+            let second = db
+                .backfill_cap_grant_batch(first.next_cursor.as_deref(), 23)
                 .await
                 .unwrap();
-            assert_eq!(batch.keyed, 7);
-            assert_eq!(unkeyed_counts(db).await.1, before - 7);
+            let (authors, keyed) = (first.authors + second.authors, first.keyed + second.keyed);
+            assert!(authors > 5 && keyed > 5, "{first:?} {second:?}");
             assert_eq!(
-                assert_matches_reference(db, false, "keys partly filled").await,
+                unkeyed_counts(db).await,
+                (no_author - authors as i64, no_key - keyed as i64)
+            );
+            assert!(unkeyed_counts(db).await.1 > 0);
+            assert_eq!(
+                assert_matches_reference(db, false, "partly filled").await,
                 matched
             );
+            let before = no_key - keyed as i64 + 7;
 
             // Everything.
             let report = db
@@ -2371,31 +2450,30 @@ mod tests {
         assert!(total > 20);
 
         // An "interrupted" run: two batches, then the cursor is lost.
-        let first = db
-            .backfill_cap_grant_secret_keys_batch(None, 5)
-            .await
-            .unwrap();
+        let first = db.backfill_cap_grant_batch(None, 9).await.unwrap();
         let second = db
-            .backfill_cap_grant_secret_keys_batch(first.next_cursor.as_deref(), 5)
+            .backfill_cap_grant_batch(first.next_cursor.as_deref(), 9)
             .await
             .unwrap();
-        assert_eq!((first.keyed, second.keyed), (5, 5));
-        assert_eq!(unkeyed_counts(db).await.1, total - 10);
+        let keyed = (first.keyed + second.keyed) as i64;
+        assert_eq!((first.authors, second.authors), (9, 9));
+        assert!(keyed > 0);
+        assert_eq!(unkeyed_counts(db).await.1, total - keyed);
 
         let report = db
             .backfill_cap_grant_lookup_keys(5, Duration::ZERO)
             .await
             .unwrap();
-        assert_eq!(report.secret_keys_filled as i64, total - 10);
+        assert_eq!(report.secret_keys_filled as i64, total - keyed);
         assert_eq!(unkeyed_counts(db).await, (0, 0));
     }
 
-    /// A key-backfill batch seeks to its cursor in primary-key order and stops
+    /// A backfill batch seeks to its cursor in primary-key order and stops
     /// at its limit; it never sorts, and never walks, the rest of the table.
     #[tokio::test]
-    async fn key_backfill_batch_is_a_primary_key_range_walk() {
+    async fn backfill_batch_is_a_primary_key_range_walk() {
         let db = open().await;
-        let explain = format!("EXPLAIN QUERY PLAN {CAP_GRANTS_MISSING_SECRET_KEY_SQL}");
+        let explain = format!("EXPLAIN QUERY PLAN {CAP_GRANTS_TO_BACKFILL_SQL}");
         let plan: Vec<String> =
             sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain))
                 .bind(current_version_floor())
@@ -2839,6 +2917,8 @@ mod tests {
         start_delay: Duration::ZERO,
         batch: 4,
         pause: Duration::ZERO,
+        yield_above: Duration::MAX,
+        max_pause: Duration::ZERO,
         min_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(8),
     };
@@ -2854,10 +2934,14 @@ mod tests {
         failures: Vec<(u32, Duration, bool)>,
         /// `(report, unkeyed)` of the converged pass, if one was reported.
         converged: Option<(CapGrantBackfillReport, Option<u64>)>,
+        /// The un-keyed count reported by each `Started` event.
+        started: Vec<Option<u64>>,
+        /// The pause in force after each `Yielded` event.
+        yields: Vec<Duration>,
     }
 
     impl Seen {
-        fn record(&mut self, event: CapGrantBackfillEvent<'_>) {
+        fn record(&mut self, event: CapGrantBackfillEvent) {
             match event {
                 CapGrantBackfillEvent::PassFailed {
                     consecutive_failures,
@@ -2872,6 +2956,8 @@ mod tests {
                 CapGrantBackfillEvent::Converged { report, unkeyed } => {
                     self.converged = Some((report, unkeyed));
                 }
+                CapGrantBackfillEvent::Started { unkeyed } => self.started.push(unkeyed),
+                CapGrantBackfillEvent::Yielded { pause, .. } => self.yields.push(pause),
             }
         }
     }
@@ -3069,13 +3155,18 @@ mod tests {
         assert_eq!(reference_snapshot(&fx.db).await, written_by_parent);
         let matched = assert_matches_reference(&fx.db, false, "first new open").await;
         assert!(matched > 40);
-        while fx.db.backfill_cap_grant_authors_batch(50).await.unwrap() > 0 {}
-        let batch = fx
-            .db
-            .backfill_cap_grant_secret_keys_batch(None, 60)
-            .await
-            .unwrap();
-        assert_eq!(batch.keyed, 60);
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut keyed = 0;
+        for _ in 0..3 {
+            let batch = fx
+                .db
+                .backfill_cap_grant_batch(cursor.as_deref(), 40)
+                .await
+                .unwrap();
+            keyed += batch.keyed;
+            cursor = batch.next_cursor;
+        }
+        assert!(keyed >= 50, "{keyed}");
         assert!(unkeyed_counts(&fx.db).await.1 > 20, "only partly keyed");
         assert_eq!(
             assert_matches_reference(&fx.db, false, "partly backfilled").await,
@@ -3134,5 +3225,211 @@ mod tests {
         );
         assert_eq!(reference_snapshot(&fx.db).await, after_rollback);
         fx.db.pool().close().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Strictly background: bounded holds, yielding, nothing held while paused
+    // -----------------------------------------------------------------------
+
+    /// `count` legacy grants spread over `authors` agents, on a real file.
+    async fn legacy_store_on_disk(dir: &std::path::Path, authors: u8, count: u32) -> Fixture {
+        let db = open_as_new(dir).await;
+        let mut fx = Fixture { db, next_id: 1 };
+        let mut tx = fx.db.begin().await.unwrap();
+        for i in 0..count {
+            let who = agent((i % u32::from(authors)) as u8 + 1);
+            let access = CapAccess::Transferable {
+                secret: secret(u64::from(i)),
+            };
+            fx.grant(&mut tx, &who, access, Keying::Legacy).await;
+        }
+        tx.commit().await.unwrap();
+        fx
+    }
+
+    /// THE HOLD BOUND. On an on-disk WAL store of 30 000 un-keyed grants across
+    /// six authors, with another task writing to the same database throughout,
+    /// no backfill batch holds the write lock for more than a fraction of a
+    /// second — by construction: a batch is one statement over 64 rows by
+    /// primary key, and nothing is awaited while the lock is held.
+    ///
+    /// The bound asserted is deliberately loose (a debug build on a shared
+    /// host); the measured value is printed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backfill_write_hold_is_bounded_while_another_task_writes() {
+        const BOUND: Duration = Duration::from_millis(250);
+        let dir = tempfile::tempdir().unwrap();
+        let fx = legacy_store_on_disk(dir.path(), 6, 30_000).await;
+        let db = fx.db.clone();
+        assert_eq!(unkeyed_counts(&db).await, (30_000, 30_000));
+
+        // Another writer on the same database: short transactions, back to
+        // back, for as long as the backfill runs.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = tokio::spawn({
+            let (db, stop) = (db.clone(), stop.clone());
+            async move {
+                let mut fx = Fixture {
+                    db,
+                    next_id: 10_000_000,
+                };
+                let mut written = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let mut tx = fx.db.begin().await.unwrap();
+                    let access = CapAccess::Transferable {
+                        secret: secret(u64::from(fx.next_id)),
+                    };
+                    fx.grant(&mut tx, &agent(9), access, Keying::Keyed).await;
+                    tx.commit().await.unwrap();
+                    written += 1;
+                    tokio::task::yield_now().await;
+                }
+                written
+            }
+        });
+
+        let config = CapGrantBackfillConfig {
+            start_delay: Duration::ZERO,
+            batch: 64,
+            pause: Duration::from_millis(1),
+            yield_above: Duration::from_millis(100),
+            max_pause: Duration::from_millis(20),
+            min_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(50),
+        };
+        let started = std::time::Instant::now();
+        let mut seen = Seen::default();
+        let report = db
+            .converge_cap_grant_lookup_keys(config, &mut |e| seen.record(e))
+            .await;
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let written = writer.await.unwrap();
+
+        eprintln!(
+            "cap-grant backfill hold bound: 30000 rows in {took:?}, {written} competing writes, \
+             {} failed passes, report {report:?}",
+            seen.failures.len()
+        );
+        assert_eq!(seen.started, vec![Some(30_000)]);
+        assert!(seen.converged.is_some());
+        assert_eq!(
+            (
+                report.authors_filled,
+                report.secret_keys_filled,
+                report.left_unkeyed
+            ),
+            (30_000, 30_000, 0)
+        );
+        assert_eq!(unkeyed_counts(&db).await, (0, 0));
+        assert!(written > 50, "the other writer kept writing: {written}");
+        assert!(
+            report.max_write_hold < BOUND,
+            "a batch held the write lock for {:?}",
+            report.max_write_hold
+        );
+    }
+
+    /// The backfill YIELDS. While another task keeps taking the write lock for
+    /// 60 ms at a time, batches that had to wait lengthen the pause — doubling,
+    /// capped at `max_pause` — and the store still ends fully keyed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backfill_lengthens_its_pause_when_it_has_to_wait_for_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = legacy_store_on_disk(dir.path(), 3, 400).await;
+        let db = fx.db.clone();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hog = tokio::spawn({
+            let (pool, stop) = (db.pool().clone(), stop.clone());
+            async move {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    tx.commit().await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        });
+
+        let config = CapGrantBackfillConfig {
+            start_delay: Duration::ZERO,
+            batch: 16,
+            pause: Duration::from_millis(1),
+            yield_above: Duration::from_millis(10),
+            max_pause: Duration::from_millis(80),
+            min_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(50),
+        };
+        let mut seen = Seen::default();
+        let report = db
+            .converge_cap_grant_lookup_keys(config, &mut |e| seen.record(e))
+            .await;
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        hog.await.unwrap();
+
+        eprintln!(
+            "cap-grant backfill yielding: {} yields, pauses {:?}, report {report:?}",
+            seen.yields.len(),
+            seen.yields
+        );
+        assert!(seen.yields.len() >= 3, "it had to wait and said so");
+        assert_eq!(report.yields, seen.yields.len() as u64);
+        assert!(report.max_lock_wait > config.yield_above);
+        // The first yield jumps to twice the yield bound; no pause exceeds the cap.
+        assert_eq!(seen.yields[0], Duration::from_millis(20));
+        assert!(seen.yields.iter().all(|p| *p <= config.max_pause));
+        assert!(seen.yields.iter().any(|p| *p > Duration::from_millis(20)));
+        assert!(seen.converged.is_some());
+        assert_eq!(unkeyed_counts(&db).await, (0, 0));
+    }
+
+    /// Between batches the backfill holds NOTHING: when it reports a yield —
+    /// after the batch, before the pause — every connection is back in the
+    /// pool.
+    ///
+    /// sqlx hands a dropped connection back to the pool on a spawned task, so
+    /// the check gives that task a moment to run on another worker — while the
+    /// backfill itself is stopped inside the callback and so cannot be the one
+    /// letting go.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backfill_holds_no_connection_between_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let fx = legacy_store_on_disk(dir.path(), 2, 200).await;
+        let db = fx.db.clone();
+        let pool = db.pool().clone();
+
+        // A zero bound makes every batch report a yield.
+        let config = CapGrantBackfillConfig {
+            start_delay: Duration::ZERO,
+            batch: 10,
+            pause: Duration::ZERO,
+            yield_above: Duration::ZERO,
+            max_pause: Duration::from_millis(1),
+            min_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(1),
+        };
+        let mut checked = 0;
+        let report = db
+            .converge_cap_grant_lookup_keys(config, &mut |event| {
+                if let CapGrantBackfillEvent::Yielded { .. } = event {
+                    for _ in 0..500 {
+                        if pool.num_idle() as u32 == pool.size() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_eq!(
+                        pool.num_idle() as u32,
+                        pool.size(),
+                        "a connection is still checked out between batches"
+                    );
+                    checked += 1;
+                }
+            })
+            .await;
+        assert_eq!(checked, 20);
+        assert_eq!(report.yields, 20);
+        assert_eq!(report.secret_keys_filled, 200);
     }
 }
