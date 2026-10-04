@@ -734,10 +734,14 @@ pub(crate) fn derive_cap_grant_secret_key(
 /// meantime is left untouched. Fills with nothing to write are ignored.
 /// Returns the number of rows the statement touched.
 ///
-/// One statement, so the time the database's single writer is held is the time
-/// SQLite takes to update `fills.len()` rows by primary key — bounded by the
-/// batch size and by nothing else: no round trip to the caller happens while
-/// the lock is held.
+/// One statement, so while the database's single writer is held SQLite does
+/// one thing: update `fills.len()` rows by primary key. The caller awaits
+/// twice with the lock held — this statement, then the commit — instead of
+/// once per row, so the hold is bounded by the batch size plus two hand-offs
+/// to the connection's worker. (On a saturated runtime those hand-offs are
+/// what dominate: measured holds were 77 ms beside a plain SQL writer and
+/// 229 ms beside source-chain flushes and authorisation reads, in an
+/// unoptimised build.)
 pub(crate) async fn apply_cap_grant_fills(
     conn: &mut sqlx::SqliteConnection,
     fills: &[CapGrantFill],
