@@ -403,6 +403,90 @@ mod tests {
         assert_eq!(all.len(), 3);
     }
 
+    /// A stored WASM whose bytes differ by `tag`, with its compiled module.
+    async fn put_tagged_wasm(db: &DbWrite<Wasm>, tag: u8) -> holo_hash::WasmHash {
+        let wasm = DnaWasm {
+            code: vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, tag].into(),
+        };
+        let hash = wasm.to_hash().await;
+        db.put_wasm(DnaWasmHashed::with_pre_hashed(wasm, hash.clone()))
+            .await
+            .unwrap();
+        db.put_compiled_wasm(hash.clone(), bytes::Bytes::from(vec![tag; 16]))
+            .await
+            .unwrap();
+        hash
+    }
+
+    fn one_coordinator_dna(name: &str, coordinator: &holo_hash::WasmHash) -> DnaDef {
+        DnaDef {
+            name: name.to_string(),
+            modifiers: DnaModifiers {
+                network_seed: "seed".to_string(),
+                properties: SerializedBytes::default(),
+            },
+            integrity_zomes: vec![],
+            coordinator_zomes: vec![(
+                ZomeName::from("coordinator"),
+                CoordinatorZomeDef::from_hash(coordinator.clone()),
+            )],
+            #[cfg(feature = "unstable-migration")]
+            lineage: std::collections::HashSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn superseded_wasm_is_pruned_keeping_the_newest_unreferenced() {
+        let db = test_db().await;
+        let agent = AgentPubKey::from_raw_32(vec![0u8; 32]);
+
+        // One WASM in use, so one set is one row and three unreferenced rows are kept.
+        let in_use = put_tagged_wasm(&db, 0).await;
+        let mut unreferenced = Vec::new();
+        for tag in 1..=6u8 {
+            unreferenced.push(put_tagged_wasm(&db, tag).await);
+        }
+
+        db.put_dna_def(&agent, &one_coordinator_dna("pruned", &in_use))
+            .await
+            .unwrap();
+
+        assert!(db.as_ref().wasm_exists(&in_use).await.unwrap());
+        assert!(db.as_ref().compiled_wasm_exists(&in_use).await.unwrap());
+        for old in &unreferenced[..3] {
+            assert!(!db.as_ref().wasm_exists(old).await.unwrap());
+            assert!(!db.as_ref().compiled_wasm_exists(old).await.unwrap());
+        }
+        for recent in &unreferenced[3..] {
+            assert!(db.as_ref().wasm_exists(recent).await.unwrap());
+            assert!(db.as_ref().compiled_wasm_exists(recent).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn wasm_referenced_by_another_agents_definition_is_never_pruned() {
+        let db = test_db().await;
+        let first = AgentPubKey::from_raw_32(vec![1u8; 32]);
+        let second = AgentPubKey::from_raw_32(vec![2u8; 32]);
+
+        let shared = put_tagged_wasm(&db, 0).await;
+        db.put_dna_def(&first, &one_coordinator_dna("shared", &shared))
+            .await
+            .unwrap();
+        for tag in 1..=8u8 {
+            put_tagged_wasm(&db, tag).await;
+        }
+        // A second agent moves the same DNA name to a new coordinator; the
+        // first agent's definition still references the shared WASM.
+        let replacement = put_tagged_wasm(&db, 9).await;
+        db.put_dna_def(&second, &one_coordinator_dna("shared", &replacement))
+            .await
+            .unwrap();
+
+        assert!(db.as_ref().wasm_exists(&shared).await.unwrap());
+        assert!(db.as_ref().wasm_exists(&replacement).await.unwrap());
+    }
+
     #[tokio::test]
     async fn update_dna_def_removes_orphaned_zomes() {
         let db = test_db().await;

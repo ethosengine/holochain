@@ -154,3 +154,67 @@ where
 
     Ok(())
 }
+
+/// How many full sets of unreferenced WASM are kept beyond what is in use.
+///
+/// A set is as many rows as there are distinct WASM hashes referenced by an
+/// installed DNA definition, so this keeps roughly the last three superseded
+/// versions of everything installed.
+pub(super) const UNREFERENCED_WASM_SETS_KEPT: i64 = 3;
+
+/// Delete WASM that no installed DNA definition references, keeping the most
+/// recently stored unreferenced rows.
+///
+/// A coordinator update replaces a DNA's zome rows and leaves the superseded
+/// WASM and its compiled module behind, so without this the store grows by
+/// one module set per update and never shrinks.
+///
+/// Recent unreferenced rows are kept for two reasons. An install stores its
+/// WASM before the DNA definition that references it, so the newest
+/// unreferenced rows may belong to an install in flight. And a recent
+/// version is the one most likely to be reinstated.
+///
+/// Returns the number of WASM rows deleted. Freed pages are reused by later
+/// writes; the file does not shrink without a `VACUUM`.
+pub(super) async fn prune_unreferenced_wasm(
+    conn: &mut sqlx::SqliteConnection,
+) -> sqlx::Result<u64> {
+    // Static strings throughout: the only variable is the bound row count.
+    macro_rules! referenced {
+        () => {
+            "SELECT zome_hash FROM IntegrityZome UNION SELECT zome_hash FROM CoordinatorZome"
+        };
+    }
+    macro_rules! doomed {
+        () => {
+            concat!(
+                "SELECT hash FROM Wasm WHERE hash NOT IN (",
+                referenced!(),
+                ") ORDER BY rowid DESC LIMIT -1 OFFSET ?"
+            )
+        };
+    }
+    let (referenced,): (i64,) = sqlx::query_as(concat!(
+        "SELECT COUNT(*) FROM Wasm WHERE hash IN (",
+        referenced!(),
+        ")"
+    ))
+    .fetch_one(&mut *conn)
+    .await?;
+    let keep = UNREFERENCED_WASM_SETS_KEPT * referenced.max(1);
+    // Explicit, so the compiled module goes whether or not foreign keys are
+    // enforced on this connection.
+    sqlx::query(concat!(
+        "DELETE FROM CompiledWasm WHERE hash IN (",
+        doomed!(),
+        ")"
+    ))
+    .bind(keep)
+    .execute(&mut *conn)
+    .await?;
+    let deleted = sqlx::query(concat!("DELETE FROM Wasm WHERE hash IN (", doomed!(), ")"))
+        .bind(keep)
+        .execute(&mut *conn)
+        .await?;
+    Ok(deleted.rows_affected())
+}

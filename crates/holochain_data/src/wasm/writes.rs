@@ -100,6 +100,11 @@ where
         inner_writes::insert_coordinator_zome(&mut *tx, &model).await?;
     }
 
+    // The zome rows just replaced may have been the last reference to their
+    // WASM. This is the one place references are dropped, so it is where the
+    // store is bounded.
+    inner_writes::prune_unreferenced_wasm(&mut tx).await?;
+
     tx.commit().await
 }
 
