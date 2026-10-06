@@ -15,7 +15,7 @@ pub use key::DbKey;
 
 mod handles;
 mod metrics;
-pub use handles::{DbRead, DbWrite, TxRead, TxWrite};
+pub use handles::{is_lock_contention, DbRead, DbWrite, TxRead, TxWrite};
 pub mod conductor;
 pub mod dht;
 pub mod kind;

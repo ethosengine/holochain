@@ -76,8 +76,23 @@ pub struct PublishableOp {
 
 /// How many publish records [`DhtStore::record_published_op_hashes`] writes in
 /// one transaction before falling back to per-op transactions for a chunk
-/// that fails.
+/// that fails for a reason other than the write lock.
 const PUBLISH_RECORD_CHUNK: usize = 256;
+
+/// What [`DhtStore::record_published_op_hashes`] left unwritten.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublishRecordOutcome {
+    /// Ops whose publish time was not written because the database's write
+    /// lock could not be had within the busy timeout. They were sent, have no
+    /// publish time on record, and are selected again by a later publish run.
+    pub deferred_by_lock: usize,
+}
+
+/// Whether `err` is the database refusing its write lock, which is a fact
+/// about the database and not about the op being recorded.
+fn lost_the_write_lock(err: &StateMutationError) -> bool {
+    matches!(err, StateMutationError::Sqlx(e) if holochain_data::is_lock_contention(e))
+}
 
 /// Output options for [`DhtStore::get_agent_activity`]. A `holochain_state`-local
 /// mirror of `holochain_p2p`'s `GetActivityOptions` (which is off this crate's
@@ -1095,52 +1110,96 @@ impl DhtStore<DbWrite<Dht>> {
     /// rolled back and retried one op per transaction, and an op that still
     /// fails is skipped with a warning: one unrecordable op cannot void the
     /// records of the other ops in the batch (which would re-select the whole
-    /// batch on every publish loop). Failing to open a transaction at all is
-    /// a database-level failure, not an op-level one, and is returned.
+    /// batch on every publish loop).
+    ///
+    /// A write lock that could not be had within the busy timeout is not a
+    /// failure of any op. Every op still to be written would wait out the same
+    /// timeout and fail the same way, so the rest of the batch is left
+    /// unwritten with one warning and counted in the returned
+    /// [`PublishRecordOutcome`]. Those ops are selected again by a later
+    /// publish run. Any other failure to open a transaction is a
+    /// database-level failure and is returned.
     pub async fn record_published_op_hashes(
         &self,
         ops: Vec<PublishableOp>,
         now: Timestamp,
-    ) -> StateMutationResult<()> {
-        for chunk in ops.chunks(PUBLISH_RECORD_CHUNK) {
+    ) -> StateMutationResult<PublishRecordOutcome> {
+        for (index, chunk) in ops.chunks(PUBLISH_RECORD_CHUNK).enumerate() {
             let chunk_err = match self.try_record_publish_times(chunk, now).await? {
                 Ok(()) => continue,
                 Err(e) => e,
             };
+            let chunk_start = index * PUBLISH_RECORD_CHUNK;
+            if lost_the_write_lock(&chunk_err) {
+                return Ok(Self::defer_publish_records(
+                    ops.len() - chunk_start,
+                    &chunk_err,
+                ));
+            }
             tracing::warn!(
                 ?chunk_err,
                 chunk_len = chunk.len(),
                 "recording publish times failed for a chunk; retrying one op per transaction"
             );
-            for op in chunk {
-                if let Err(e) = self
+            for (offset, op) in chunk.iter().enumerate() {
+                let Err(e) = self
                     .try_record_publish_times(std::slice::from_ref(op), now)
                     .await?
-                {
-                    tracing::warn!(
-                        op_hash = ?op.hash,
-                        kind = ?op.kind,
-                        ?e,
-                        "could not record publish time; skipping this op"
-                    );
+                else {
+                    continue;
+                };
+                if lost_the_write_lock(&e) {
+                    return Ok(Self::defer_publish_records(
+                        ops.len() - chunk_start - offset,
+                        &e,
+                    ));
                 }
+                tracing::warn!(
+                    op_hash = ?op.hash,
+                    kind = ?op.kind,
+                    ?e,
+                    "could not record publish time; skipping this op"
+                );
             }
         }
-        Ok(())
+        Ok(PublishRecordOutcome::default())
+    }
+
+    /// Report, once, that `deferred` publish records were left unwritten
+    /// because the write lock could not be had.
+    fn defer_publish_records(deferred: usize, err: &StateMutationError) -> PublishRecordOutcome {
+        tracing::warn!(
+            deferred,
+            ?err,
+            "the database write lock was not available; publish times left for a later publish run"
+        );
+        PublishRecordOutcome {
+            deferred_by_lock: deferred,
+        }
     }
 
     /// Write the publish records for `ops` in one transaction.
     ///
-    /// The outer result is the failure to open the transaction (a
-    /// database-level failure); the inner result is the failure of a record
-    /// or of the commit (the transaction is rolled back on drop), which the
-    /// caller isolates by retrying per op.
+    /// The transaction takes the write lock as it opens, so the wait for a
+    /// busy database happens once, before anything is written.
+    ///
+    /// The outer result is a failure to open the transaction for any reason
+    /// other than the lock (a database-level failure). The inner result is
+    /// the lock not being had, or the failure of a record or of the commit
+    /// (the transaction is rolled back on drop); the caller defers the batch
+    /// on the first and isolates the others by retrying per op.
     async fn try_record_publish_times(
         &self,
         ops: &[PublishableOp],
         now: Timestamp,
     ) -> StateMutationResult<StateMutationResult<()>> {
-        let mut tx = self.db.begin().await.map_err(StateMutationError::from)?;
+        let mut tx = match self.db.begin_immediate().await {
+            Ok(tx) => tx,
+            Err(e) if holochain_data::is_lock_contention(&e) => {
+                return Ok(Err(StateMutationError::from(e)))
+            }
+            Err(e) => return Err(StateMutationError::from(e)),
+        };
         let mut unrecordable = Vec::new();
         for op in ops {
             let recorded = match op.kind {

@@ -123,6 +123,42 @@ impl<I: DatabaseIdentifier> DbWrite<I> {
             write_txn_metric: self.0.write_txn_metric.clone(),
         })
     }
+
+    /// Begin a read-write transaction that takes the write lock before it
+    /// returns.
+    ///
+    /// The wait for the lock is bounded by the connection's busy timeout and
+    /// happens here, not at the transaction's first write. A caller that
+    /// writes nothing it cannot write later can then tell a lock it could not
+    /// have (see [`is_lock_contention`]) from a statement that failed.
+    pub async fn begin_immediate(&self) -> sqlx::Result<TxWrite<I>> {
+        let tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        Ok(TxWrite {
+            inner: TxRead::new(tx, self.0.identifier.clone()),
+            start: std::time::Instant::now(),
+            write_txn_metric: self.0.write_txn_metric.clone(),
+        })
+    }
+}
+
+/// Whether `err` is SQLite refusing a lock: `SQLITE_BUSY` or `SQLITE_LOCKED`,
+/// in any of their extended forms.
+///
+/// Such an error says the database was in use for longer than the busy
+/// timeout. It says nothing about the statement that met it, which would have
+/// succeeded a moment later.
+pub fn is_lock_contention(err: &sqlx::Error) -> bool {
+    const SQLITE_BUSY: i32 = 5;
+    const SQLITE_LOCKED: i32 = 6;
+    let sqlx::Error::Database(db_err) = err else {
+        return false;
+    };
+    // The driver reports the extended result code; its low byte is the
+    // primary code.
+    db_err
+        .code()
+        .and_then(|code| code.parse::<i32>().ok())
+        .is_some_and(|code| matches!(code & 0xFF, SQLITE_BUSY | SQLITE_LOCKED))
 }
 
 /// A read-only database transaction handle.

@@ -1048,6 +1048,77 @@ async fn record_published_op_hashes_isolates_a_failing_hash() {
         .is_none());
 }
 
+/// While another connection holds the write lock past the busy timeout, the
+/// batch is left unwritten and counted, not failed and not retried op by op;
+/// once the lock is free the same batch is recorded in full.
+#[tokio::test(flavor = "multi_thread")]
+async fn record_published_op_hashes_defers_the_batch_when_the_write_lock_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    // One reader and one writer: exactly two pooled connections.
+    let config = holochain_data::HolochainDataConfig {
+        max_readers: 1,
+        ..Default::default()
+    };
+    let db = holochain_data::open_db(dir.path(), dht_id(), config)
+        .await
+        .unwrap();
+    let store = DhtStore::new(db);
+    let hashes = [
+        seed_authored_publishable_op(&store, 90).await,
+        seed_authored_publishable_op(&store, 94).await,
+        seed_authored_publishable_op(&store, 98).await,
+    ];
+    let ops: Vec<_> = hashes.iter().map(chain_op_to_publish).collect();
+
+    // Both connections are held at once, so each is given the short timeout
+    // and whichever one the recorder is handed gives up on a held lock in
+    // 100 ms.
+    let pool = store.db().pool().clone();
+    {
+        let mut first = pool.acquire().await.unwrap();
+        let mut second = pool.acquire().await.unwrap();
+        for conn in [&mut first, &mut second] {
+            sqlx::query("PRAGMA busy_timeout = 100")
+                .execute(&mut **conn)
+                .await
+                .unwrap();
+        }
+    }
+
+    let holder = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let outcome = store
+        .record_published_op_hashes(ops.clone(), Timestamp::from_micros(42))
+        .await
+        .expect("a write lock that could not be had is not an error");
+    assert_eq!(
+        outcome,
+        PublishRecordOutcome {
+            deferred_by_lock: hashes.len()
+        }
+    );
+    holder.rollback().await.unwrap();
+    for hash in &hashes {
+        assert_eq!(
+            store.test_chain_op_publish_time(hash).await.unwrap(),
+            None,
+            "nothing is recorded while the lock is held"
+        );
+    }
+
+    let outcome = store
+        .record_published_op_hashes(ops, Timestamp::from_micros(42))
+        .await
+        .unwrap();
+    assert_eq!(outcome, PublishRecordOutcome::default());
+    for hash in &hashes {
+        assert_eq!(
+            store.test_chain_op_publish_time(hash).await.unwrap(),
+            Some(Timestamp::from_micros(42)),
+            "the deferred batch is recorded once the lock is free"
+        );
+    }
+}
+
 #[tokio::test]
 async fn validation_receipts_for_action_reconstructs_receipt() {
     use holochain_types::prelude::{SignedValidationReceipt, ValidationReceipt};
