@@ -4,7 +4,7 @@
 
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    Pool, Sqlite,
+    ConnectOptions, Pool, Sqlite,
 };
 use std::path::Path;
 #[cfg(feature = "test-utils")]
@@ -243,6 +243,16 @@ fn configure_sqlite_options(
     // write fails with "database is locked".
     opts = opts.busy_timeout(BUSY_TIMEOUT);
 
+    // ELOHIM PATCH (sqlcipher-key-log): sqlx logs every statement slower
+    // than 1 s at WARN under target `sqlx::query`, with its text. The
+    // connect-time PRAGMA batch carries `PRAGMA key = "x'<hex>'"` (see
+    // `DbKey::apply_pragmas`) and regularly exceeds 1 s, which printed the
+    // SQLCipher key at the default log level. Demote slow-statement logging to
+    // DEBUG so no default level prints a statement body; it is NOT disabled,
+    // and `RUST_LOG=sqlx::query=debug` still yields the full statement log an
+    // operator explicitly opts into.
+    opts = opts.log_slow_statements(log::LevelFilter::Debug, SLOW_STATEMENT_LOG_THRESHOLD);
+
     // Set other pragmas
     let sync_value = config.sync_level.as_pragma_value().to_string();
     opts = opts
@@ -258,6 +268,12 @@ fn configure_sqlite_options(
 
     Ok(opts)
 }
+
+// ELOHIM PATCH (sqlcipher-key-log): sqlx's own default threshold, kept.
+/// Statements slower than this are logged by sqlx at DEBUG (not sqlx's
+/// default WARN), so statement bodies such as the SQLCipher key pragma never
+/// reach a default-level log.
+pub const SLOW_STATEMENT_LOG_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Create a connection pool with standard options.
 async fn create_pool(opts: SqliteConnectOptions, max_readers: u16) -> sqlx::Result<Pool<Sqlite>> {
@@ -277,6 +293,24 @@ mod tests {
     use super::*;
 
     use kind::DbKind;
+
+    // ELOHIM PATCH (sqlcipher-key-log): `SqliteConnectOptions` exposes no
+    // getter for its log settings, so assert through its derived `Debug`.
+    #[test]
+    fn slow_statements_logged_at_debug_not_warn() {
+        let opts =
+            configure_sqlite_options(SqliteConnectOptions::new(), HolochainDataConfig::default())
+                .unwrap();
+        let dbg = format!("{opts:?}");
+        assert!(
+            dbg.contains("slow_statements_level: Debug"),
+            "slow statements must log at DEBUG: {dbg}"
+        );
+        assert!(
+            dbg.contains("LogSettings { statements_level: Debug"),
+            "per-statement logging stays enabled at sqlx's DEBUG default"
+        );
+    }
 
     #[derive(Debug, Clone)]
     struct TestWasmDbId;
