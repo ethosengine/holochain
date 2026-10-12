@@ -498,10 +498,12 @@ impl SourceChain<DbWrite<Dht>> {
 
             // ELOHIM PATCH (perf/scheduler-latch): open an in-flight write
             // window before the first scheduled-function upsert and hold it
-            // across `tx.commit()`. It drops when this block ends, on success,
-            // on error, or when the flush future is cancelled after the commit,
-            // and the drop un-clears the author so the scheduler reads the rows.
-            let _schedule_guard = (!scheduled_fns.is_empty())
+            // across `tx.commit()`. It is `complete()`d only after the commit
+            // returned `Ok`. An early `?` return or cancellation drops it
+            // instead, which un-clears the author and quarantines clears,
+            // because a COMMIT already queued on the sqlx worker still runs
+            // after the flush future is dropped.
+            let schedule_guard = (!scheduled_fns.is_empty())
                 .then(|| self.dht_store.schedule_hint().write_guard(&author));
 
             // Scheduled functions flushed from the scratch are always written
@@ -525,6 +527,9 @@ impl SourceChain<DbWrite<Dht>> {
             }
 
             tx.commit().await.map_err(SourceChainError::other)?;
+            if let Some(guard) = schedule_guard {
+                guard.complete();
+            }
 
             SourceChainResult::Ok(actions)
         }

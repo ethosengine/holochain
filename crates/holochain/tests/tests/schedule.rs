@@ -637,12 +637,27 @@ async fn schedule_latch_stays_open_while_write_guard_held() {
     }
     assert!(!is_scheduled(&cell).await);
 
-    drop(guard);
+    // ELOHIM PATCH (perf/scheduler-latch): an acknowledged write (guard
+    // `complete()`d after `Ok`) lets the next tick clear.
+    guard.complete();
     conductor.dispatch_scheduled_fns(Timestamp::now()).await;
     assert!(
         cleared(&cell),
-        "a tick after the guard drops clears the latch"
+        "a tick after the guard completes clears the latch"
     );
+
+    // A guard dropped WITHOUT `complete()` (cancellation with a statement
+    // possibly still queued on the sqlx worker) quarantines clears, so the
+    // author stays open across the next ticks even though no row exists.
+    drop(cell.dht_store().schedule_hint().write_guard(&pubkey));
+    for _ in 0..5 {
+        conductor.dispatch_scheduled_fns(Timestamp::now()).await;
+        assert!(
+            !cleared(&cell),
+            "latch must stay open during the unacknowledged-write quarantine"
+        );
+    }
+    assert!(!is_scheduled(&cell).await);
 }
 
 /// Helper for creating a zome with just one schedulable function called [`SCHEDULED_FN`]

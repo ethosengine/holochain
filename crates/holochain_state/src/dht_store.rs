@@ -203,9 +203,44 @@ pub struct DhtStore<Db = DbWrite<Dht>> {
 /// `cleared` only after the scheduler has observed that it owns ZERO rows (see
 /// [`ScheduleHint::try_clear`]); any write that can add a row calls
 /// [`ScheduleHint::touch`] after its commit lands, which un-clears it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ScheduleHint {
     entries: std::sync::Mutex<std::collections::HashMap<AgentPubKey, ScheduleHintEntry>>,
+    // ELOHIM PATCH (perf/scheduler-latch): how long a guard dropped without
+    // [`ScheduleWriteGuard::complete`] blocks clears. Production uses
+    // [`UNACKED_WRITE_QUARANTINE`]; tests shorten it via
+    // [`ScheduleHint::with_quarantine`].
+    quarantine: std::time::Duration,
+}
+
+// ELOHIM PATCH (perf/scheduler-latch): quarantine bound for unacknowledged
+// writes.
+/// How long [`ScheduleHint::try_clear`] refuses after a
+/// [`ScheduleWriteGuard`] was dropped without
+/// [`complete`](ScheduleWriteGuard::complete) (cancellation, early return,
+/// unwind).
+///
+/// sqlx-sqlite runs statements on a per-connection worker thread, and a
+/// statement already queued there (a COMMIT, or an autocommit INSERT) still
+/// executes after the awaiting future is dropped. The guard's drop can
+/// therefore precede the write becoming durable. The bound must exceed the
+/// longest such a queued statement can still wait before it either lands or
+/// fails:
+///
+/// - `holochain_data::BUSY_TIMEOUT` = 15 s: the longest a queued statement
+///   waits on a locked database before failing with SQLITE_BUSY.
+/// - the pool `acquire_timeout` = 30 s (`holochain_data`'s `create_pool`): a
+///   statement is only queued on a worker after its connection was acquired,
+///   so this does not extend a queued statement's wait, but it is the larger
+///   of the two configured waits and is taken as the conservative base.
+///
+/// 2 x max(15 s, 30 s) = 60 s, floor 30 s, gives 60 s.
+pub const UNACKED_WRITE_QUARANTINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl Default for ScheduleHint {
+    fn default() -> Self {
+        Self::with_quarantine(UNACKED_WRITE_QUARANTINE)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -216,9 +251,22 @@ struct ScheduleHintEntry {
     // [`ScheduleWriteGuard`]s for this author. While non-zero the latch
     // cannot clear.
     in_flight: u64,
+    // ELOHIM PATCH (perf/scheduler-latch): set when a guard was dropped
+    // without `complete()`; `try_clear` refuses until this instant passes.
+    clear_not_before: Option<std::time::Instant>,
 }
 
 impl ScheduleHint {
+    // ELOHIM PATCH (perf/scheduler-latch): configurable quarantine.
+    /// A hint whose unacknowledged-write quarantine is `quarantine` instead of
+    /// [`UNACKED_WRITE_QUARANTINE`]. Intended for tests.
+    pub fn with_quarantine(quarantine: std::time::Duration) -> Self {
+        Self {
+            entries: Default::default(),
+            quarantine,
+        }
+    }
+
     fn lock(
         &self,
     ) -> std::sync::MutexGuard<'_, std::collections::HashMap<AgentPubKey, ScheduleHintEntry>> {
@@ -242,12 +290,14 @@ impl ScheduleHint {
     /// Open an in-flight write window for `author`. Take it BEFORE the first
     /// statement that can add a scheduled-function row and hold it until the
     /// write is durable (across the commit). While any guard for `author` is
-    /// alive, [`try_clear`](Self::try_clear) refuses; dropping the guard
-    /// performs [`touch`](Self::touch) semantics (generation bump, un-clear).
-    ///
-    /// `Drop` runs on every exit, including cancellation of the future that
-    /// holds the guard, so a write that commits and is then cancelled before
-    /// any post-commit code runs still re-opens the latch.
+    /// alive, [`try_clear`](Self::try_clear) refuses. Call
+    /// [`ScheduleWriteGuard::complete`] once the awaited write returned `Ok`;
+    /// that performs [`touch`](Self::touch) semantics (generation bump,
+    /// un-clear). A guard dropped without `complete` (cancellation, early
+    /// return, unwind) does the same AND quarantines clears for this author
+    /// for the hint's quarantine (default [`UNACKED_WRITE_QUARANTINE`]),
+    /// because a statement already queued on the sqlx worker may still commit
+    /// after the drop.
     pub fn write_guard(self: &std::sync::Arc<Self>, author: &AgentPubKey) -> ScheduleWriteGuard {
         {
             let mut map = self.lock();
@@ -258,6 +308,7 @@ impl ScheduleHint {
         ScheduleWriteGuard {
             hint: self.clone(),
             author: author.clone(),
+            completed: false,
         }
     }
 
@@ -273,43 +324,65 @@ impl ScheduleHint {
     }
 
     /// Mark `author` as holding no scheduled functions, but only if no write
-    /// guard for `author` is alive and no guard was dropped (nor
+    /// guard for `author` is alive, no guard was finished (nor
     /// [`touch`](Self::touch) called) since the caller sampled `g0` with
-    /// [`peek`](Self::peek). Returns whether the author is now cleared.
+    /// [`peek`](Self::peek), and no unacknowledged-write quarantine is
+    /// running. Returns whether the author is now cleared.
     ///
     /// ELOHIM PATCH (perf/scheduler-latch): ordering argument.
     ///
-    /// Reader protocol: `peek → g0`, then the live SELECT and the EXISTS
+    /// Reader protocol: `peek -> g0`, then the live SELECT and the EXISTS
     /// probe, and only if both see zero rows, `try_clear(g0)`. Writer
     /// protocol: take the guard (G) before any row-adding statement, the
-    /// commit becomes durable (C), drop the guard (D). G < C < D always
-    /// holds for a write that commits, because the guard spans the commit.
-    /// A committed row R hidden behind a cleared latch would need a
-    /// successful `try_clear(g0)` (T) with no later un-clear. Case on T:
+    /// write becomes durable (C), the guard finishes (D: `complete()` or
+    /// drop). A committed row R hidden behind a cleared latch would need a
+    /// successful `try_clear(g0)` (T) with no later un-clear.
+    ///
+    /// Completed writes, G < C < D. `complete()` is only called after the
+    /// awaited operation returned `Ok`, i.e. after C. Case on T:
     ///
     /// - T < G: the clear lands first, then G sets `cleared = false` (and D
     ///   does it again). The next tick reads R.
     /// - G < T < D: the guard is alive at T, so `in_flight > 0` and T is
-    ///   refused. This is the case a pre-commit touch alone could not close
-    ///   (touch, reader peeks the new gen, SELECTs see nothing, clear
-    ///   succeeds, then the commit lands).
+    ///   refused.
     /// - D < T: D bumped the generation. If the reader's peek came before D,
     ///   `g0` is stale and T is refused. If the peek came after D, then it
     ///   came after C, so the SELECT/EXISTS that follow the peek observe R
-    ///   (a read transaction begun after a commit sees it) and the reader
-    ///   never calls T.
+    ///   and the reader never calls T.
     ///
-    /// Cancellation: dropping the writer's future runs the guard's `Drop`, so
-    /// D still happens. If C was reached the row is covered by the cases
-    /// above; if it was not, no row exists and the extra generation bump only
-    /// costs one wasted read on the next tick. Overlapping guards for one
-    /// author each count in `in_flight`, so the latch cannot clear until the
-    /// last is dropped, and each drop bumps the generation. Authors are
-    /// independent map entries, so a guard for one never blocks another.
+    /// Unacknowledged writes, G < D < C possible. sqlx-sqlite executes
+    /// statements on a dedicated worker thread; dropping the awaiting future
+    /// does not retract a COMMIT (or autocommit INSERT) already queued there,
+    /// so the guard can drop before the row lands. Such a drop (no
+    /// `complete()`) sets `clear_not_before = D + quarantine`. A reader whose
+    /// peek precedes D is refused by the generation as above; a reader whose
+    /// peek follows D may see zero rows (C not yet reached), but its T is
+    /// refused until `D + quarantine`. The first T that can succeed comes
+    /// from a peek/SELECT/EXISTS sequence that, if C landed within the
+    /// quarantine, observes R.
+    ///
+    /// Residual: if the worker holds the queued statement longer than the
+    /// quarantine (default [`UNACKED_WRITE_QUARANTINE`], 60 s) and it then
+    /// commits, the latch can be clear with R present until the next write
+    /// for this author or a restart. A queued statement waits at most
+    /// `holochain_data::BUSY_TIMEOUT` (15 s) on a locked database before
+    /// failing, so the 60 s bound is four times the only configured wait a
+    /// queued statement is subject to; exceeding it would need the worker
+    /// thread itself to stall (e.g. a stopped process), not a lock wait.
+    ///
+    /// A guard dropped on an early `?` return or unwind also quarantines,
+    /// even though nothing was queued; that only delays the clear. Overlapping
+    /// guards for one author each count in `in_flight`, so the latch cannot
+    /// clear until the last finishes, and each finish bumps the generation.
+    /// Authors are independent map entries, so a guard for one never blocks
+    /// another.
     pub fn try_clear(&self, author: &AgentPubKey, g0: u64) -> bool {
         let mut map = self.lock();
         let e = map.entry(author.clone()).or_default();
-        if e.in_flight == 0 && e.gen == g0 {
+        let quarantined = e
+            .clear_not_before
+            .is_some_and(|t| std::time::Instant::now() < t);
+        if e.in_flight == 0 && e.gen == g0 && !quarantined {
             e.cleared = true;
             true
         } else {
@@ -322,22 +395,53 @@ impl ScheduleHint {
 /// Returned by [`ScheduleHint::write_guard`]. Holds an owned `Arc` so it can
 /// live across `.await` points; it is `Send` because `ScheduleHint` is
 /// `Send + Sync` (a `Mutex` over plain data) and `AgentPubKey` is `Send`.
-/// On drop it closes the window and bumps the author's generation.
+/// Finish it with [`complete`](Self::complete) once the awaited write
+/// returned `Ok`; that closes the window and bumps the author's generation.
+/// Dropping it without `complete` does the same and also quarantines clears
+/// (see [`ScheduleHint::try_clear`]).
 #[must_use = "the guard only protects the write while it is held"]
 #[derive(Debug)]
 pub struct ScheduleWriteGuard {
     hint: std::sync::Arc<ScheduleHint>,
     author: AgentPubKey,
+    // ELOHIM PATCH (perf/scheduler-latch): set by `complete()` so `Drop`
+    // neither decrements twice nor quarantines.
+    completed: bool,
 }
 
-impl Drop for ScheduleWriteGuard {
-    fn drop(&mut self) {
+impl ScheduleWriteGuard {
+    // ELOHIM PATCH (perf/scheduler-latch): acknowledged finish.
+    /// Close the write window after the awaited DB operation returned `Ok`
+    /// (the write is durable, or definitively did nothing). Decrements the
+    /// in-flight count, bumps the generation and un-clears, without the
+    /// quarantine a bare drop applies. Call it ONLY after `Ok`.
+    pub fn complete(mut self) {
+        self.finish(false);
+        self.completed = true;
+    }
+
+    fn finish(&self, unacknowledged: bool) {
         // `lock()` recovers a poisoned mutex, so this never panics.
         let mut map = self.hint.lock();
         let e = map.entry(self.author.clone()).or_default();
         e.in_flight = e.in_flight.saturating_sub(1);
         e.gen = e.gen.wrapping_add(1);
         e.cleared = false;
+        if unacknowledged {
+            let until = std::time::Instant::now() + self.hint.quarantine;
+            e.clear_not_before = Some(e.clear_not_before.map_or(until, |t| t.max(until)));
+        }
+    }
+}
+
+impl Drop for ScheduleWriteGuard {
+    fn drop(&mut self) {
+        // ELOHIM PATCH (perf/scheduler-latch): reached without `complete()`
+        // only on cancellation, early return or unwind; a queued statement
+        // may still commit, so quarantine clears.
+        if !self.completed {
+            self.finish(true);
+        }
     }
 }
 
@@ -656,8 +760,10 @@ impl DhtStore<DbWrite<Dht>> {
                     // row-writing path; guard it like the others. It only
                     // runs when an expired persisted row exists, so the
                     // reader's own clear is unaffected on empty authors.
-                    let _guard = self.schedule_hint.write_guard(author);
-                    if let Err(e) = self
+                    // `complete()` only on `Ok`; an error or cancellation
+                    // drops the guard and quarantines clears.
+                    let guard = self.schedule_hint.write_guard(author);
+                    match self
                         .db
                         .upsert_scheduled_function(InsertScheduledFunction {
                             author,
@@ -670,12 +776,16 @@ impl DhtStore<DbWrite<Dht>> {
                         })
                         .await
                     {
-                        tracing::error!(
-                            "error upserting rescheduled function ({}, {}): {:?}",
-                            zome_name,
-                            scheduled_fn_name,
-                            e
-                        );
+                        Ok(_) => guard.complete(),
+                        Err(e) => {
+                            drop(guard);
+                            tracing::error!(
+                                "error upserting rescheduled function ({}, {}): {:?}",
+                                zome_name,
+                                scheduled_fn_name,
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -713,9 +823,10 @@ impl DhtStore<DbWrite<Dht>> {
             }
             Some((start_at, end_at, ephemeral)) => {
                 // ELOHIM PATCH (perf/scheduler-latch): hold an in-flight
-                // write guard across the upsert; its drop (on success, error
-                // or cancellation) un-clears the author.
-                let _guard = self.schedule_hint.write_guard(author);
+                // write guard across the upsert. `complete()` after `Ok`; an
+                // error or cancellation drops it, which un-clears the author
+                // and quarantines clears (the INSERT may still be queued).
+                let guard = self.schedule_hint.write_guard(author);
                 let written = self
                     .db
                     .upsert_scheduled_function(InsertScheduledFunction {
@@ -728,6 +839,7 @@ impl DhtStore<DbWrite<Dht>> {
                         ephemeral,
                     })
                     .await?;
+                guard.complete();
                 Ok(written)
             }
         }

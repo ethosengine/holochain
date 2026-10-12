@@ -3585,16 +3585,16 @@ fn schedule_write_guard_drop_reopens_cleared_author() {
 }
 
 #[test]
-fn schedule_write_guard_overlapping_guards_block_until_both_drop() {
+fn schedule_write_guard_overlapping_guards_block_until_both_complete() {
     let hint = Arc::new(ScheduleHint::default());
     let author = agent(1);
 
     let a = hint.write_guard(&author);
     let b = hint.write_guard(&author);
-    drop(a);
+    a.complete();
     let (g, _) = hint.peek(&author);
     assert!(!hint.try_clear(&author, g), "one guard still in flight");
-    drop(b);
+    b.complete();
     assert!(
         !hint.try_clear(&author, g),
         "second drop bumped the generation"
@@ -3602,7 +3602,7 @@ fn schedule_write_guard_overlapping_guards_block_until_both_drop() {
     let (g, _) = hint.peek(&author);
     assert!(
         hint.try_clear(&author, g),
-        "clear allowed once both dropped"
+        "clear allowed once both completed"
     );
     assert!(hint.peek(&author).1);
 }
@@ -3625,4 +3625,106 @@ fn schedule_write_guard_is_per_author() {
 fn schedule_write_guard_is_send() {
     fn assert_send<T: Send + 'static>() {}
     assert_send::<ScheduleWriteGuard>();
+}
+
+// ELOHIM PATCH (perf/scheduler-latch): acknowledged completion vs the
+// unacknowledged-drop quarantine.
+#[test]
+fn schedule_write_guard_complete_allows_immediate_clear() {
+    let hint = Arc::new(ScheduleHint::default());
+    let author = agent(1);
+
+    let (g0, _) = hint.peek(&author);
+    hint.write_guard(&author).complete();
+    assert!(
+        !hint.try_clear(&author, g0),
+        "completion bumped the generation"
+    );
+    let (g1, cleared) = hint.peek(&author);
+    assert!(!cleared);
+    assert!(
+        hint.try_clear(&author, g1),
+        "a completed write does not quarantine"
+    );
+}
+
+#[test]
+fn schedule_write_guard_drop_without_complete_quarantines_clear() {
+    let quarantine = std::time::Duration::from_millis(300);
+    let hint = Arc::new(ScheduleHint::with_quarantine(quarantine));
+    let author = agent(1);
+
+    // Cancellation with a statement possibly still queued on the worker.
+    drop(hint.write_guard(&author));
+    let (g, _) = hint.peek(&author);
+    assert!(
+        !hint.try_clear(&author, g),
+        "fresh peek still refused inside the quarantine"
+    );
+    assert!(!hint.peek(&author).1);
+
+    std::thread::sleep(quarantine + std::time::Duration::from_millis(100));
+    let (g, _) = hint.peek(&author);
+    assert!(
+        hint.try_clear(&author, g),
+        "clear allowed once the quarantine has passed"
+    );
+}
+
+#[test]
+fn schedule_write_guard_complete_disarms_drop() {
+    let hint = Arc::new(ScheduleHint::default());
+    let author = agent(1);
+
+    // Two guards; completing one must decrement exactly once, so the other
+    // still holds the latch open.
+    let a = hint.write_guard(&author);
+    let b = hint.write_guard(&author);
+    a.complete();
+    let (g, _) = hint.peek(&author);
+    assert!(
+        !hint.try_clear(&author, g),
+        "b still in flight: complete() must not double-decrement"
+    );
+    b.complete();
+    let (g, _) = hint.peek(&author);
+    assert!(
+        hint.try_clear(&author, g),
+        "both completed, no quarantine: in_flight is back to 0"
+    );
+
+    // A further guard must block again: in_flight did not underflow-saturate
+    // into a state where a single guard is invisible.
+    let c = hint.write_guard(&author);
+    let (g, _) = hint.peek(&author);
+    assert!(!hint.try_clear(&author, g));
+    c.complete();
+}
+
+#[test]
+fn schedule_write_guard_early_return_quarantines() {
+    let hint = Arc::new(ScheduleHint::default());
+    let author = agent(1);
+
+    fn db_op(fail: bool) -> Result<(), &'static str> {
+        if fail {
+            Err("db error")
+        } else {
+            Ok(())
+        }
+    }
+    fn write(hint: &Arc<ScheduleHint>, author: &AgentPubKey) -> Result<(), &'static str> {
+        let guard = hint.write_guard(author);
+        db_op(true)?;
+        guard.complete();
+        Ok(())
+    }
+    assert!(write(&hint, &author).is_err());
+
+    let (g, cleared) = hint.peek(&author);
+    assert!(!cleared);
+    assert!(
+        !hint.try_clear(&author, g),
+        "an early return drops the guard and quarantines (default 60 s)"
+    );
 }
