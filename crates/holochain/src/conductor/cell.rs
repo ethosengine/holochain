@@ -233,9 +233,11 @@ impl Cell {
         // ELOHIM PATCH (perf/scheduler-latch): the scheduler ticks every
         // 100 ms for every running cell, and a cell whose zomes never call
         // `schedule()` paid two reads per tick for nothing. Skip while the
-        // latch says this author holds no rows. `g0` is sampled before the
-        // reads so a write that lands meanwhile refuses the clear below.
-        let (g0, cleared) = self.space.dht_store.schedule_hint().peek(&author);
+        // latch says this author holds no rows. `token` (generation + peek
+        // instant) is sampled before the reads so a write that lands
+        // meanwhile, or an observation that began inside an
+        // unacknowledged-write quarantine, refuses the clear below.
+        let (token, cleared) = self.space.dht_store.schedule_hint().peek(&author);
         if cleared {
             return;
         }
@@ -256,7 +258,10 @@ impl Cell {
         if matches!(&live_fns, Ok(fns) if fns.is_empty()) {
             match self.space.dht_store.has_scheduled_functions(&author).await {
                 Ok(false) => {
-                    self.space.dht_store.schedule_hint().try_clear(&author, g0);
+                    self.space
+                        .dht_store
+                        .schedule_hint()
+                        .try_clear(&author, token);
                 }
                 Ok(true) => {}
                 Err(e) => error!("error probing scheduled fns: {:?}", e),

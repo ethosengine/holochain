@@ -218,24 +218,28 @@ pub struct ScheduleHint {
 /// How long [`ScheduleHint::try_clear`] refuses after a
 /// [`ScheduleWriteGuard`] was dropped without
 /// [`complete`](ScheduleWriteGuard::complete) (cancellation, early return,
-/// unwind).
+/// unwind), measured against when the reader's observation STARTED (its
+/// [`ScheduleHint::peek`]), not when it calls `try_clear`.
 ///
 /// sqlx-sqlite runs statements on a per-connection worker thread, and a
 /// statement already queued there (a COMMIT, or an autocommit INSERT) still
 /// executes after the awaiting future is dropped. The guard's drop can
-/// therefore precede the write becoming durable. The bound must exceed the
-/// longest such a queued statement can still wait before it either lands or
-/// fails:
+/// therefore precede the write becoming durable.
 ///
-/// - `holochain_data::BUSY_TIMEOUT` = 15 s: the longest a queued statement
-///   waits on a locked database before failing with SQLITE_BUSY.
-/// - the pool `acquire_timeout` = 30 s (`holochain_data`'s `create_pool`): a
-///   statement is only queued on a worker after its connection was acquired,
-///   so this does not extend a queued statement's wait, but it is the larger
-///   of the two configured waits and is taken as the conservative base.
-///
-/// 2 x max(15 s, 30 s) = 60 s, floor 30 s, gives 60 s.
-pub const UNACKED_WRITE_QUARANTINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// ELOHIM PATCH (perf/scheduler-latch): this is a PRACTICAL bound, not one
+/// derived from a configured maximum. Nothing in sqlx-sqlite bounds the time
+/// from queuing a statement to executing it: the worker runs commands
+/// serially, its command channel bounds their count and not their duration,
+/// and SQLite's busy timeout bounds only busy-handler sleeps, not execution,
+/// disk I/O, fsync, a WAL checkpoint, or a long statement queued ahead. Ten
+/// minutes is chosen far above any statement latency observed on a healthy
+/// node. The cost of a long quarantine is small: one author keeps doing the
+/// scheduler's full reads for ten minutes after a CANCELLED scheduling write,
+/// which is rare. The residual is a queued COMMIT whose worker is stalled
+/// longer than the quarantine (storage fault, severe resource pressure); if it
+/// then commits, its row can sit behind a cleared latch until the next write
+/// for that author or a restart.
+pub const UNACKED_WRITE_QUARANTINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl Default for ScheduleHint {
     fn default() -> Self {
@@ -252,8 +256,27 @@ struct ScheduleHintEntry {
     // cannot clear.
     in_flight: u64,
     // ELOHIM PATCH (perf/scheduler-latch): set when a guard was dropped
-    // without `complete()`; `try_clear` refuses until this instant passes.
+    // without `complete()`; `try_clear` refuses unless the reader's peek was
+    // taken at or after this instant.
     clear_not_before: Option<std::time::Instant>,
+    // ELOHIM PATCH (perf/scheduler-latch): set instead of `clear_not_before`
+    // when `now + quarantine` overflows `Instant` (an absurd quarantine);
+    // clears are then refused for the life of the hint, never a panic.
+    quarantined_forever: bool,
+}
+
+// ELOHIM PATCH (perf/scheduler-latch): what a reader's observation started
+// from.
+/// Returned by [`ScheduleHint::peek`] and handed back to
+/// [`ScheduleHint::try_clear`]: the author's generation and the instant the
+/// peek was taken. The reader's SELECT and EXISTS run after the peek, so `at`
+/// is a lower bound on when its observation started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeekToken {
+    /// The author's generation at peek time.
+    pub gen: u64,
+    /// When the peek was taken.
+    pub at: std::time::Instant,
 }
 
 impl ScheduleHint {
@@ -277,13 +300,22 @@ impl ScheduleHint {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Return `(generation, cleared)` for `author`. An unknown author is
-    /// `(0, false)`: it may have schedules.
-    pub fn peek(&self, author: &AgentPubKey) -> (u64, bool) {
-        self.lock()
+    /// Return `(token, cleared)` for `author`, where the token carries the
+    /// generation and the instant of the peek. An unknown author is
+    /// generation 0, not cleared: it may have schedules.
+    // ELOHIM PATCH (perf/scheduler-latch): the token carries `at` so
+    // `try_clear` can refuse an observation that began inside a quarantine.
+    pub fn peek(&self, author: &AgentPubKey) -> (PeekToken, bool) {
+        let map = self.lock();
+        // Sampled under the lock, so a guard's drop either happened before
+        // this instant (and its quarantine is visible) or after it (and its
+        // generation bump refuses this token).
+        let at = std::time::Instant::now();
+        let (gen, cleared) = map
             .get(author)
             .map(|e| (e.gen, e.cleared))
-            .unwrap_or((0, false))
+            .unwrap_or((0, false));
+        (PeekToken { gen, at }, cleared)
     }
 
     // ELOHIM PATCH (perf/scheduler-latch): in-flight write guard.
@@ -325,14 +357,16 @@ impl ScheduleHint {
 
     /// Mark `author` as holding no scheduled functions, but only if no write
     /// guard for `author` is alive, no guard was finished (nor
-    /// [`touch`](Self::touch) called) since the caller sampled `g0` with
-    /// [`peek`](Self::peek), and no unacknowledged-write quarantine is
-    /// running. Returns whether the author is now cleared.
+    /// [`touch`](Self::touch) called) since the caller took `token` with
+    /// [`peek`](Self::peek), and the peek was taken after any
+    /// unacknowledged-write quarantine had expired. Returns whether the author
+    /// is now cleared.
     ///
     /// ELOHIM PATCH (perf/scheduler-latch): ordering argument.
     ///
-    /// Reader protocol: `peek -> g0`, then the live SELECT and the EXISTS
-    /// probe, and only if both see zero rows, `try_clear(g0)`. Writer
+    /// Reader protocol: `peek -> token` (generation `g0`, instant `P`), then
+    /// the live SELECT and the EXISTS probe, and only if both see zero rows,
+    /// `try_clear(token)`. Writer
     /// protocol: take the guard (G) before any row-adding statement, the
     /// write becomes durable (C), the guard finishes (D: `complete()` or
     /// drop). A committed row R hidden behind a cleared latch would need a
@@ -354,21 +388,25 @@ impl ScheduleHint {
     /// statements on a dedicated worker thread; dropping the awaiting future
     /// does not retract a COMMIT (or autocommit INSERT) already queued there,
     /// so the guard can drop before the row lands. Such a drop (no
-    /// `complete()`) sets `clear_not_before = D + quarantine`. A reader whose
-    /// peek precedes D is refused by the generation as above; a reader whose
-    /// peek follows D may see zero rows (C not yet reached), but its T is
-    /// refused until `D + quarantine`. The first T that can succeed comes
-    /// from a peek/SELECT/EXISTS sequence that, if C landed within the
-    /// quarantine, observes R.
+    /// `complete()`) sets `clear_not_before = D + quarantine`, and T is
+    /// refused unless the reader's peek instant `P >= D + quarantine`. A
+    /// reader whose peek precedes D is refused by the generation as above. A
+    /// reader whose peek follows D but precedes `D + quarantine` is refused
+    /// by the quarantine however late it calls T: checking only the time of T
+    /// would let a reader that observed zero rows before C, and was then
+    /// delayed past the quarantine, clear over a row that C committed within
+    /// it. A reader whose peek follows `D + quarantine` runs its SELECT and
+    /// EXISTS after that instant, so if C landed within the quarantine they
+    /// observe R and the reader never calls T.
     ///
-    /// Residual: if the worker holds the queued statement longer than the
-    /// quarantine (default [`UNACKED_WRITE_QUARANTINE`], 60 s) and it then
-    /// commits, the latch can be clear with R present until the next write
-    /// for this author or a restart. A queued statement waits at most
-    /// `holochain_data::BUSY_TIMEOUT` (15 s) on a locked database before
-    /// failing, so the 60 s bound is four times the only configured wait a
-    /// queued statement is subject to; exceeding it would need the worker
-    /// thread itself to stall (e.g. a stopped process), not a lock wait.
+    /// Residual: the quarantine (default [`UNACKED_WRITE_QUARANTINE`], ten
+    /// minutes) is a practical bound chosen far above any observed statement
+    /// latency, not derived from a configured maximum; sqlx-sqlite has no
+    /// configured limit on how long a queued statement can wait on its
+    /// worker. If the worker is stalled longer than the quarantine (storage
+    /// fault, severe resource pressure) and the queued COMMIT then lands, R
+    /// can sit behind a cleared latch until the next write for this author or
+    /// a restart.
     ///
     /// A guard dropped on an early `?` return or unwind also quarantines,
     /// even though nothing was queued; that only delays the clear. Overlapping
@@ -376,13 +414,17 @@ impl ScheduleHint {
     /// clear until the last finishes, and each finish bumps the generation.
     /// Authors are independent map entries, so a guard for one never blocks
     /// another.
-    pub fn try_clear(&self, author: &AgentPubKey, g0: u64) -> bool {
+    pub fn try_clear(&self, author: &AgentPubKey, token: PeekToken) -> bool {
         let mut map = self.lock();
         let e = map.entry(author.clone()).or_default();
-        let quarantined = e
-            .clear_not_before
-            .is_some_and(|t| std::time::Instant::now() < t);
-        if e.in_flight == 0 && e.gen == g0 && !quarantined {
+        // ELOHIM PATCH (perf/scheduler-latch): refuse while the quarantine
+        // runs AND when the observation began inside it (`token.at` before
+        // expiry), so the SELECT/EXISTS that justified this clear started
+        // after any commit queued within the quarantine could land.
+        let quarantined = e.quarantined_forever
+            || e.clear_not_before
+                .is_some_and(|t| token.at < t || std::time::Instant::now() < t);
+        if e.in_flight == 0 && e.gen == token.gen && !quarantined {
             e.cleared = true;
             true
         } else {
@@ -428,8 +470,14 @@ impl ScheduleWriteGuard {
         e.gen = e.gen.wrapping_add(1);
         e.cleared = false;
         if unacknowledged {
-            let until = std::time::Instant::now() + self.hint.quarantine;
-            e.clear_not_before = Some(e.clear_not_before.map_or(until, |t| t.max(until)));
+            // ELOHIM PATCH (perf/scheduler-latch): `Instant + Duration` panics
+            // on overflow; an unrepresentable deadline refuses clears forever.
+            match std::time::Instant::now().checked_add(self.hint.quarantine) {
+                Some(until) => {
+                    e.clear_not_before = Some(e.clear_not_before.map_or(until, |t| t.max(until)));
+                }
+                None => e.quarantined_forever = true,
+            }
         }
     }
 }

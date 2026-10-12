@@ -3478,7 +3478,8 @@ fn schedule_hint_touch_between_peek_and_clear_refuses_the_clear() {
     let author = agent(1);
 
     // Unknown author: may have schedules.
-    assert_eq!(hint.peek(&author), (0, false));
+    let (t, cleared) = hint.peek(&author);
+    assert_eq!((t.gen, cleared), (0, false));
 
     let (g0, cleared) = hint.peek(&author);
     assert!(!cleared);
@@ -3505,7 +3506,7 @@ fn schedule_hint_clears_when_untouched_and_touch_unclears() {
     hint.touch(&alice);
     let (g1, cleared) = hint.peek(&alice);
     assert!(!cleared, "touch after clear must un-clear");
-    assert_ne!(g1, g0);
+    assert_ne!(g1.gen, g0.gen);
 }
 
 #[tokio::test]
@@ -3565,7 +3566,7 @@ fn schedule_write_guard_drop_without_write_bumps_generation() {
     // sampled before it.
     drop(hint.write_guard(&author));
     let (g1, _) = hint.peek(&author);
-    assert_ne!(g0, g1);
+    assert_ne!(g0.gen, g1.gen);
     assert!(!hint.try_clear(&author, g0));
 }
 
@@ -3671,6 +3672,53 @@ fn schedule_write_guard_drop_without_complete_quarantines_clear() {
     );
 }
 
+// ELOHIM PATCH (perf/scheduler-latch): the quarantine is judged against
+// when the reader's observation started, not when it calls `try_clear`.
+#[test]
+fn schedule_write_guard_peek_inside_quarantine_refused_after_expiry() {
+    let quarantine = std::time::Duration::from_millis(300);
+    let hint = Arc::new(ScheduleHint::with_quarantine(quarantine));
+    let author = agent(1);
+
+    // Guard dropped unacknowledged (D); the reader peeks the NEW generation
+    // inside the quarantine, its SELECT/EXISTS see zero (C not yet landed),
+    // then it is delayed past expiry before calling try_clear.
+    drop(hint.write_guard(&author));
+    let (token, cleared) = hint.peek(&author);
+    assert!(!cleared);
+    std::thread::sleep(quarantine + std::time::Duration::from_millis(100));
+    assert!(
+        !hint.try_clear(&author, token),
+        "an observation that began inside the quarantine must not clear"
+    );
+    assert!(!hint.peek(&author).1);
+
+    // A peek taken after expiry starts a fresh observation and may clear.
+    let (token, _) = hint.peek(&author);
+    assert!(hint.try_clear(&author, token), "a peek after expiry clears");
+    assert!(hint.peek(&author).1);
+}
+
+#[test]
+fn schedule_write_guard_overflowing_quarantine_refuses_without_panic() {
+    let hint = Arc::new(ScheduleHint::with_quarantine(std::time::Duration::MAX));
+    let author = agent(1);
+
+    // Before any unacknowledged drop, clears work normally.
+    let (token, _) = hint.peek(&author);
+    assert!(hint.try_clear(&author, token));
+
+    // `now + Duration::MAX` overflows `Instant`; the drop must not panic and
+    // must refuse clears.
+    drop(hint.write_guard(&author));
+    let (token, cleared) = hint.peek(&author);
+    assert!(!cleared);
+    assert!(
+        !hint.try_clear(&author, token),
+        "an unrepresentable quarantine refuses clears"
+    );
+}
+
 #[test]
 fn schedule_write_guard_complete_disarms_drop() {
     let hint = Arc::new(ScheduleHint::default());
@@ -3725,6 +3773,6 @@ fn schedule_write_guard_early_return_quarantines() {
     assert!(!cleared);
     assert!(
         !hint.try_clear(&author, g),
-        "an early return drops the guard and quarantines (default 60 s)"
+        "an early return drops the guard and quarantines (default 600 s)"
     );
 }
