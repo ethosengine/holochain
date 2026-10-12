@@ -479,6 +479,124 @@ async fn schedule_persisted_expired() {
     assert!(is_scheduled(&cell).await);
 }
 
+// ELOHIM PATCH (perf/scheduler-latch): a cell with no scheduled-function rows
+// stops paying for scheduler reads after one tick, and every write path that
+// adds a row (the store upsert and the source-chain flush) reopens it.
+#[tokio::test(flavor = "multi_thread")]
+async fn schedule_latch_clears_without_rows_and_reopens_on_write() {
+    holochain_trace::test_run();
+
+    let zome = create_schedule_zome(|api, input| {
+        let _ = api.emit_signal(AppSignal::new(ExternIO::encode(input.clone()).unwrap()));
+        Ok(input)
+    });
+    let dna = SweetDnaFile::unique_from_inline_zomes(zome).await;
+    let mut conductor = SweetConductor::from_config_rendezvous(
+        SweetConductorConfig::rendezvous(true),
+        SweetLocalRendezvous::new().await,
+    )
+    .await;
+    let app = conductor
+        .setup_app("app", std::slice::from_ref(&dna.0))
+        .await
+        .unwrap();
+    let cell = app.into_cells()[0].clone();
+    let pubkey = cell.agent_pubkey().clone();
+    let mut app_signal = conductor.subscribe_to_app_signals("app".into());
+
+    // Drive the scheduler by hand; let the replacement's immediate first tick
+    // finish before asserting.
+    conductor
+        .start_scheduler(std::time::Duration::from_millis(1_000_000_000))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let cleared = |cell: &SweetCell| cell.dht_store().schedule_hint().peek(&pubkey).1;
+
+    // No rows: one tick clears the latch.
+    conductor.dispatch_scheduled_fns(Timestamp::now()).await;
+    assert!(cleared(&cell));
+
+    // A store upsert reopens it, and the next tick dispatches the function.
+    cell.dht_store()
+        .upsert_scheduled_function(
+            &pubkey,
+            &ScheduledFn::new(COORDINATOR.into(), SCHEDULED_FN.into()),
+            &None,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+    assert!(!cleared(&cell));
+    conductor.dispatch_scheduled_fns(Timestamp::now()).await;
+    assert_eq!(None, wait_for_signal(&mut app_signal).await.unwrap());
+
+    // The ephemeral row was consumed: the next tick clears again.
+    assert!(!is_scheduled(&cell).await);
+    conductor.dispatch_scheduled_fns(Timestamp::now()).await;
+    assert!(cleared(&cell));
+
+    // `schedule()` in a zome call reaches the table through the source-chain
+    // flush, which reopens the latch too.
+    let _: () = conductor
+        .call(&cell.zome(COORDINATOR), SCHEDULING_FN, ())
+        .await;
+    assert!(is_scheduled(&cell).await);
+    assert!(!cleared(&cell));
+    conductor.dispatch_scheduled_fns(Timestamp::now()).await;
+    assert_eq!(None, wait_for_signal(&mut app_signal).await.unwrap());
+}
+
+// ELOHIM PATCH (perf/scheduler-latch): a persisted row that is neither live
+// nor expired (a fired cron re-upserted into the future looks exactly like
+// this) must never clear the latch, or the cron would be silenced forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn schedule_latch_never_clears_with_future_persisted_row() {
+    holochain_trace::test_run();
+
+    let zome = create_schedule_zome(|api, input| {
+        let _ = api.emit_signal(AppSignal::new(ExternIO::encode(input.clone()).unwrap()));
+        Ok(input)
+    });
+    let dna = SweetDnaFile::unique_from_inline_zomes(zome).await;
+    let mut conductor = SweetConductor::from_config_rendezvous(
+        SweetConductorConfig::rendezvous(true),
+        SweetLocalRendezvous::new().await,
+    )
+    .await;
+    let app = conductor
+        .setup_app("app", std::slice::from_ref(&dna.0))
+        .await
+        .unwrap();
+    let cell = app.into_cells()[0].clone();
+    let pubkey = cell.agent_pubkey().clone();
+    let mut app_signal = conductor.subscribe_to_app_signals("app".into());
+
+    conductor
+        .start_scheduler(std::time::Duration::from_millis(1_000_000_000))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    cell.dht_store()
+        .upsert_scheduled_function(
+            &pubkey,
+            &ScheduledFn::new(COORDINATOR.into(), SCHEDULED_FN.into()),
+            &Some(Schedule::Persisted("0 0 0 * * * 2099".into())),
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..5 {
+        conductor.dispatch_scheduled_fns(Timestamp::now()).await;
+        assert!(!cell.dht_store().schedule_hint().peek(&pubkey).1);
+    }
+    assert!(is_scheduled(&cell).await);
+    assert!(wait_for_signal(&mut app_signal).await.is_err());
+}
+
 /// Helper for creating a zome with just one schedulable function called [`SCHEDULED_FN`]
 /// that can be scheduled by calling [`SCHEDULING_FN`]
 fn create_schedule_zome(
@@ -730,6 +848,10 @@ async fn schedule_test_wasm() -> anyhow::Result<()> {
             break;
         }
     }
+
+    // ELOHIM PATCH (perf/scheduler-latch): alice holds a persisted cron, so
+    // the scheduler latch must stay open for her between firings.
+    assert!(!alice_cell.dht_store().schedule_hint().peek(&alice_pubkey).1);
 
     // alice can schedule things outside of init.
     let query_tock: Vec<Record> = conductor.call(&alice, "query_tock", ()).await;

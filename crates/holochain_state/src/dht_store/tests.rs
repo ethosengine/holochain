@@ -3470,3 +3470,66 @@ mod publish_query {
         assert_eq!(ops_to_publish(&dht_store, &agent).await.len(), 0);
     }
 }
+
+// ELOHIM PATCH (perf/scheduler-latch): the latch's generation rule.
+#[test]
+fn schedule_hint_touch_between_peek_and_clear_refuses_the_clear() {
+    let hint = ScheduleHint::default();
+    let author = agent(1);
+
+    // Unknown author: may have schedules.
+    assert_eq!(hint.peek(&author), (0, false));
+
+    let (g0, cleared) = hint.peek(&author);
+    assert!(!cleared);
+    hint.touch(&author);
+    assert!(
+        !hint.try_clear(&author, g0),
+        "a touch after peek must refuse"
+    );
+    assert!(!hint.peek(&author).1);
+}
+
+#[test]
+fn schedule_hint_clears_when_untouched_and_touch_unclears() {
+    let hint = ScheduleHint::default();
+    let alice = agent(1);
+    let bob = agent(2);
+
+    let (g0, _) = hint.peek(&alice);
+    assert!(hint.try_clear(&alice, g0));
+    assert!(hint.peek(&alice).1);
+    // Per-author: bob is untouched by alice's clear.
+    assert!(!hint.peek(&bob).1);
+
+    hint.touch(&alice);
+    let (g1, cleared) = hint.peek(&alice);
+    assert!(!cleared, "touch after clear must un-clear");
+    assert_ne!(g1, g0);
+}
+
+#[tokio::test]
+async fn schedule_hint_shared_across_clones_and_touched_by_upsert() {
+    let store = DhtStore::new_test(dht_id()).await.unwrap();
+    let author = agent(1);
+    let read = store.as_read();
+    let clone = store.clone();
+
+    let (g0, _) = store.schedule_hint().peek(&author);
+    assert!(!store.has_scheduled_functions(&author).await.unwrap());
+    assert!(store.schedule_hint().try_clear(&author, g0));
+    assert!(read.schedule_hint().peek(&author).1);
+    assert!(clone.schedule_hint().peek(&author).1);
+
+    clone
+        .upsert_scheduled_function(
+            &author,
+            &ScheduledFn::new("z".into(), "f".into()),
+            &None,
+            Timestamp::from_micros(50),
+        )
+        .await
+        .unwrap();
+    assert!(!store.schedule_hint().peek(&author).1);
+    assert!(store.has_scheduled_functions(&author).await.unwrap());
+}

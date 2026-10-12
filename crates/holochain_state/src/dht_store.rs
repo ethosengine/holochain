@@ -187,12 +187,108 @@ use holochain_zome_types::prelude::{Action, ActionData, OpValidity, SignedAction
 #[derive(Clone, Debug)]
 pub struct DhtStore<Db = DbWrite<Dht>> {
     db: Db,
+    // ELOHIM PATCH (perf/scheduler-latch): shared by every clone of the store
+    // (and its `as_read` downgrade) so the scheduler can skip its per-tick
+    // reads for authors that hold no scheduled functions.
+    schedule_hint: std::sync::Arc<ScheduleHint>,
+}
+
+// ELOHIM PATCH (perf/scheduler-latch): per-author latch over the
+// `ScheduledFunction` table.
+/// In-memory hint telling the scheduler which authors hold no scheduled
+/// functions, so its 100 ms tick can skip two reads per cell for them.
+///
+/// An author absent from the map "may have schedules": that is the boot
+/// state, because persisted rows survive restarts. An author is marked
+/// `cleared` only after the scheduler has observed that it owns ZERO rows (see
+/// [`ScheduleHint::try_clear`]); any write that can add a row calls
+/// [`ScheduleHint::touch`] after its commit lands, which un-clears it.
+#[derive(Debug, Default)]
+pub struct ScheduleHint {
+    entries: std::sync::Mutex<std::collections::HashMap<AgentPubKey, ScheduleHintEntry>>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ScheduleHintEntry {
+    gen: u64,
+    cleared: bool,
+}
+
+impl ScheduleHint {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<AgentPubKey, ScheduleHintEntry>> {
+        // The map holds plain data; a panic while it was held cannot leave it
+        // inconsistent, so a poisoned lock is still usable.
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Return `(generation, cleared)` for `author`. An unknown author is
+    /// `(0, false)`: it may have schedules.
+    pub fn peek(&self, author: &AgentPubKey) -> (u64, bool) {
+        self.lock()
+            .get(author)
+            .map(|e| (e.gen, e.cleared))
+            .unwrap_or((0, false))
+    }
+
+    /// Record that a write which may have added a scheduled-function row for
+    /// `author` has committed: bump the generation and un-clear the author.
+    /// Must be called AFTER the commit lands.
+    pub fn touch(&self, author: &AgentPubKey) {
+        let mut map = self.lock();
+        let e = map.entry(author.clone()).or_default();
+        e.gen = e.gen.wrapping_add(1);
+        e.cleared = false;
+    }
+
+    /// Mark `author` as holding no scheduled functions, but only if no
+    /// [`touch`](Self::touch) has happened since the caller sampled `g0` with
+    /// [`peek`](Self::peek). Returns whether the author is now cleared.
+    ///
+    /// The caller samples `g0` BEFORE reading the table and may only call this
+    /// after observing that the author owns ZERO rows. The writer commits and
+    /// then touches. The four orderings of a concurrent write against the
+    /// reader's `peek → SELECT → try_clear`:
+    ///
+    /// 1. Write commits and touches before `peek`: `g0` already includes the
+    ///    touch, and the SELECT sees the committed row, so nothing clears.
+    /// 2. Write commits before the SELECT but touches after `peek`: the SELECT
+    ///    sees the row (nothing clears), and anyway the generation moved.
+    /// 3. Write commits after the SELECT, touches before `try_clear`: the
+    ///    SELECT saw no row, but the generation is no longer `g0`, so the
+    ///    clear is refused.
+    /// 4. Write commits after the SELECT, touches after `try_clear`: the clear
+    ///    lands, then the touch un-clears it; the next tick reads the row.
+    ///
+    /// In no ordering does a committed row stay hidden behind a cleared latch.
+    pub fn try_clear(&self, author: &AgentPubKey, g0: u64) -> bool {
+        let mut map = self.lock();
+        let e = map.entry(author.clone()).or_default();
+        if e.gen == g0 {
+            e.cleared = true;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl<Db> DhtStore<Db> {
     /// Create a new `DhtStore` from a database handle.
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self {
+            db,
+            schedule_hint: Default::default(),
+        }
+    }
+
+    // ELOHIM PATCH (perf/scheduler-latch): accessor for the shared latch.
+    /// The scheduler latch shared by every clone of this store.
+    pub fn schedule_hint(&self) -> &ScheduleHint {
+        &self.schedule_hint
     }
 
     /// Access the raw database handle.
@@ -543,18 +639,24 @@ impl DhtStore<DbWrite<Dht>> {
                     .delete_scheduled_function(author, zome_name, fn_name)
                     .await?)
             }
-            Some((start_at, end_at, ephemeral)) => Ok(self
-                .db
-                .upsert_scheduled_function(InsertScheduledFunction {
-                    author,
-                    zome_name,
-                    scheduled_fn: fn_name,
-                    maybe_schedule: &maybe_schedule_blob,
-                    start_at,
-                    end_at,
-                    ephemeral,
-                })
-                .await?),
+            Some((start_at, end_at, ephemeral)) => {
+                let written = self
+                    .db
+                    .upsert_scheduled_function(InsertScheduledFunction {
+                        author,
+                        zome_name,
+                        scheduled_fn: fn_name,
+                        maybe_schedule: &maybe_schedule_blob,
+                        start_at,
+                        end_at,
+                        ephemeral,
+                    })
+                    .await?;
+                // ELOHIM PATCH (perf/scheduler-latch): the row has landed;
+                // un-clear the author so the scheduler reads it.
+                self.schedule_hint.touch(author);
+                Ok(written)
+            }
         }
     }
 
@@ -602,6 +704,13 @@ impl DhtStore<DbWrite<Dht>> {
             ));
         }
         Ok(result)
+    }
+
+    // ELOHIM PATCH (perf/scheduler-latch): existence probe for the latch.
+    /// Return `true` if `author` owns at least one scheduled-function row of
+    /// any kind (ephemeral or persisted, live, expired or in the future).
+    pub async fn has_scheduled_functions(&self, author: &AgentPubKey) -> StateQueryResult<bool> {
+        Ok(self.db.as_ref().has_scheduled_functions(author).await?)
     }
 
     /// Insert a `SignedValidationReceipt` into the `ValidationReceipt` table
@@ -1364,7 +1473,11 @@ where
     /// already read-only (`DbRead<Dht>`), since both handle types provide
     /// `AsRef<DbRead<Dht>>`.
     pub fn as_read(&self) -> DhtStoreRead {
-        DhtStore::new(self.db.as_ref().clone())
+        // ELOHIM PATCH (perf/scheduler-latch): keep the shared latch.
+        DhtStore {
+            db: self.db.as_ref().clone(),
+            schedule_hint: self.schedule_hint.clone(),
+        }
     }
 }
 

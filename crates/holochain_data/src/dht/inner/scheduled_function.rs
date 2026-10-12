@@ -221,6 +221,25 @@ where
     Ok(row.0 != 0)
 }
 
+// ELOHIM PATCH (perf/scheduler-latch): one PK-prefix probe the scheduler
+// latch uses to decide that an author holds no schedules at all.
+/// Return `true` if `author` owns at least one scheduled-function row of any
+/// kind (ephemeral or persisted, live, expired or in the future).
+pub(crate) async fn has_scheduled_functions<'e, E>(
+    executor: E,
+    author: &AgentPubKey,
+) -> sqlx::Result<bool>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let row: (i64,) =
+        sqlx::query_as("SELECT EXISTS (SELECT 1 FROM ScheduledFunction WHERE author = ?)")
+            .bind(author.get_raw_36())
+            .fetch_one(executor)
+            .await?;
+    Ok(row.0 != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +305,37 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    // ELOHIM PATCH (perf/scheduler-latch): the latch's existence probe.
+    #[tokio::test]
+    async fn has_scheduled_functions_scoped_to_author() {
+        let db = test_open_db(dht_id()).await.unwrap();
+        let alice = agent(1);
+        let bob = agent(2);
+
+        assert!(!db.as_ref().has_scheduled_functions(&alice).await.unwrap());
+
+        // A persisted row far in the future still counts.
+        db.upsert_scheduled_function(InsertScheduledFunction {
+            author: &alice,
+            zome_name: "z",
+            scheduled_fn: "f",
+            maybe_schedule: b"",
+            start_at: Timestamp::from_micros(i64::MAX - 1),
+            end_at: Timestamp::from_micros(i64::MAX),
+            ephemeral: false,
+        })
+        .await
+        .unwrap();
+
+        assert!(db.as_ref().has_scheduled_functions(&alice).await.unwrap());
+        assert!(!db.as_ref().has_scheduled_functions(&bob).await.unwrap());
+
+        db.delete_scheduled_function(&alice, "z", "f")
+            .await
+            .unwrap();
+        assert!(!db.as_ref().has_scheduled_functions(&alice).await.unwrap());
     }
 
     #[tokio::test]

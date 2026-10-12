@@ -31,6 +31,14 @@ impl DbRead<Dht> {
         scheduled_function::get_live_scheduled_functions(&mut *conn, author, now).await
     }
 
+    // ELOHIM PATCH (perf/scheduler-latch): existence probe for the latch.
+    /// Return `true` if `author` owns at least one scheduled-function row of
+    /// any kind, regardless of liveness or ephemerality.
+    pub async fn has_scheduled_functions(&self, author: &AgentPubKey) -> sqlx::Result<bool> {
+        let mut conn = self.timed_conn().await?;
+        scheduled_function::has_scheduled_functions(&mut *conn, author).await
+    }
+
     /// Return `true` if a scheduled-function row exists for the given
     /// `(author, zome_name, scheduled_fn)` tuple, regardless of liveness.
     pub async fn is_function_scheduled(

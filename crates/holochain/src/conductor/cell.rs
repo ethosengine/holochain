@@ -230,6 +230,15 @@ impl Cell {
 
     pub(super) async fn dispatch_scheduled_fns(self: Arc<Self>, now: Timestamp) {
         let author = self.id.agent_pubkey().clone();
+        // ELOHIM PATCH (perf/scheduler-latch): the scheduler ticks every
+        // 100 ms for every running cell, and a cell whose zomes never call
+        // `schedule()` paid two reads per tick for nothing. Skip while the
+        // latch says this author holds no rows. `g0` is sampled before the
+        // reads so a write that lands meanwhile refuses the clear below.
+        let (g0, cleared) = self.space.dht_store.schedule_hint().peek(&author);
+        if cleared {
+            return;
+        }
         self.space
             .dht_store
             .reschedule_expired_persisted(&author, now)
@@ -239,6 +248,20 @@ impl Cell {
             .dht_store
             .live_scheduled_functions(&author, now)
             .await;
+
+        // ELOHIM PATCH (perf/scheduler-latch): clear ONLY when the author owns
+        // ZERO rows. "No live and no expired row" is not enough: a fired
+        // persisted cron is re-upserted with a future `start_at`, and
+        // clearing on that would silence it forever.
+        if matches!(&live_fns, Ok(fns) if fns.is_empty()) {
+            match self.space.dht_store.has_scheduled_functions(&author).await {
+                Ok(false) => {
+                    self.space.dht_store.schedule_hint().try_clear(&author, g0);
+                }
+                Ok(true) => {}
+                Err(e) => error!("error probing scheduled fns: {:?}", e),
+            }
+        }
 
         match live_fns {
             // Cannot proceed if we don't know what to run.

@@ -518,6 +518,12 @@ impl SourceChain<DbWrite<Dht>> {
 
             tx.commit().await.map_err(SourceChainError::other)?;
 
+            // ELOHIM PATCH (perf/scheduler-latch): the scheduled-function rows
+            // have landed; un-clear the author so the scheduler reads them.
+            if !scheduled_fns.is_empty() {
+                self.dht_store.schedule_hint().touch(&author);
+            }
+
             SourceChainResult::Ok(actions)
         }
         .await;
