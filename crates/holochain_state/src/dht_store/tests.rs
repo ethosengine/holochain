@@ -3533,3 +3533,96 @@ async fn schedule_hint_shared_across_clones_and_touched_by_upsert() {
     assert!(!store.schedule_hint().peek(&author).1);
     assert!(store.has_scheduled_functions(&author).await.unwrap());
 }
+
+// ELOHIM PATCH (perf/scheduler-latch): the in-flight write guard.
+#[test]
+fn schedule_write_guard_refuses_clear_while_held() {
+    let hint = Arc::new(ScheduleHint::default());
+    let author = agent(1);
+
+    let guard = hint.write_guard(&author);
+    // The reader peeks AFTER the guard was taken: the generation it samples
+    // is current, yet the clear must still be refused while the write is in
+    // flight (the commit may not be visible to its SELECTs yet).
+    let (g0, cleared) = hint.peek(&author);
+    assert!(!cleared);
+    assert!(
+        !hint.try_clear(&author, g0),
+        "clear refused while guard held"
+    );
+    assert!(!hint.peek(&author).1);
+    drop(guard);
+}
+
+#[test]
+fn schedule_write_guard_drop_without_write_bumps_generation() {
+    let hint = Arc::new(ScheduleHint::default());
+    let author = agent(1);
+
+    let (g0, _) = hint.peek(&author);
+    // A guard dropped without any DB op (a cancelled flush that never reached
+    // its commit) still bumps the generation: harmless, and refuses a clear
+    // sampled before it.
+    drop(hint.write_guard(&author));
+    let (g1, _) = hint.peek(&author);
+    assert_ne!(g0, g1);
+    assert!(!hint.try_clear(&author, g0));
+}
+
+#[test]
+fn schedule_write_guard_drop_reopens_cleared_author() {
+    let hint = Arc::new(ScheduleHint::default());
+    let author = agent(1);
+
+    let (g0, _) = hint.peek(&author);
+    assert!(hint.try_clear(&author, g0));
+    assert!(hint.peek(&author).1);
+
+    let guard = hint.write_guard(&author);
+    assert!(!hint.peek(&author).1, "taking the guard opens the author");
+    drop(guard);
+    assert!(!hint.peek(&author).1, "dropping the guard leaves it open");
+}
+
+#[test]
+fn schedule_write_guard_overlapping_guards_block_until_both_drop() {
+    let hint = Arc::new(ScheduleHint::default());
+    let author = agent(1);
+
+    let a = hint.write_guard(&author);
+    let b = hint.write_guard(&author);
+    drop(a);
+    let (g, _) = hint.peek(&author);
+    assert!(!hint.try_clear(&author, g), "one guard still in flight");
+    drop(b);
+    assert!(
+        !hint.try_clear(&author, g),
+        "second drop bumped the generation"
+    );
+    let (g, _) = hint.peek(&author);
+    assert!(
+        hint.try_clear(&author, g),
+        "clear allowed once both dropped"
+    );
+    assert!(hint.peek(&author).1);
+}
+
+#[test]
+fn schedule_write_guard_is_per_author() {
+    let hint = Arc::new(ScheduleHint::default());
+    let alice = agent(1);
+    let bob = agent(2);
+
+    let _guard = hint.write_guard(&alice);
+    let (g, _) = hint.peek(&bob);
+    assert!(hint.try_clear(&bob, g), "alice's guard must not block bob");
+    assert!(hint.peek(&bob).1);
+    let (ga, _) = hint.peek(&alice);
+    assert!(!hint.try_clear(&alice, ga));
+}
+
+#[test]
+fn schedule_write_guard_is_send() {
+    fn assert_send<T: Send + 'static>() {}
+    assert_send::<ScheduleWriteGuard>();
+}

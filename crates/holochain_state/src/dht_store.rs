@@ -212,6 +212,10 @@ pub struct ScheduleHint {
 struct ScheduleHintEntry {
     gen: u64,
     cleared: bool,
+    // ELOHIM PATCH (perf/scheduler-latch): number of live
+    // [`ScheduleWriteGuard`]s for this author. While non-zero the latch
+    // cannot clear.
+    in_flight: u64,
 }
 
 impl ScheduleHint {
@@ -234,9 +238,33 @@ impl ScheduleHint {
             .unwrap_or((0, false))
     }
 
+    // ELOHIM PATCH (perf/scheduler-latch): in-flight write guard.
+    /// Open an in-flight write window for `author`. Take it BEFORE the first
+    /// statement that can add a scheduled-function row and hold it until the
+    /// write is durable (across the commit). While any guard for `author` is
+    /// alive, [`try_clear`](Self::try_clear) refuses; dropping the guard
+    /// performs [`touch`](Self::touch) semantics (generation bump, un-clear).
+    ///
+    /// `Drop` runs on every exit, including cancellation of the future that
+    /// holds the guard, so a write that commits and is then cancelled before
+    /// any post-commit code runs still re-opens the latch.
+    pub fn write_guard(self: &std::sync::Arc<Self>, author: &AgentPubKey) -> ScheduleWriteGuard {
+        {
+            let mut map = self.lock();
+            let e = map.entry(author.clone()).or_default();
+            e.in_flight = e.in_flight.saturating_add(1);
+            e.cleared = false;
+        }
+        ScheduleWriteGuard {
+            hint: self.clone(),
+            author: author.clone(),
+        }
+    }
+
     /// Record that a write which may have added a scheduled-function row for
     /// `author` has committed: bump the generation and un-clear the author.
-    /// Must be called AFTER the commit lands.
+    /// Must be called AFTER the commit lands. Prefer
+    /// [`write_guard`](Self::write_guard), which also covers cancellation.
     pub fn touch(&self, author: &AgentPubKey) {
         let mut map = self.lock();
         let e = map.entry(author.clone()).or_default();
@@ -244,35 +272,72 @@ impl ScheduleHint {
         e.cleared = false;
     }
 
-    /// Mark `author` as holding no scheduled functions, but only if no
-    /// [`touch`](Self::touch) has happened since the caller sampled `g0` with
+    /// Mark `author` as holding no scheduled functions, but only if no write
+    /// guard for `author` is alive and no guard was dropped (nor
+    /// [`touch`](Self::touch) called) since the caller sampled `g0` with
     /// [`peek`](Self::peek). Returns whether the author is now cleared.
     ///
-    /// The caller samples `g0` BEFORE reading the table and may only call this
-    /// after observing that the author owns ZERO rows. The writer commits and
-    /// then touches. The four orderings of a concurrent write against the
-    /// reader's `peek → SELECT → try_clear`:
+    /// ELOHIM PATCH (perf/scheduler-latch): ordering argument.
     ///
-    /// 1. Write commits and touches before `peek`: `g0` already includes the
-    ///    touch, and the SELECT sees the committed row, so nothing clears.
-    /// 2. Write commits before the SELECT but touches after `peek`: the SELECT
-    ///    sees the row (nothing clears), and anyway the generation moved.
-    /// 3. Write commits after the SELECT, touches before `try_clear`: the
-    ///    SELECT saw no row, but the generation is no longer `g0`, so the
-    ///    clear is refused.
-    /// 4. Write commits after the SELECT, touches after `try_clear`: the clear
-    ///    lands, then the touch un-clears it; the next tick reads the row.
+    /// Reader protocol: `peek → g0`, then the live SELECT and the EXISTS
+    /// probe, and only if both see zero rows, `try_clear(g0)`. Writer
+    /// protocol: take the guard (G) before any row-adding statement, the
+    /// commit becomes durable (C), drop the guard (D). G < C < D always
+    /// holds for a write that commits, because the guard spans the commit.
+    /// A committed row R hidden behind a cleared latch would need a
+    /// successful `try_clear(g0)` (T) with no later un-clear. Case on T:
     ///
-    /// In no ordering does a committed row stay hidden behind a cleared latch.
+    /// - T < G: the clear lands first, then G sets `cleared = false` (and D
+    ///   does it again). The next tick reads R.
+    /// - G < T < D: the guard is alive at T, so `in_flight > 0` and T is
+    ///   refused. This is the case a pre-commit touch alone could not close
+    ///   (touch, reader peeks the new gen, SELECTs see nothing, clear
+    ///   succeeds, then the commit lands).
+    /// - D < T: D bumped the generation. If the reader's peek came before D,
+    ///   `g0` is stale and T is refused. If the peek came after D, then it
+    ///   came after C, so the SELECT/EXISTS that follow the peek observe R
+    ///   (a read transaction begun after a commit sees it) and the reader
+    ///   never calls T.
+    ///
+    /// Cancellation: dropping the writer's future runs the guard's `Drop`, so
+    /// D still happens. If C was reached the row is covered by the cases
+    /// above; if it was not, no row exists and the extra generation bump only
+    /// costs one wasted read on the next tick. Overlapping guards for one
+    /// author each count in `in_flight`, so the latch cannot clear until the
+    /// last is dropped, and each drop bumps the generation. Authors are
+    /// independent map entries, so a guard for one never blocks another.
     pub fn try_clear(&self, author: &AgentPubKey, g0: u64) -> bool {
         let mut map = self.lock();
         let e = map.entry(author.clone()).or_default();
-        if e.gen == g0 {
+        if e.in_flight == 0 && e.gen == g0 {
             e.cleared = true;
             true
         } else {
             false
         }
+    }
+}
+
+// ELOHIM PATCH (perf/scheduler-latch): RAII in-flight write window.
+/// Returned by [`ScheduleHint::write_guard`]. Holds an owned `Arc` so it can
+/// live across `.await` points; it is `Send` because `ScheduleHint` is
+/// `Send + Sync` (a `Mutex` over plain data) and `AgentPubKey` is `Send`.
+/// On drop it closes the window and bumps the author's generation.
+#[must_use = "the guard only protects the write while it is held"]
+#[derive(Debug)]
+pub struct ScheduleWriteGuard {
+    hint: std::sync::Arc<ScheduleHint>,
+    author: AgentPubKey,
+}
+
+impl Drop for ScheduleWriteGuard {
+    fn drop(&mut self) {
+        // `lock()` recovers a poisoned mutex, so this never panics.
+        let mut map = self.hint.lock();
+        let e = map.entry(self.author.clone()).or_default();
+        e.in_flight = e.in_flight.saturating_sub(1);
+        e.gen = e.gen.wrapping_add(1);
+        e.cleared = false;
     }
 }
 
@@ -287,7 +352,9 @@ impl<Db> DhtStore<Db> {
 
     // ELOHIM PATCH (perf/scheduler-latch): accessor for the shared latch.
     /// The scheduler latch shared by every clone of this store.
-    pub fn schedule_hint(&self) -> &ScheduleHint {
+    // Returns the `Arc` so callers can take an owned
+    // [`ScheduleHint::write_guard`]; `peek`/`try_clear` auto-deref.
+    pub fn schedule_hint(&self) -> &std::sync::Arc<ScheduleHint> {
         &self.schedule_hint
     }
 
@@ -585,6 +652,11 @@ impl DhtStore<DbWrite<Dht>> {
                     }
                 }
                 Ok(Some((start_at, end_at, ephemeral))) => {
+                    // ELOHIM PATCH (perf/scheduler-latch): this is a third
+                    // row-writing path; guard it like the others. It only
+                    // runs when an expired persisted row exists, so the
+                    // reader's own clear is unaffected on empty authors.
+                    let _guard = self.schedule_hint.write_guard(author);
                     if let Err(e) = self
                         .db
                         .upsert_scheduled_function(InsertScheduledFunction {
@@ -640,6 +712,10 @@ impl DhtStore<DbWrite<Dht>> {
                     .await?)
             }
             Some((start_at, end_at, ephemeral)) => {
+                // ELOHIM PATCH (perf/scheduler-latch): hold an in-flight
+                // write guard across the upsert; its drop (on success, error
+                // or cancellation) un-clears the author.
+                let _guard = self.schedule_hint.write_guard(author);
                 let written = self
                     .db
                     .upsert_scheduled_function(InsertScheduledFunction {
@@ -652,9 +728,6 @@ impl DhtStore<DbWrite<Dht>> {
                         ephemeral,
                     })
                     .await?;
-                // ELOHIM PATCH (perf/scheduler-latch): the row has landed;
-                // un-clear the author so the scheduler reads it.
-                self.schedule_hint.touch(author);
                 Ok(written)
             }
         }

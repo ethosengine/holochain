@@ -597,6 +597,54 @@ async fn schedule_latch_never_clears_with_future_persisted_row() {
     assert!(wait_for_signal(&mut app_signal).await.is_err());
 }
 
+// ELOHIM PATCH (perf/scheduler-latch): while a write guard is held (a
+// flush or upsert in flight, possibly not yet visible to the scheduler's
+// SELECTs) the latch must stay open even though every tick sees zero rows;
+// once the guard drops, a later tick clears it.
+#[tokio::test(flavor = "multi_thread")]
+async fn schedule_latch_stays_open_while_write_guard_held() {
+    holochain_trace::test_run();
+
+    let zome = create_schedule_zome(|_api, input| Ok(input));
+    let dna = SweetDnaFile::unique_from_inline_zomes(zome).await;
+    let mut conductor = SweetConductor::from_config_rendezvous(
+        SweetConductorConfig::rendezvous(true),
+        SweetLocalRendezvous::new().await,
+    )
+    .await;
+    let app = conductor
+        .setup_app("app", std::slice::from_ref(&dna.0))
+        .await
+        .unwrap();
+    let cell = app.into_cells()[0].clone();
+    let pubkey = cell.agent_pubkey().clone();
+
+    conductor
+        .start_scheduler(std::time::Duration::from_millis(1_000_000_000))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let cleared = |cell: &SweetCell| cell.dht_store().schedule_hint().peek(&pubkey).1;
+
+    let guard = cell.dht_store().schedule_hint().write_guard(&pubkey);
+    for _ in 0..5 {
+        conductor.dispatch_scheduled_fns(Timestamp::now()).await;
+        assert!(
+            !cleared(&cell),
+            "latch must stay open while a write is in flight"
+        );
+    }
+    assert!(!is_scheduled(&cell).await);
+
+    drop(guard);
+    conductor.dispatch_scheduled_fns(Timestamp::now()).await;
+    assert!(
+        cleared(&cell),
+        "a tick after the guard drops clears the latch"
+    );
+}
+
 /// Helper for creating a zome with just one schedulable function called [`SCHEDULED_FN`]
 /// that can be scheduled by calling [`SCHEDULING_FN`]
 fn create_schedule_zome(
