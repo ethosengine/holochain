@@ -1924,8 +1924,22 @@ mod app_status_impls {
     use crate::conductor::cell::error::CellResult;
     use holochain_types::cell_config_overrides::CellConfigOverrides;
 
+    /// Maximum number of cells one call to `create_cells_and_startup` creates
+    /// at once.
+    const CELL_CREATION_CONCURRENCY: usize = 5;
+
+    /// Maximum number of network joins one call to `create_cells_and_startup`
+    /// awaits at once.
+    const NETWORK_JOIN_CONCURRENCY: usize = 10;
+
     impl Conductor {
-        /// Instantiate cells, add them to the conductor's state, then initialize them.
+        /// Instantiate cells, join them to the network, add them to the
+        /// conductor's running cells, then initialize them.
+        ///
+        /// The cells are published together or not at all: if any of them
+        /// cannot be created, the ones that were are discarded and the first
+        /// creation error is returned. A failed network join is logged and
+        /// does not stop its cell from being published.
         pub(crate) async fn create_cells_and_startup(
             self: Arc<Self>,
             cell_ids: impl Iterator<Item = CellId>,
@@ -1936,13 +1950,16 @@ mod app_status_impls {
                 let overrides = config_override.clone();
                 async move { handle.clone().create_cell(&cell_id, overrides).await }
             });
-            // Create cells with bounded parallelism (max 5 concurrent)
-            let cells = futures::stream::iter(cells_to_create)
-                .buffer_unordered(5)
+            let (cells, failures): (Vec<_>, Vec<_>) = futures::stream::iter(cells_to_create)
+                .buffer_unordered(CELL_CREATION_CONCURRENCY)
                 .collect::<Vec<_>>()
                 .await
                 .into_iter()
-                .collect::<Result<Vec<_>, _>>()?;
+                .partition_result();
+            if let Some(error) = failures.into_iter().next() {
+                self.discard_unpublished_cells(cells).await;
+                return Err(error.into());
+            }
 
             let (new_cells, triggers): (Vec<_>, Vec<_>) = cells.into_iter().unzip();
             let new_cells_map: IndexMap<CellId, Arc<Cell>> = new_cells
@@ -1951,7 +1968,7 @@ mod app_status_impls {
                 .collect();
             let new_cell_ids: HashSet<_> = new_cells_map.keys().cloned().collect();
 
-            // Add agents to local agent store in kitsune with bounded parallelism (max 10 concurrent)
+            // Add agents to local agent store in kitsune with bounded parallelism
             let join_futures = new_cells_map
                 .values()
                 .enumerate()
@@ -1972,7 +1989,7 @@ mod app_status_impls {
                 })
                 .collect::<Vec<_>>();
             futures::stream::iter(join_futures)
-                .buffer_unordered(10)
+                .buffer_unordered(NETWORK_JOIN_CONCURRENCY)
                 .collect::<Vec<_>>()
                 .await;
 
@@ -1993,6 +2010,33 @@ mod app_status_impls {
             self.spaces.start_pending_cap_grant_backfills();
 
             Ok(())
+        }
+
+        /// Stop the tasks of cells that were created but never published as
+        /// running, and so never joined to the network.
+        ///
+        /// Only the cells' own tasks are stopped. The DNA-wide workflows their
+        /// creation started are shared by every cell of the DNA and stay up,
+        /// and a cell whose id is already running — the same agent and DNA
+        /// started by another app — is left to that running cell.
+        async fn discard_unpublished_cells(&self, cells: Vec<(Cell, InitialQueueTriggers)>) {
+            let unpublished: Vec<CellId> = self.running_cells.share_ref(|running| {
+                cells
+                    .iter()
+                    .map(|(cell, _)| cell.id().clone())
+                    .filter(|cell_id| !running.contains_key(cell_id))
+                    .collect()
+            });
+            future::join_all(unpublished.into_iter().map(|cell_id| async move {
+                if let Err(error) = self.task_manager().stop_cell_tasks(cell_id.clone()).await {
+                    tracing::error!(
+                        ?error,
+                        ?cell_id,
+                        "Error stopping an unpublished cell's tasks."
+                    );
+                }
+            }))
+            .await;
         }
 
         /// Instantiate a cell.
