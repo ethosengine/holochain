@@ -2005,16 +2005,30 @@ mod app_status_impls {
         /// creation started are shared by every cell of the DNA and stay up,
         /// and a cell whose id is already running — the same agent and DNA
         /// started by another app — is left to that running cell.
+        ///
+        /// Which ids are running is read, and their tasks are told to stop,
+        /// under one read of `running_cells`, so no cell can be published
+        /// between the check and the stop. Tasks are grouped by `CellId`,
+        /// though, not by the call that created them: if two apps sharing a
+        /// `CellId` create it concurrently, discarding one also stops the
+        /// tasks of the other's not-yet-published instance, and an id skipped
+        /// because it is running keeps the discarded duplicate's tasks until
+        /// that running cell is removed.
         async fn discard_unpublished_cells(&self, cells: Vec<(Cell, InitialQueueTriggers)>) {
-            let unpublished: Vec<CellId> = self.running_cells.share_ref(|running| {
+            let task_manager = self.task_manager();
+            let stopping: Vec<_> = self.running_cells.share_ref(|running| {
                 cells
                     .iter()
-                    .map(|(cell, _)| cell.id().clone())
-                    .filter(|cell_id| !running.contains_key(cell_id))
+                    .map(|(cell, _)| cell.id())
+                    .filter(|cell_id| !running.contains_key(*cell_id))
+                    .map(|cell_id| {
+                        let stopped = task_manager.stop_cell_tasks(cell_id.clone());
+                        (cell_id.clone(), stopped)
+                    })
                     .collect()
             });
-            future::join_all(unpublished.into_iter().map(|cell_id| async move {
-                if let Err(error) = self.task_manager().stop_cell_tasks(cell_id.clone()).await {
+            future::join_all(stopping.into_iter().map(|(cell_id, stopped)| async move {
+                if let Err(error) = stopped.await {
                     tracing::error!(
                         ?error,
                         ?cell_id,
