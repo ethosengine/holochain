@@ -4,7 +4,7 @@
 
 use crate::conductor::api::error::ConductorApiResult;
 use crate::conductor::conductor::app_startup::{
-    run_app_startup_attempts, P2pOverrideReservations, APP_STARTUP_CONCURRENCY,
+    run_app_startup_attempts, CellPublication, P2pOverrideReservations, APP_STARTUP_CONCURRENCY,
 };
 use crate::conductor::{error::ConductorError, CellError};
 use crate::sweettest::*;
@@ -123,6 +123,10 @@ async fn app_cells(conductor: &SweetConductor, app_id: &str) -> Vec<CellId> {
         .unwrap()
         .all_cells()
         .collect()
+}
+
+fn while_enabled(app_id: &str) -> CellPublication {
+    CellPublication::WhileAppEnabled(app_id.to_string())
 }
 
 async fn create_unit(
@@ -273,14 +277,14 @@ async fn an_app_serves_while_another_apps_startup_is_pending() {
         let (handle, app) = (handle.clone(), enabled_app("pending"));
         async move {
             pending_released.await.unwrap();
-            handle.startup_app(app).await
+            handle.startup_app(app, while_enabled("pending")).await
         }
         .boxed()
     };
     let ready_attempt = {
         let (handle, app) = (handle.clone(), enabled_app("ready"));
         async move {
-            handle.startup_app(app).await?;
+            handle.startup_app(app, while_enabled("ready")).await?;
             ready_started.send(()).unwrap();
             Ok::<_, ConductorError>(())
         }

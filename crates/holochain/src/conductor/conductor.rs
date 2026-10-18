@@ -111,6 +111,7 @@ mod builder;
 mod app_auth_token_store;
 
 mod app_startup;
+use app_startup::CellPublication;
 
 mod hc_p2p_handler_impl;
 
@@ -1918,7 +1919,29 @@ mod app_status_impls {
     /// awaits at once.
     const NETWORK_JOIN_CONCURRENCY: usize = 10;
 
+    /// How far an unpublished cell got before it was discarded.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum UnpublishedStage {
+        /// Created, with its own tasks running, but not joined to the network.
+        Created,
+        /// Created and joined to the network.
+        Joined,
+    }
+
     impl Conductor {
+        /// Instantiate cells, join them to the network, add them to the
+        /// conductor's running cells, then initialize them — unconditionally,
+        /// for callers that own the app's lifecycle for the whole call. See
+        /// [`Self::create_and_publish_cells`].
+        pub(crate) async fn create_cells_and_startup(
+            self: Arc<Self>,
+            cell_ids: impl Iterator<Item = CellId>,
+            config_override: Option<CellConfigOverrides>,
+        ) -> ConductorResult<()> {
+            self.create_and_publish_cells(cell_ids, config_override, CellPublication::Always)
+                .await
+        }
+
         /// Instantiate cells, join them to the network, add them to the
         /// conductor's running cells, then initialize them.
         ///
@@ -1926,10 +1949,19 @@ mod app_status_impls {
         /// cannot be created, the ones that were are discarded and the first
         /// creation error is returned. A failed network join is logged and
         /// does not stop its cell from being published.
-        pub(crate) async fn create_cells_and_startup(
+        ///
+        /// With [`CellPublication::WhileAppEnabled`] the app's persisted
+        /// status is read again once the joins have returned, just before
+        /// publishing. If the app is no longer `Enabled` — disabled or
+        /// uninstalled while the cells were being created and joined — the
+        /// cells leave the network and are discarded instead, and the call
+        /// returns `Ok`. A disable that lands between that read and the
+        /// write to `running_cells` is still possible.
+        pub(crate) async fn create_and_publish_cells(
             self: Arc<Self>,
             cell_ids: impl Iterator<Item = CellId>,
             config_override: Option<CellConfigOverrides>,
+            publication: CellPublication,
         ) -> ConductorResult<()> {
             let cells_to_create = cell_ids.map(|cell_id| {
                 let handle = self.clone();
@@ -1943,7 +1975,11 @@ mod app_status_impls {
                 .into_iter()
                 .partition_result();
             if let Some(error) = failures.into_iter().next() {
-                self.discard_unpublished_cells(cells).await;
+                self.discard_unpublished_cells(
+                    cells.iter().map(|(cell, _)| cell),
+                    UnpublishedStage::Created,
+                )
+                .await;
                 return Err(error.into());
             }
 
@@ -1979,6 +2015,26 @@ mod app_status_impls {
                 .collect::<Vec<_>>()
                 .await;
 
+            if let CellPublication::WhileAppEnabled(app_id) = &publication {
+                let status = self
+                    .get_state()
+                    .await
+                    .map(|state| state.get_app(app_id).ok().map(|app| app.status.clone()));
+                if !matches!(status, Ok(Some(AppStatus::Enabled))) {
+                    info!(
+                        %app_id,
+                        ?status,
+                        "App is no longer enabled; discarding its started cells instead of publishing them."
+                    );
+                    self.discard_unpublished_cells(
+                        new_cells_map.values().map(Arc::as_ref),
+                        UnpublishedStage::Joined,
+                    )
+                    .await;
+                    return status.map(|_| ());
+                }
+            }
+
             // Add cells to conductor state as running cells
             self.running_cells.share_mut(|cells| {
                 cells.extend(new_cells_map.clone());
@@ -1998,13 +2054,14 @@ mod app_status_impls {
             Ok(())
         }
 
-        /// Stop the tasks of cells that were created but never published as
-        /// running, and so never joined to the network.
+        /// Discard cells that were created — and, at [`UnpublishedStage::Joined`],
+        /// joined to the network — but never published as running: stop their
+        /// own tasks and, if they joined, leave the network.
         ///
-        /// Only the cells' own tasks are stopped. The DNA-wide workflows their
-        /// creation started are shared by every cell of the DNA and stay up,
-        /// and a cell whose id is already running — the same agent and DNA
-        /// started by another app — is left to that running cell.
+        /// The DNA-wide workflows their creation started are shared by every
+        /// cell of the DNA and stay up, and a cell whose id is already running
+        /// — the same agent and DNA started by another app — is left to that
+        /// running cell.
         ///
         /// Which ids are running is read, and their tasks are told to stop,
         /// under one read of `running_cells`, so no cell can be published
@@ -2014,26 +2071,37 @@ mod app_status_impls {
         /// tasks of the other's not-yet-published instance, and an id skipped
         /// because it is running keeps the discarded duplicate's tasks until
         /// that running cell is removed.
-        async fn discard_unpublished_cells(&self, cells: Vec<(Cell, InitialQueueTriggers)>) {
+        async fn discard_unpublished_cells<'a>(
+            &self,
+            cells: impl IntoIterator<Item = &'a Cell>,
+            stage: UnpublishedStage,
+        ) {
             let task_manager = self.task_manager();
             let stopping: Vec<_> = self.running_cells.share_ref(|running| {
                 cells
-                    .iter()
-                    .map(|(cell, _)| cell.id())
-                    .filter(|cell_id| !running.contains_key(*cell_id))
-                    .map(|cell_id| {
-                        let stopped = task_manager.stop_cell_tasks(cell_id.clone());
-                        (cell_id.clone(), stopped)
-                    })
+                    .into_iter()
+                    .filter(|cell| !running.contains_key(cell.id()))
+                    .map(|cell| (cell, task_manager.stop_cell_tasks(cell.id().clone())))
                     .collect()
             });
-            future::join_all(stopping.into_iter().map(|(cell_id, stopped)| async move {
+            future::join_all(stopping.into_iter().map(|(cell, stopped)| async move {
+                let cell_id = cell.id();
                 if let Err(error) = stopped.await {
                     tracing::error!(
                         ?error,
                         ?cell_id,
                         "Error stopping an unpublished cell's tasks."
                     );
+                }
+                if stage == UnpublishedStage::Joined {
+                    let agent = cell_id.agent_pubkey().clone();
+                    if let Err(error) = cell.holochain_p2p_dna().leave(agent).await {
+                        tracing::error!(
+                            ?error,
+                            ?cell_id,
+                            "Error leaving the network for an unpublished cell."
+                        );
+                    }
                 }
             }))
             .await;
@@ -2112,7 +2180,9 @@ mod app_status_impls {
                 return Ok(app.clone());
             }
 
-            self.clone().startup_app(app.clone()).await?;
+            self.clone()
+                .startup_app(app.clone(), CellPublication::Always)
+                .await?;
 
             // Set app status to enabled in conductor state.
             let (_, app) = self

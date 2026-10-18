@@ -43,9 +43,10 @@ impl Conductor {
                 let admission = reservations.reserve(app);
                 let conductor = self.clone();
                 let app = app.clone();
+                let publication = CellPublication::WhileAppEnabled(app_id.clone());
                 let attempt = async move {
                     match admission {
-                        Ok(()) => conductor.startup_app(app).await,
+                        Ok(()) => conductor.startup_app(app, publication).await,
                         Err(conflict) => Err(conflict.into()),
                     }
                 };
@@ -60,15 +61,20 @@ impl Conductor {
     }
 
     /// Start one app: load its ribosomes, then create its enabled cells, join
-    /// them to the network and publish them as running.
+    /// them to the network and publish them as running, as `publication`
+    /// allows.
     ///
-    /// When this returns `Ok` every enabled cell of the app is running; when it
-    /// returns `Err` none of them is. Setting the app's persisted status is the
-    /// caller's part.
-    pub(crate) async fn startup_app(self: Arc<Self>, app: InstalledApp) -> ConductorResult<()> {
+    /// When this returns `Ok` every enabled cell of the app is running, unless
+    /// `publication` withheld them all; when it returns `Err` none of them is.
+    /// Setting the app's persisted status is the caller's part.
+    pub(crate) async fn startup_app(
+        self: Arc<Self>,
+        app: InstalledApp,
+        publication: CellPublication,
+    ) -> ConductorResult<()> {
         self.load_wasms_into_ribosome_for_app(&app).await?;
         let config_override = Self::p2p_config_overrides(&app.manifest);
-        self.create_cells_and_startup(app.all_enabled_cells(), config_override)
+        self.create_and_publish_cells(app.all_enabled_cells(), config_override, publication)
             .await
     }
 
@@ -90,6 +96,18 @@ impl Conductor {
         }
         Ok(())
     }
+}
+
+/// When the cells a call creates and joins may be published as running.
+#[derive(Clone, Debug)]
+pub(crate) enum CellPublication {
+    /// Always: the caller owns the app's lifecycle for the whole call, as
+    /// enabling an app or a clone cell does.
+    Always,
+    /// Only if the app is still `Enabled` in the persisted state just before
+    /// publishing: conductor startup, where the admin interface may disable
+    /// or uninstall the app while its attempt is under way.
+    WhileAppEnabled(InstalledAppId),
 }
 
 /// Run app startup attempts, at most [`APP_STARTUP_CONCURRENCY`] at a time,
