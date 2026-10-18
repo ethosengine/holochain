@@ -9,14 +9,19 @@
 //!
 //! Three races remain (tracked in elohim backlog conductor-startup-lifecycle-ownership):
 //!
-//! - Lifecycle: a disable landing between an attempt's status recheck and
-//!   its write to `running_cells`, an uninstall deleting databases under a
-//!   pending attempt, or a disable and re-enable during an attempt can still
-//!   leave cells running for an app that is not enabled, or start it twice.
+//! - Lifecycle: disabling removes an app's cells and then persists
+//!   `Disabled`, and an attempt rechecks the status and then publishes; none
+//!   of the four steps is atomic with another, so an attempt can read
+//!   `Enabled` after the disable removed the cells and publish before the
+//!   disable commits. With an uninstall deleting databases under a pending
+//!   attempt, or a disable and re-enable during one, this can still leave cells
+//!   running for an app that is not enabled, or start it twice.
 //! - Overrides: the reservations cover the startup snapshot only; an
 //!   `EnableApp` during startup relies on `create_cell`'s running-cells check.
 //! - Discard: tasks are grouped by `CellId`, so discarding a cell that another
-//!   app is creating concurrently with the same id stops that instance's tasks.
+//!   app is creating concurrently with the same id stops that instance's tasks,
+//!   and a discarded joined cell's `leave` can evict a replacement with the
+//!   same id that joined or was published meanwhile.
 
 use super::*;
 use holochain_types::cell_config_overrides::CellConfigOverrides;
@@ -116,8 +121,8 @@ impl Conductor {
 /// When the cells a call creates and joins may be published as running.
 #[derive(Clone, Debug)]
 pub(crate) enum CellPublication {
-    /// Always: the caller owns the app's lifecycle for the whole call, as
-    /// enabling an app or a clone cell does.
+    /// Always, without rechecking the app's status: enabling an app or a
+    /// clone cell publishes unconditionally.
     Always,
     /// Only if the app is still `Enabled` in the persisted state just before
     /// publishing: conductor startup, where the admin interface may disable

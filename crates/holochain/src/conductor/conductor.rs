@@ -1955,8 +1955,11 @@ mod app_status_impls {
         /// publishing. If the app is no longer `Enabled` — disabled or
         /// uninstalled while the cells were being created and joined — the
         /// cells leave the network and are discarded instead, and the call
-        /// returns `Ok`. A disable that lands between that read and the
-        /// write to `running_cells` is still possible.
+        /// returns `Ok`. The recheck is not atomic with a disable: disabling
+        /// removes the app's cells and then persists `Disabled`, so an attempt
+        /// can read `Enabled` after the cells were removed and publish before
+        /// the disable commits, as it can after its read and before its write
+        /// to `running_cells`.
         pub(crate) async fn create_and_publish_cells(
             self: Arc<Self>,
             cell_ids: impl Iterator<Item = CellId>,
@@ -2070,7 +2073,9 @@ mod app_status_impls {
         /// `CellId` create it concurrently, discarding one also stops the
         /// tasks of the other's not-yet-published instance, and an id skipped
         /// because it is running keeps the discarded duplicate's tasks until
-        /// that running cell is removed.
+        /// that running cell is removed. A joined cell's `leave` happens after
+        /// that read, so it can evict a replacement cell with the same id that
+        /// joined or was published meanwhile.
         async fn discard_unpublished_cells<'a>(
             &self,
             cells: impl IntoIterator<Item = &'a Cell>,
@@ -2197,6 +2202,10 @@ mod app_status_impls {
         }
 
         /// Disable an installed app
+        ///
+        /// The app's cells are removed first and `Disabled` is persisted after,
+        /// as two steps: a startup attempt that rechecks the status in between
+        /// still reads `Enabled` and may publish its cells.
         #[cfg_attr(feature = "instrument", tracing::instrument(skip(self)))]
         pub async fn disable_app(
             self: Arc<Self>,
