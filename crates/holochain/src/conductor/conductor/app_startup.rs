@@ -32,8 +32,10 @@ impl Conductor {
     /// whose attempt fails — including one refused because its P2P overrides
     /// conflict with an app earlier in the conductor's order — is disabled with
     /// [`DisabledAppReason::Error`], so the next restart does not retry it.
-    /// The only error returned is a failure to record such a disable, and it is
-    /// returned only after every attempt has finished.
+    ///
+    /// Two errors are returned: a failure to read the conductor state for the
+    /// enabled-app snapshot, before any attempt starts; and a failure to
+    /// record such a disable, returned only after every attempt has finished.
     pub(crate) async fn startup_enabled_apps(self: Arc<Self>) -> ConductorResult<()> {
         let state = self.get_state().await?;
         let mut reservations = P2pOverrideReservations::default();
