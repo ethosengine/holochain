@@ -4,6 +4,20 @@
 //! are created and joined to the network, and those cells are published as
 //! running — independently of every other app. A slow app holds only its own
 //! slot, and an app whose startup fails is disabled while the rest start.
+//!
+//! # Known limitations
+//!
+//! Three races remain, tracked in elohim backlog
+//! conductor-startup-lifecycle-ownership:
+//!
+//! - Lifecycle: a disable landing between an attempt's status recheck and
+//!   its write to `running_cells`, an uninstall deleting databases under a
+//!   pending attempt, or a disable and re-enable during an attempt can still
+//!   leave cells running for an app that is not enabled, or start it twice.
+//! - Overrides: the reservations cover the startup snapshot only; an
+//!   `EnableApp` during startup relies on `create_cell`'s running-cells check.
+//! - Discard: tasks are grouped by `CellId`, so discarding a cell that another
+//!   app is creating concurrently with the same id stops that instance's tasks.
 
 use super::*;
 use holochain_types::cell_config_overrides::CellConfigOverrides;
@@ -33,9 +47,9 @@ impl Conductor {
     /// conflict with an app earlier in the conductor's order — is disabled with
     /// [`DisabledAppReason::Error`], so the next restart does not retry it.
     ///
-    /// Two errors are returned: a failure to read the conductor state for the
-    /// enabled-app snapshot, before any attempt starts; and a failure to
-    /// record such a disable, returned only after every attempt has finished.
+    /// It returns an error in two cases only: the conductor state for the
+    /// enabled-app snapshot cannot be read, before any attempt starts; or such
+    /// a disable cannot be recorded, returned after every attempt has finished.
     pub(crate) async fn startup_enabled_apps(self: Arc<Self>) -> ConductorResult<()> {
         let state = self.get_state().await?;
         let mut reservations = P2pOverrideReservations::default();
