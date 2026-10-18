@@ -26,6 +26,7 @@ mod builder;
 mod cap_grant_backfill;
 mod cells_with_conflicting_overrides;
 mod p2p_config_override;
+mod startup;
 mod state_dump;
 
 /// App can't be installed if another app is already installed under the
