@@ -311,6 +311,55 @@ async fn an_app_serves_while_another_apps_startup_is_pending() {
     create_unit(&conductor, &pending_cell).await.unwrap();
 }
 
+/// An app disabled while its startup attempt is pending is not published
+/// when the attempt goes on: its cells are discarded and the disable stands.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_disabled_during_its_startup_attempt_is_not_published() {
+    holochain_trace::test_run();
+    let dna = unique_dna().await;
+    let mut conductor = SweetConductor::standard().await;
+    let agent = conductor
+        .install_app("disabled", None, std::slice::from_ref(&dna), None)
+        .await
+        .unwrap();
+    mark_enabled(&conductor, &["disabled"]).await;
+    let cell_id = CellId::new(dna.dna_hash().clone(), agent);
+
+    let handle = conductor.raw_handle();
+    let app = handle
+        .get_state()
+        .await
+        .unwrap()
+        .get_app(&"disabled".to_string())
+        .unwrap()
+        .clone();
+    let (release, released) = oneshot::channel::<()>();
+    let attempt = {
+        let handle = handle.clone();
+        async move {
+            released.await.unwrap();
+            handle.startup_app(app, while_enabled("disabled")).await
+        }
+    };
+    let startup = tokio::spawn(run_app_startup_attempts(
+        [("disabled".to_string(), attempt)],
+        |_app_id, error| future::ready(Err(error)),
+    ));
+
+    conductor
+        .disable_app("disabled".to_string(), DisabledAppReason::User)
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    startup.await.unwrap().unwrap();
+
+    assert!(!handle.running_cell_ids().contains(&cell_id));
+    assert_eq!(
+        app_status(&conductor, "disabled").await,
+        AppStatus::Disabled(DisabledAppReason::User)
+    );
+}
+
 /// Through a real restart: apps whose startup fails — one whose ribosomes
 /// cannot be loaded, one whose cell cannot be created — are disabled with the
 /// error, the apps around them start and serve, and by the time startup
