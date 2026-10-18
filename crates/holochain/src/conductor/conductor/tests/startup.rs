@@ -252,11 +252,11 @@ async fn an_app_serves_while_another_apps_startup_is_pending() {
     let dna = unique_dna().await;
     let mut conductor = SweetConductor::standard().await;
     let pending_agent = conductor
-        .install_app("pending", None, &[dna.clone()], None)
+        .install_app("pending", None, std::slice::from_ref(&dna), None)
         .await
         .unwrap();
     let ready_agent = conductor
-        .install_app("ready", None, &[dna.clone()], None)
+        .install_app("ready", None, std::slice::from_ref(&dna), None)
         .await
         .unwrap();
     mark_enabled(&conductor, &["pending", "ready"]).await;
