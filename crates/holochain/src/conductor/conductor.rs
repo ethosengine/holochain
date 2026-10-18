@@ -110,6 +110,8 @@ mod builder;
 
 mod app_auth_token_store;
 
+mod app_startup;
+
 mod hc_p2p_handler_impl;
 
 mod state_dump_helpers;
@@ -342,11 +344,6 @@ mod startup_shutdown_impls {
             outcome_rx: OutcomeReceiver,
             admin_configs: Vec<AdminInterfaceConfig>,
         ) -> ConductorResult<()> {
-            // Load the wasms and dna defs from the database and populate the RibosomeStore
-            self.load_wasms_into_ribosomes().await?;
-
-            info!("Conductor startup: Ribosomes loaded.");
-
             // Start the task manager
             self.outcomes_task.share_mut(|lock| {
                 if lock.is_some() {
@@ -364,23 +361,24 @@ mod startup_shutdown_impls {
 
             info!("Conductor startup: app interfaces started.");
 
-            // Determine cells to create
-            let state = self.get_state().await?;
-            // create cells with their config override
-            for (_, app) in state.enabled_apps() {
-                let config_override = Self::p2p_config_overrides(&app.manifest);
-                let cell_ids = app.all_enabled_cells();
-                self.clone()
-                    .create_cells_and_startup(cell_ids, config_override)
-                    .await?;
-            }
+            // Each enabled app starts on its own, loading its ribosomes and
+            // publishing its cells as soon as they are joined, so one slow app
+            // does not hold back the rest.
+            //
+            // Startup succeeds once every app's attempt has finished, not only
+            // when every app has started: an app whose startup failed is now
+            // disabled with `DisabledAppReason::Error` and the conductor serves
+            // the others, where it used to abort on the first such failure.
+            // Only failing to record that disable fails startup.
+            self.clone().startup_enabled_apps().await?;
 
-            info!("Conductor startup: apps enabled.");
+            info!("Conductor startup: app startup attempts finished; successful cells running.");
 
-            // ELOHIM PATCH (per-call grant walk): every enabled app's cells are
-            // created, joined and running. Only now may the capability-grant
-            // lookup-key backfill start; until this point it would have been
-            // competing with startup for each DNA's database.
+            // ELOHIM PATCH (per-call grant walk): every app startup attempt has
+            // finished and the cells of the apps that started are running.
+            // Only now may the capability-grant lookup-key backfill start;
+            // until this point it would have been competing with startup for
+            // each DNA's database.
             self.spaces.conductor_cells_running();
 
             // Start recording conductor uptime
@@ -624,18 +622,6 @@ mod dna_impls {
         pub(crate) fn add_ribosome_to_store(&self, cell_id: CellId, ribosome: Ribosome) {
             self.ribosome_store
                 .share_mut(|d| d.add_ribosome(cell_id, ribosome));
-        }
-
-        pub(crate) async fn load_wasms_into_ribosomes(&self) -> ConductorResult<()> {
-            // Get all installed cells from conductor state
-            let state = self.get_state().await?;
-
-            let enabled_apps: Vec<_> = state.enabled_apps().map(|(_, app)| app.clone()).collect();
-            for enabled_app in enabled_apps {
-                self.load_wasms_into_ribosome_for_app(&enabled_app).await?;
-            }
-
-            Ok(())
         }
 
         pub(crate) async fn load_wasms_into_ribosome_for_app(
@@ -2112,16 +2098,7 @@ mod app_status_impls {
                 return Ok(app.clone());
             }
 
-            self.load_wasms_into_ribosome_for_app(app).await?;
-
-            // Prepare module config overrides from app manifest
-            let config_override = Self::p2p_config_overrides(&app.manifest);
-
-            // Determine cells to create
-            let cell_ids_in_app = app.all_enabled_cells();
-            self.clone()
-                .create_cells_and_startup(cell_ids_in_app, config_override)
-                .await?;
+            self.clone().startup_app(app.clone()).await?;
 
             // Set app status to enabled in conductor state.
             let (_, app) = self

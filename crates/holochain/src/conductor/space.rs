@@ -62,11 +62,11 @@ pub struct Spaces {
 /// and the workflows those cells trigger all read and write the same per-DNA
 /// database, through the same single writer and the same connection pool. So
 /// a DNA's store is not backfilled when it is opened; it is backfilled once
-/// the conductor has finished enabling its apps, and, for a store opened
-/// later, once the cells created with it are running.
+/// every app startup attempt has finished, and, for a store opened later,
+/// once the cells created with it are running.
 #[derive(Default)]
 struct CapGrantBackfillGate {
-    /// Set when conductor startup has enabled every app.
+    /// Set when every app startup attempt of conductor startup has finished.
     cells_running: std::sync::atomic::AtomicBool,
     /// The DNAs whose store already has a backfill task.
     started: parking_lot::Mutex<std::collections::HashSet<DnaHash>>,
@@ -228,9 +228,10 @@ impl Spaces {
         })
     }
 
-    /// Conductor startup has enabled every app: the cells are running, and the
-    /// capability-grant lookup-key backfill may start on every store that is
-    /// open, and on any opened from now on once its cells are running.
+    /// Every app startup attempt of conductor startup has finished, and the
+    /// cells of the apps that started are running: the capability-grant
+    /// lookup-key backfill may start on every store that is open, and on any
+    /// opened from now on once its cells are running.
     pub(crate) fn conductor_cells_running(&self) {
         self.cap_grant_backfill
             .cells_running
