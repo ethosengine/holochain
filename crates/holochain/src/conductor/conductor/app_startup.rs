@@ -154,6 +154,11 @@ where
 /// cells that are already running, and apps that start side by side are not
 /// running yet. So the set is checked up front, in the conductor's app order,
 /// and an app that disagrees with an earlier one is refused.
+///
+/// The reservations cover the startup snapshot only. An `EnableApp` that runs
+/// while startup is under way does not consult them and relies on the
+/// running-cells check in `create_cell` alone, so it can still race a startup
+/// attempt for the same DNA — as two concurrent runtime enables already could.
 #[derive(Default)]
 pub(super) struct P2pOverrideReservations {
     by_dna: HashMap<DnaHash, P2pOverrideReservation>,
