@@ -7,8 +7,7 @@
 //!
 //! # Known limitations
 //!
-//! Three races remain, tracked in elohim backlog
-//! conductor-startup-lifecycle-ownership:
+//! Three races remain (tracked in elohim backlog conductor-startup-lifecycle-ownership):
 //!
 //! - Lifecycle: a disable landing between an attempt's status recheck and
 //!   its write to `running_cells`, an uninstall deleting databases under a
