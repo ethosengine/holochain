@@ -25,11 +25,7 @@ use holochain_util::timed;
 use lair_keystore_api::prelude::SharedLockedArray;
 use std::convert::TryInto;
 use std::path::PathBuf;
-use std::{
-    cell::Cell,
-    collections::{hash_map, HashMap},
-    sync::Arc,
-};
+use std::{cell::Cell, collections::HashMap, sync::Arc};
 
 /// This is the set of all current
 /// [`DnaHash`] spaces for all cells
@@ -51,6 +47,53 @@ pub struct Spaces {
     /// ELOHIM PATCH (per-call grant walk): when the capability-grant
     /// lookup-key backfill may run, and where it already does.
     cap_grant_backfill: Arc<CapGrantBackfillGate>,
+    /// ELOHIM PATCH (space single-flight): who is opening which DNA's space.
+    space_init: Arc<SpaceInitLocks>,
+}
+
+/// One lock per DNA, held while that DNA's space is created or dropped.
+///
+/// Creating a space opens its databases, which blocks for as long as the
+/// opens take. The spaces map is never held for that time: every user of the
+/// map would wait on it, and those waits park the runtime's worker threads —
+/// the same threads the opens need to finish (sqlx returns released pool
+/// connections from spawned tasks). With few workers, nothing is left to run
+/// them and creation never completes. Instead, the first caller for a DNA
+/// takes that DNA's lock and opens its space with the map free; later callers
+/// for the same DNA wait for the lock and then find the space in the map.
+/// Each space is built exactly once: a space that was built and then thrown
+/// away would leave its WAL maintenance task holding its pool open.
+///
+/// Entries are kept for the life of the conductor (one per DNA it has ever
+/// opened, alongside that DNA's space), so a caller never waits on a lock that
+/// has been replaced.
+#[derive(Default)]
+struct SpaceInitLocks(parking_lot::Mutex<HashMap<DnaHash, Arc<parking_lot::Mutex<()>>>>);
+
+impl SpaceInitLocks {
+    /// The lock for one DNA's space.
+    fn for_dna(&self, dna_hash: &DnaHash) -> Arc<parking_lot::Mutex<()>> {
+        self.0.lock().entry(dna_hash.clone()).or_default().clone()
+    }
+}
+
+/// Take a DNA's space lock without parking a runtime worker on it.
+///
+/// The lock is only contended while another caller opens the same DNA's
+/// databases. Waiting on it directly would park this worker for that whole
+/// time, and enough such waiters would starve the opens they wait for. On a
+/// multi-threaded runtime the wait therefore hands this worker's queue to
+/// another thread first, as the opening caller itself does.
+fn hold_space_init(lock: &parking_lot::Mutex<()>) -> parking_lot::MutexGuard<'_, ()> {
+    if let Some(guard) = lock.try_lock() {
+        return guard;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| lock.lock())
+        }
+        _ => lock.lock(),
+    }
 }
 
 /// Holds the capability-grant lookup-key backfill back until the conductor's
@@ -225,6 +268,7 @@ impl Spaces {
             space_data_config,
             data_db_key,
             cap_grant_backfill: Default::default(),
+            space_init: Default::default(),
         })
     }
 
@@ -410,6 +454,10 @@ impl Spaces {
     /// only run when a database is opened). Dropping the space forces a
     /// subsequent install to open fresh, migrated databases.
     pub(crate) fn remove_space(&self, dna_hash: &DnaHash) {
+        // Wait for a creation of this DNA's space that is still opening its
+        // databases, so that space is dropped here rather than inserted after.
+        let init = self.space_init.for_dna(dna_hash);
+        let _init = hold_space_init(&init);
         self.map.share_mut(|spaces| {
             spaces.remove(dna_hash);
         });
@@ -422,52 +470,54 @@ impl Spaces {
     where
         F: Fn(&Space) -> R,
     {
-        match self.map.share_ref(|spaces| spaces.get(dna_hash).map(&f)) {
-            Some(r) => Ok(r),
-            None => self
-                .map
-                .share_mut(|spaces| match spaces.entry(dna_hash.clone()) {
-                    hash_map::Entry::Occupied(entry) => Ok(f(entry.get())),
-                    hash_map::Entry::Vacant(entry) => {
-                        let space = Space::new(
-                            Arc::new(dna_hash.clone()),
-                            self.db_dir.to_path_buf(),
-                            convert_db_sync_level(self.config.db_sync_level),
-                            self.config.db_max_readers,
-                            self.space_data_config.clone(),
-                            Some(self.data_db_key.clone()),
-                        )?;
-
-                        if !self
-                            .cap_grant_backfill
-                            .cells_running
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                        {
-                            tracing::info!(
-                                %dna_hash,
-                                "capability-grant lookup-key backfill deferred until the \
-                                 conductor's cells are running"
-                            );
-                        }
-                        #[cfg(test)]
-                        if CAP_GRANT_BACKFILL_TEST_MODE.load(std::sync::atomic::Ordering::SeqCst)
-                            == 2
-                        {
-                            let mut config = DhtStore::test_cap_grant_backfill_config();
-                            config.start_delay = std::time::Duration::ZERO;
-                            drop(
-                                space
-                                    .dht_store
-                                    .test_spawn_cap_grant_lookup_backfill_with(config),
-                            );
-                        }
-
-                        let r = f(&space);
-                        entry.insert(space);
-                        Ok(r)
-                    }
-                }),
+        if let Some(r) = self.map.share_ref(|spaces| spaces.get(dna_hash).map(&f)) {
+            return Ok(r);
         }
+
+        // ELOHIM PATCH (space single-flight): open the space with the map
+        // free; see `SpaceInitLocks`.
+        let init = self.space_init.for_dna(dna_hash);
+        let _init = hold_space_init(&init);
+        if let Some(r) = self.map.share_ref(|spaces| spaces.get(dna_hash).map(&f)) {
+            return Ok(r);
+        }
+
+        let space = Space::new(
+            Arc::new(dna_hash.clone()),
+            self.db_dir.to_path_buf(),
+            convert_db_sync_level(self.config.db_sync_level),
+            self.config.db_max_readers,
+            self.space_data_config.clone(),
+            Some(self.data_db_key.clone()),
+        )?;
+
+        if !self
+            .cap_grant_backfill
+            .cells_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::info!(
+                %dna_hash,
+                "capability-grant lookup-key backfill deferred until the \
+                 conductor's cells are running"
+            );
+        }
+        #[cfg(test)]
+        if CAP_GRANT_BACKFILL_TEST_MODE.load(std::sync::atomic::Ordering::SeqCst) == 2 {
+            let mut config = DhtStore::test_cap_grant_backfill_config();
+            config.start_delay = std::time::Duration::ZERO;
+            drop(
+                space
+                    .dht_store
+                    .test_spawn_cap_grant_lookup_backfill_with(config),
+            );
+        }
+
+        let r = f(&space);
+        self.map.share_mut(|spaces| {
+            spaces.insert(dna_hash.clone(), space);
+        });
+        Ok(r)
     }
 
     /// Get the new-schema DHT store (this will create the space if it doesn't already exist).
@@ -747,6 +797,133 @@ mod tests {
     use super::*;
     use holochain_conductor_api::conductor::ConductorConfig;
     use holochain_types::prelude::DnaHash;
+
+    /// Creating a DNA's space must not stall the conductor's other users of
+    /// the spaces map.
+    ///
+    /// Creating a space opens its databases by blocking on them from inside
+    /// the runtime. Those opens only finish if the runtime's workers stay
+    /// free: sqlx hands each released pool connection back from a spawned
+    /// task, and an open runs enough statements to exhaust a small pool
+    /// without them. If the map is held while the databases open, every
+    /// worker that reads the map parks on its lock, the spawned tasks never
+    /// run, and creation and the readers wait for each other — on a
+    /// conductor with a small CPU quota, a cold install idles until its
+    /// client gives up.
+    ///
+    /// This runs that shape on two workers with a small pool: readers of
+    /// present spaces keep both workers busy while several callers ask for
+    /// the same new DNA and another for a second new DNA. Every caller must
+    /// finish, well inside the map lock's own 30 s retry, and the callers of
+    /// one DNA must share one space. The work runs on its own runtime, watched
+    /// from outside it, so a stalled runtime fails the test instead of hanging
+    /// it.
+    #[test]
+    fn creating_a_space_does_not_starve_the_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let temp_dir = tempfile::Builder::new().tempdir().unwrap();
+        let data_root = temp_dir.path().to_path_buf();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        runtime.spawn(async move {
+            let spaces = Spaces::new(
+                Arc::new(ConductorConfig {
+                    data_root_path: Some(data_root.into()),
+                    db_max_readers: 2,
+                    ..Default::default()
+                }),
+                Arc::new(std::sync::Mutex::new(sodoken::LockedArray::from(
+                    b"passphrase".to_vec(),
+                ))),
+            )
+            .await
+            .unwrap();
+
+            let present: Vec<DnaHash> = (1..=2u8)
+                .map(|i| DnaHash::from_raw_36(vec![i; 36]))
+                .collect();
+            for dna_hash in &present {
+                spaces.get_or_create_space(dna_hash).unwrap();
+            }
+
+            let created = Arc::new(AtomicBool::new(false));
+            let readers: Vec<_> = (0..6)
+                .map(|i| {
+                    let spaces = spaces.clone();
+                    let dna_hash = present[i % present.len()].clone();
+                    let created = created.clone();
+                    tokio::spawn(async move {
+                        while !created.load(Ordering::SeqCst) {
+                            spaces.get_or_create_space(&dna_hash).unwrap();
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                })
+                .collect();
+            // Let the readers occupy both workers before anything is created.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let fresh = DnaHash::from_raw_36(vec![7; 36]);
+            let other = DnaHash::from_raw_36(vec![8; 36]);
+            let creators: Vec<_> = [&fresh, &fresh, &fresh, &other]
+                .into_iter()
+                .map(|dna_hash| {
+                    let spaces = spaces.clone();
+                    let dna_hash = dna_hash.clone();
+                    tokio::spawn(async move {
+                        let started = std::time::Instant::now();
+                        let space = spaces.get_or_create_space(&dna_hash).unwrap();
+                        (dna_hash, space, started.elapsed())
+                    })
+                })
+                .collect();
+
+            let mut fresh_spaces = Vec::new();
+            for creator in creators {
+                let (dna_hash, space, elapsed) = creator.await.unwrap();
+                assert!(
+                    elapsed < Duration::from_secs(25),
+                    "creating a space took {elapsed:?}: callers waited out a stalled runtime"
+                );
+                if dna_hash == fresh {
+                    fresh_spaces.push(space);
+                }
+            }
+            created.store(true, Ordering::SeqCst);
+            for reader in readers {
+                reader.await.unwrap();
+            }
+
+            // One space per DNA: concurrent callers did not each build one.
+            assert!(fresh_spaces.windows(2).all(|pair| Arc::ptr_eq(
+                &pair[0].countersigning_workspaces,
+                &pair[1].countersigning_workspaces
+            )));
+            assert!(Arc::ptr_eq(
+                &fresh_spaces[0].countersigning_workspaces,
+                &spaces
+                    .get_or_create_space(&fresh)
+                    .unwrap()
+                    .countersigning_workspaces
+            ));
+            done_tx.send(()).unwrap();
+        });
+
+        let outcome = done_rx.recv_timeout(Duration::from_secs(60));
+        // A stalled runtime cannot be shut down cleanly: leave its threads.
+        runtime.shutdown_background();
+        outcome.expect(
+            "creating a space stalled the runtime: the spaces map was held while \
+             its databases opened, and every worker parked waiting for it",
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn db_max_readers_applied_to_pools() {

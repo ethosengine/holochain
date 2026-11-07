@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+- Fix installing an app on a fresh conductor hanging until the client times out, with the conductor idle and logging "Failed to get a RwShare read lock for over 120s this could be a dead lock". Opening a DNA's databases no longer holds the conductor's table of DNA spaces, so the cells being installed, and peers' requests for other DNAs, no longer wait on it; and callers waiting for the same DNA's databases to open no longer occupy the runtime's worker threads. The hang was most likely on conductors with few CPUs and apps with several DNAs.
 - Give each missing sys validation dependency its own exponential backoff. A dependency that cannot be found was previously re-checked locally and re-fetched from the network on every pass of the workflow, forever. On a node holding ops whose dependencies no peer holds, that is a spin: the local lookups (previously an unbounded `join_all`) oversubscribed the database read pool and every pass issued a network request per missing dependency. Local re-checks now back off to a 60s cap, so a dependency that arrives by gossip is still noticed promptly; network fetches back off to a 1h cap. After 12 failed network fetches a dependency is reported as unfetchable and moves to a slow sweep. Nothing is dropped and nothing is treated as valid. The missing and unfetchable counts are exposed as the `hc.conductor.sys_validation.missing_dependencies` and `hc.conductor.sys_validation.unfetchable_dependencies` metrics.
 
 ## 0.7.0
